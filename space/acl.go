@@ -1,6 +1,59 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+)
+
+// ErrNoActiveGuestKey is returned by RevokeGuestKey when the space has
+// no guest identity to revoke.
+var ErrNoActiveGuestKey = errors.New("no active guest key")
+
+// ErrBadIdentity is returned by identity-taking methods (ACL ops,
+// OneToOne, RegisterIncoming) when the identity string is empty or not
+// a decodable account address.
+var ErrBadIdentity = errors.New("bad identity")
+
+// Re-exported any-sync ACL and coordinator sentinels, so consumers
+// classify ACL failures with errors.Is against this package instead
+// of importing any-sync internals.
+var (
+	// ErrDuplicateInvite is returned by CreateInvite when an active
+	// invite of the same type already exists.
+	ErrDuplicateInvite = list.ErrDuplicateInvites
+
+	// ErrInsufficientPermissions is returned by ACL ops the caller's
+	// permission does not allow.
+	ErrInsufficientPermissions = list.ErrInsufficientPermissions
+
+	// ErrAclRecordNotFound is returned by ACL ops addressing a record
+	// (or pending request) the ACL does not hold.
+	ErrAclRecordNotFound = list.ErrNoSuchRecord
+
+	// ErrInviteNotFound is returned by Join when the space's ACL holds
+	// no such invite (revoked, replaced, or never minted), and by
+	// RevokeInvite for an unknown invite record.
+	ErrInviteNotFound = list.ErrNoSuchInvite
+
+	// ErrCoordinatorForbidden is the coordinator refusing an operation
+	// for this account. CreateInvite, CreateGuestKey and AddAccounts
+	// return it from make-shareable, which is owner-only.
+	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
+
+	// ErrCoordinatorLimitReached is the coordinator refusing an
+	// operation because the space owner's plan reached a limit, whoever
+	// the caller is: shared spaces on make-shareable (CreateInvite,
+	// CreateGuestKey, AddAccounts), or members on an ACL record that
+	// raises the reader or writer count past the plan's cap
+	// (AcceptRequest, ChangePermissions, AddAccounts, CreateGuestKey).
+	// A plan allowing at most one reader and one writer refuses every
+	// ACL record, removals and the joiner's Join and CancelJoin
+	// included.
+	ErrCoordinatorLimitReached = coordinatorproto.ErrSpaceLimitReached
+)
 
 // ACL is the owner/admin-side ACL surface: invite lifecycle, join
 // approvals, permission changes, ownership transfer, member removal.
@@ -49,8 +102,15 @@ type ACL interface {
 	RemoveAccounts(ctx context.Context, identities []string) error
 
 	// AddAccounts adds members directly without an invite/request
-	// round-trip. Useful for server-side flows where the owner already
-	// holds the joiner's identity.
+	// round-trip — the whole batch lands in ONE ACL record. Useful
+	// wherever the caller already holds the joiners' identities.
+	//
+	// When the coordinator inbox transport is available, each added
+	// account is also notified durably (queued + retried across
+	// restarts): the space surfaces on their devices as
+	// StatusInvitePending for them to AcceptInvite / DeclineInvite.
+	// Without the transport (headless deployments) the ACL write still
+	// happens but no notification is sent.
 	AddAccounts(ctx context.Context, accounts []MemberAdd) error
 
 	// OwnershipChange transfers ownership to newOwner; the old owner's
@@ -61,13 +121,35 @@ type ACL interface {
 	// — works for any non-owner, non-guest member.
 	RequestSelfRemove(ctx context.Context) error
 
-	// CancelJoinRequest withdraws a join request that the caller
-	// previously made and that has not yet been accepted/declined.
+	// CancelJoinRequest withdraws the caller's pending request on a
+	// LOADED space. A pending join is never loaded (Service.Get refuses
+	// it), so withdrawing a join request goes through the account-level
+	// Service.CancelJoin; this handle only reaches a request the loaded
+	// space can hold, i.e. a pending self-remove.
 	CancelJoinRequest(ctx context.Context) error
 
 	// StopSharing drops every non-owner member, revokes every invite,
 	// and rotates the read key in one batch. Owner only.
 	StopSharing(ctx context.Context) error
+
+	// CreateGuestKey enables public read-only access: it mints a shared
+	// guest identity, adds it to the ACL with PermissionGuest, and
+	// returns it as an InviteKindGuest invite for Service.JoinGuest.
+	// One active guest key per space; the private key is persisted on
+	// the owner's tech-space row, so repeated calls return the same
+	// invite while the guest identity is still active in the ACL
+	// (idempotent — the key is not recoverable from the ACL itself).
+	// Owner only: custody lives in the owner's tech space, so admins
+	// can neither fetch nor reissue it.
+	CreateGuestKey(ctx context.Context) (Invite, error)
+
+	// RevokeGuestKey removes the guest identity from the ACL and
+	// rotates the read key, cutting every guest off from new content
+	// (already-synced local copies stay readable on their devices).
+	// Clears the stored key; a later CreateGuestKey mints a fresh
+	// identity, so old invites die permanently. No-op error when no
+	// guest key is active.
+	RevokeGuestKey(ctx context.Context) error
 }
 
 // PermissionChange is one entry in a batch ChangePermissions call.

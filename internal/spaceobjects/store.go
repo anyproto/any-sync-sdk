@@ -20,30 +20,50 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	anystorev1 "github.com/anyproto/any-store"
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/synctree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/synctree/updatelistener"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/objecttreebuilder"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/fanout"
+	"github.com/anyproto/any-sync-sdk/internal/history"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
+	"github.com/anyproto/any-sync-sdk/internal/types/template"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
+	"github.com/anyproto/any-sync-sdk/space"
 )
+
+var storeLog = logger.NewNamed("sdk.spaceobjects")
 
 // ErrUnknownDataset is returned by DataVersion when the caller asks
 // for a dataset the store doesn't know how to version.
@@ -54,9 +74,37 @@ var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
 // External Registrations supplied via NewStore extend this map at
 // construction time; collisions with built-ins are rejected up front.
 var builtinDataVersions = map[string]string{
-	properties.Dataset:           properties.HandlerVersion,
-	typetype.DatasetPropertyDefs: typetype.HandlerVersion,
-	typetype.ShortIdsDataset:     "shortIds-v1",
+	properties.Dataset:             properties.HandlerVersion,
+	typetype.DatasetPropertyDefs:   typetype.HandlerVersion,
+	typetype.ShortIdsDataset:       "shortIds-v1",
+	typetype.DatasetDefs:           typetype.DatasetDefsHandlerVersion,
+	payloads.Dataset:               payloads.HandlerVersion,
+	spaceindex.BundlesDataset:      spaceindex.BundlesHandlerVersion,
+	spaceindex.IdentityKeysDataset: spaceindex.IdentityKeysHandlerVersion,
+}
+
+// plaintextSpecs declares the plaintext (node-readable) object
+// classes, keyed by tree-root ChangeType. A payloads object ships its
+// changes unencrypted and may carry ONLY the payloads dataset —
+// LocalWrite hard-errors on anything else and inbound replay skips it
+// (see object.PlaintextSpec).
+var plaintextSpecs = map[string]object.PlaintextSpec{
+	payloads.ChangeType: {Datasets: map[string]struct{}{payloads.Dataset: {}}},
+}
+
+// validateEncryptionClass pins the tree-encryption invariant: a tree
+// ships unencrypted IFF its root ChangeType is a registered plaintext
+// class. Enforced at every create/derive so a callsite can't ship
+// cleartext for an encrypted-class type. The flag is not part of the
+// derived root, so it never changes a derived id; pinning it per
+// ChangeType is what keeps every deriver of a type on one value.
+func validateEncryptionClass(changeType string, unencrypted bool) error {
+	_, plaintext := plaintextSpecs[changeType]
+	if unencrypted != plaintext {
+		return fmt.Errorf("spaceobjects: ChangeType %q: Unencrypted=%v but plaintext-class registration=%v — the flag must match the class",
+			changeType, unencrypted, plaintext)
+	}
+	return nil
 }
 
 // SpaceObjectsCollection is the on-disk collection name for the
@@ -73,6 +121,11 @@ const SpaceObjectsCollection = "objects"
 type CreateOpts struct {
 	ChangeType    string
 	ChangePayload []byte
+	// Unencrypted creates a plaintext (node-readable) tree: the root
+	// payload carries IsEncrypted:false and the object's ChangeType
+	// must be a registered plaintext class (object.PlaintextSpec) so
+	// every change ships unencrypted. Regular objects leave it false.
+	Unencrypted bool
 }
 
 // DeriveOpts is the input to Store.Derive. ChangePayload is the seed
@@ -80,6 +133,15 @@ type CreateOpts struct {
 type DeriveOpts struct {
 	ChangeType    string
 	ChangePayload []byte
+	// ParentId binds the derived tree to a parent so any-sync cascade-
+	// deletes it with the parent. It is also hashed into the derived id.
+	ParentId string
+	// Unencrypted derives a plaintext (node-readable) tree — see
+	// CreateOpts.Unencrypted. The flag is not part of the derived root,
+	// so it does not change the id: validateEncryptionClass pins it per
+	// ChangeType, and every deriver of a ChangeType must pass the same
+	// value.
+	Unencrypted bool
 }
 
 // Store owns per-object Controllers and handed-out *object.Object
@@ -99,12 +161,20 @@ type Store struct {
 	spaceId string
 	reg     *types.LiveRegistry
 
+	// spaceIndexObjId is the space's derived spaceIndex object, the one
+	// row the objects handler admits with `spaceIndex` as its type.
+	spaceIndexObjId string
+
 	// extTypes are the caller-supplied type catalog entries; their
 	// handlers are carried onto every per-object Controller
 	// alongside the built-ins. dataVersions overlays the built-in
 	// map with each type's registered handlers.
-	extTypes     []handler.Type
-	dataVersions map[string]string
+	extTypes []handler.Type
+	// extCollections are the caller-supplied registered collections:
+	// properties only, surfaced by Collections().List next to the
+	// user-created ones.
+	extCollections []handler.Collection
+	dataVersions   map[string]string
 	// datasetOwners maps an external type-owned dataset name to the
 	// typeId that owns it (N datasets → one owner). Built from extTypes.
 	// Used to enforce that an object implements a type before writing to
@@ -112,19 +182,86 @@ type Store struct {
 	// are absent.
 	datasetOwners map[string]string
 
+	// modules are the caller-registered dataset modules by name;
+	// moduleInfos is the compile-time catalog (records included).
+	// canonicalRegs are the canonical collections' registrations —
+	// identical on every controller, built once; canonicalModule maps
+	// each canonical collection back to its module. modulesTracked
+	// reports that some module instance opts into read tracking, which
+	// is what constructs the read-state engine when no static dataset
+	// does.
+	modules         map[string]handler.Module
+	moduleInfos     types.Modules
+	canonicalRegs   []crdt.HandlerReg
+	canonicalModule map[string]string
+	modulesTracked  bool
+
+	// Static parts (handler.Type.Parts): a registered type's canonical
+	// module datasets seed the canonical collections' owner sets
+	// (staticCanonicalOwners) and the module namespaces (staticModuleOwners)
+	// of every catalog snapshot; its namespaced module datasets are
+	// registrations built once here (staticInstanceRegs, module by
+	// collection in staticInstanceModule), owned through datasetOwners.
+	staticCanonicalOwners map[string]map[string]struct{}
+	staticModuleOwners    map[string]map[string]struct{}
+	// reservedModules are the configured modules with Reserved set —
+	// the one-branch fast path of ReservedCarrier when there are none.
+	reservedModules      []string
+	staticInstanceRegs   []crdt.HandlerReg
+	staticInstanceModule map[string]string
+
+	// catalog is the runtime dataset snapshot compiled from type
+	// objects' `datasets` records. Readers
+	// take the copy-on-write snapshot lock-free; refreshed only when a
+	// dataset-defs change applies. See catalog.go.
+	catalog *runtimeCatalog
+
+	// staticSchemaHandlers memoizes the generic schema handler for
+	// config-registered datasets that declare a schema and no bespoke
+	// Handler. Built once at store open — buildRegs runs on every
+	// object load and must not recompile declarations. SchemaHandler
+	// is read-only after construction, safe to share.
+	staticSchemaHandlers map[string]*crdt.SchemaHandler
+
 	// cache is the per-space *object.Object cache. LoadFunc holds
 	// the per-id lock during build+ColdRestore, so peers waiting on
 	// the same id never see partial state.
 	cache ocache.OCache
 
+	// released holds the ids the sync job released; the release loop
+	// closes each Object once it has gone releaseIdle without a Get.
+	// See release.go.
+	releaseMu      sync.Mutex
+	released       map[string]releasedObject
+	releaseRunning bool
+	releaseClosed  bool
+	releaseStop    chan struct{}
+	releaseWG      sync.WaitGroup
+
 	mu         sync.Mutex
 	sharedColl anystore.Collection // per-space `objects` collection, lazy-opened
 	detached   anystore.Collection // per-space `_detached` collection, lazy-opened
+	// keyedColls are the per-space collections of shared datasets, by
+	// dataset name, lazy-opened and handed to every controller.
+	keyedColls map[string]anystore.Collection
+
+	// drainMu serializes Drain passes — see Store.Drain.
+	drainMu sync.Mutex
 
 	// drainer runs Store.Drain asynchronously off the apply path —
 	// afterApply hooks push pairs in, the drainer consumes them and
 	// coalesces bursts into single Drain passes. See drainer.go.
 	drainer *drainer
+	// parkedHook runs between a gated park's commit and the lookup that
+	// follows it — a seam for tests of that order. Always nil in
+	// production.
+	parkedHook func()
+	// purgeHook runs once per purged object after the purge
+	// transaction committed and before the object's collections
+	// drop, so it can still read them. See SetPurgeHook.
+	purgeHook func(ctx context.Context, objectId string)
+	// purgeMu runs one deletion purge at a time; see purgeAndDrop.
+	purgeMu sync.Mutex
 
 	// engine drives windowed live queries (Query.Subscribe). The
 	// afterApply hook gates on engine.HasSubscribers so the cold-
@@ -135,7 +272,7 @@ type Store struct {
 	// changeSubs is the change-index live feed (consumer-side FTS /
 	// vector indexers). afterApply dispatches (objectId, applySeq)
 	// here, gated on hasSubscribers so an idle space pays nothing.
-	changeSubs *changeRegistry
+	changeSubs *fanout.Registry[ObjectChange]
 
 	// applySeqs mints the per-space apply sequence shared by every
 	// controller — the consumer-feed watermark covering DAG, mirror,
@@ -145,21 +282,124 @@ type Store struct {
 	applySeqBackfill    sync.Once
 	applySeqBackfillErr error
 
+	// indexBuilds reports builds of shared datasets' declared indexes
+	// (indexes.go); the index* fields are that worker's state.
+	indexBuilds  *fanout.Registry[IndexBuild]
+	indexMu      sync.Mutex
+	indexKick    chan struct{}
+	indexDone    chan struct{}
+	indexCancel  context.CancelFunc
+	indexClosed  bool
+	indexStarted bool
+	// indexHeld: type objects mid-replay, whose datasets the worker
+	// leaves alone.
+	indexHeld map[string]struct{}
+	// buildMu orders build reports against a subscription being added;
+	// building is the dataset whose build is in flight.
+	buildMu  sync.Mutex
+	building string
+
 	// rowEvents notifies objects-row creations/deletions — the account
 	// mirror's replay and GC triggers. See SubscribeRowEvents.
-	rowEvents *rowEventRegistry
+	rowEvents *fanout.Registry[RowEvent]
 
-	// customHandlers, when non-nil, makes this a "raw" store: every
-	// controller registers EXACTLY these handlers (no shared `objects`
-	// collection, no built-in properties/typetype/shortIds regs, no
-	// extTypes). Used by the tech space, whose index object holds its
-	// own datasets (spaces/profile) with bespoke handlers rather than
-	// the regular type/properties model. reg is nil in this mode.
-	customHandlers []crdt.HandlerReg
-	// disableGate skips the schema-gate on every object. Set together
-	// with customHandlers — the gate is a registry/type-system concept
-	// the tech space doesn't participate in.
-	disableGate bool
+	// rebuilding marks objects whose rows a load is rebuilding from the
+	// tree (reindex.go): refills and lookups of their rows are deferred
+	// until the load ends. A failed load leaves no mark.
+	rebuilding sync.Map
+
+	// stampPending holds, per objectId, the object stamps landed during
+	// the current replay batch, emitted as one event per object by the
+	// AfterReplay hook. See dispatchObjectStamps.
+	stampPending sync.Map
+
+	// readTracking maps a tracked dataset to its registration;
+	// readState is the per-space read/unread engine. Both nil/empty
+	// when nothing in this space opted into tracking. selfIdentity is
+	// the account id self-authored changes are matched against.
+	readTracking map[string]*crdt.ReadTracking
+	readState    *readstate.Engine
+	selfIdentity string
+	readMat      *readMaterializer
+
+	// The background re-index sweep: one per store, started once, stopped
+	// with the store and waited for (Close must not return while a
+	// rebuild is still writing — an offload drops collections right
+	// after). See reindex.go.
+	sweepOnce  sync.Once
+	sweepStop  chan struct{}
+	sweepClose sync.Once
+	sweepDone  chan struct{}
+	// readSeedPending marks objects mid-first-restore: the apply hook
+	// skips tracking for them (the seed covers everything present).
+	readSeedPending sync.Map
+	// gaps holds the ids of objects whose stored changes may sit above
+	// their watermark unapplied (see GapSet). The space service owns
+	// it across store rebuilds (SetGapSet); a store built without one
+	// keeps its own.
+	gaps *GapSet
+	// seedHeads consults the account's published frontiers before
+	// first-sight seeding — see SetSeedHeadsProvider.
+	seedHeads SeedHeadsProvider
+
+	// systemRegs are per-store type-less built-ins registered on every
+	// controller after the shared built-in set — the tech space's
+	// spaces/profile/devices/… datasets. Ungated like payloads/bundles:
+	// no owner, a hardcoded DataVersion stamp, rows only on the objects
+	// that write them by convention.
+	systemRegs []crdt.HandlerReg
+	// disableHistory keeps the history index closed for this store:
+	// no eager open, no apply hook, no purge bookkeeping. Set for the
+	// tech space, which has no history surface.
+	disableHistory bool
+
+	// selective is the selective-sync tree-type allowlist (root
+	// changeType → allowed). Nil/empty = sync everything. See
+	// selective.go for the full mechanism.
+	selective map[string]struct{}
+
+	// historyIx is the per-space version-history index once opened.
+	// Published via atomic pointer so the apply hook reads it without
+	// taking historyMu — the opener may block on the any-store writer
+	// (collection DDL) while an apply holds it, and an apply hook
+	// waiting on historyMu in that state would ABBA-deadlock.
+	historyIx atomic.Pointer[history.Index]
+	// historyMu serializes index opens only. Open failures are NOT
+	// cached — the next HistoryIndex call retries, so a transient
+	// fault never disables history for the Store's lifetime.
+	historyMu sync.Mutex
+	// historySkipIndex marks objects mid-cold-restore: the apply hook
+	// skips history-index rows for them (the object is marked stale
+	// and lazily backfilled instead — proposal §4.4 cold path). Same
+	// pattern as readSeedPending.
+	historySkipIndex sync.Map
+	// historyPendingStale collects objectIds whose index rows were
+	// skipped or failed while the index was unavailable (or whose
+	// in-tx MarkStale failed). Flushed to MarkStale on every
+	// successful HistoryIndex call so the lazy backfill repairs the
+	// gap instead of it becoming permanent.
+	historyPendingStale sync.Map
+	// historyPendingPurge collects objectIds whose space-level history
+	// rows (trace rows, _history_meta) could not be purged — index
+	// unavailable at purge time, or the purge itself failed. Flushed
+	// on every successful HistoryIndex call, same contract as
+	// historyPendingStale; without it a purge skipped once would leak
+	// the rows forever.
+	historyPendingPurge sync.Map
+
+	// writeGateErr, when non-nil, rejects every user-authored synced
+	// write (Store.Create and every Object's LocalWrite) with that
+	// error — read-only spaces (guest access, reader role). An atomic
+	// so the per-write check is a single load: the value is maintained
+	// event-driven, not computed per write — seeded at construction
+	// (guest rows) and updated by the per-space ACL mirror on role
+	// changes. Inbound apply / local-set paths are never gated.
+	writeGateErr atomic.Pointer[error]
+	// globalGate, when set, is consulted by CheckWrite next to
+	// writeGateErr: an account-wide refusal (the CRDT version mark
+	// moved past what this SDK supports) that no per-space state may
+	// clear.
+	globalGate atomic.Pointer[func() error]
 }
 
 // objectCacheTTL is the idle window before a cached Object is
@@ -171,25 +411,74 @@ const (
 	objectCacheGC  = 20 * time.Second
 )
 
-// loadPayloadKey is the context-key type for the optional
-// TreeStorageCreatePayload threaded into LoadFunc by Create / Derive
-// / PutTreeFromPayload. Absent → LoadFunc takes the BuildTree path.
+// loadPayloadKey is the context-key type for the optional creation
+// payload getWithPayload threads into the cache's LoadFunc. Absent →
+// the load takes the BuildTree path.
 type loadPayloadKey struct{}
 
-func ctxWithLoadPayload(ctx context.Context, p *treestorage.TreeStorageCreatePayload) context.Context {
-	return context.WithValue(ctx, loadPayloadKey{}, p)
+// loadPayload carries a TreeStorageCreatePayload to the LoadFunc; ran
+// records that a load started under the caller's ctx.
+type loadPayload struct {
+	payload *treestorage.TreeStorageCreatePayload
+	ran     atomic.Bool
 }
 
+// loadPayloadFromCtx is the LoadFunc's first step: it marks the
+// caller's payload as run and returns it, nil when the load carries
+// none.
 func loadPayloadFromCtx(ctx context.Context) *treestorage.TreeStorageCreatePayload {
-	p, _ := ctx.Value(loadPayloadKey{}).(*treestorage.TreeStorageCreatePayload)
-	return p
+	lp, _ := ctx.Value(loadPayloadKey{}).(*loadPayload)
+	if lp == nil {
+		return nil
+	}
+	lp.ran.Store(true)
+	return lp.payload
 }
 
-// StoreConfig is the input to NewStoreWithConfig. It carries both the
-// regular type/properties path (ExtTypes) and the "raw" tech-space path
-// (Handlers + DisableGate + DataVersions). Exactly one path is active:
-// when Handlers is non-nil the store skips the LiveRegistry, the shared
-// `objects` collection, the built-in handler set, and the schema gate.
+// maxForeignRetries bounds how many times getWithPayload runs Get
+// again after a load another caller ran.
+const maxForeignRetries = 3
+
+// getWithPayload is Get for a caller that holds objectId's creation
+// payload (Create, Derive, PutTreeFromPayload). ocache runs one load
+// per id, under the first caller's ctx, and hands its outcome to every
+// caller waiting on the id: a Get that arrives while another caller's
+// load of the same id is in flight (a sync pull of a tree another peer
+// derived) gets that load's outcome, with its own payload unread. That
+// load's failure says nothing about this caller, whose payload is
+// enough on its own, so Get runs again; the failure of a load that ran
+// under this caller's ctx is returned. A closed cache and a cancelled
+// ctx end the loop.
+func (s *Store) getWithPayload(ctx context.Context, objectId string, payload *treestorage.TreeStorageCreatePayload) (*object.Object, error) {
+	for retries := 0; ; retries++ {
+		lp := &loadPayload{payload: payload}
+		obj, err := s.Get(context.WithValue(ctx, loadPayloadKey{}, lp), objectId)
+		if err == nil || lp.ran.Load() || retries == maxForeignRetries || errors.Is(err, ocache.ErrClosed) || ctx.Err() != nil {
+			return obj, err
+		}
+	}
+}
+
+// load is the cache's LoadFunc. The caller's payload is read first, so
+// a load under the caller's ctx is marked as run before anything can
+// fail (getWithPayload).
+func (s *Store) load(ctx context.Context, objectId string) (ocache.Object, error) {
+	return s.loadObject(ctx, objectId, loadPayloadFromCtx(ctx))
+}
+
+// SystemDataset is a per-store type-less built-in: a handler
+// registered on every controller of that store plus the hardcoded
+// DataVersion its writers stamp. The tech space registers its
+// spaces/profile/devices/… datasets this way.
+type SystemDataset struct {
+	Reg         crdt.HandlerReg
+	DataVersion string
+}
+
+// StoreConfig is the input to NewStoreWithConfig. Every store runs the
+// same path: LiveRegistry, shared `objects` collection, built-in
+// handler set, runtime dataset catalog, schema gate. ExtTypes and
+// SystemDatasets extend the handler set.
 type StoreConfig struct {
 	App     *anysyncx.App
 	DB      anystore.DB
@@ -197,82 +486,267 @@ type StoreConfig struct {
 	SpaceId string
 	Alloc   *object.VersionAllocator
 
-	// ExtTypes is the caller-supplied type catalog (regular path).
+	// ExtTypes is the caller-supplied type catalog.
 	ExtTypes []handler.Type
 
-	// Handlers, when non-nil, switches the store to raw mode: every
-	// controller registers EXACTLY these handlers. DataVersions then
-	// supplies the dataset → DataVersion stamp (no built-ins).
-	Handlers     []crdt.HandlerReg
-	DisableGate  bool
-	DataVersions map[string]string
+	// ExtCollections is the caller-supplied collection catalog.
+	ExtCollections []handler.Collection
+
+	// Modules are the caller-supplied dataset modules (the built-in
+	// records module is always present).
+	Modules []handler.Module
+
+	// SystemDatasets are extra ungated built-ins for this store.
+	SystemDatasets []SystemDataset
+
+	// DisableHistory keeps the history index closed — for stores with
+	// no history surface (the tech space).
+	DisableHistory bool
+
+	// SelectiveTypes is the selective-sync tree-type allowlist. Only
+	// the regular-space path (NewStore) sets it — the tech space is
+	// always fully synced. See selective.go.
+	SelectiveTypes []string
 }
 
 // NewStore constructs a regular type/properties-backed Store. The
 // allocator is per-space (shared across all objects in this space).
 //
-// extTypes is the caller-supplied type catalog. Each type's handlers
-// are wired onto every per-object Controller built by this store,
-// alongside the built-in system handlers. Validation happens in
-// ValidateExternalTypes — call it before NewStore at the SDK
+// extTypes is the caller-supplied type catalog and modules the
+// caller-supplied dataset modules. Each type's handlers and each
+// module's canonical collection are wired onto every per-object
+// Controller built by this store, alongside the built-in system
+// handlers; module instances a type declares join through the runtime
+// catalog. Validation happens in ValidateExternalTypes /
+// ValidateExternalModules — call them before NewStore at the SDK
 // boundary so collisions are caught at Open time.
-func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type) *Store {
+func NewStore(app *anysyncx.App, db anystore.DB, signKey crypto.PrivKey, spaceId string, alloc *object.VersionAllocator, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Store {
+	var selectiveTypes []string
+	if app != nil {
+		selectiveTypes = app.SelectiveTreeTypes()
+	}
 	return NewStoreWithConfig(StoreConfig{
-		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes,
+		App: app, DB: db, SignKey: signKey, SpaceId: spaceId, Alloc: alloc, ExtTypes: extTypes, ExtCollections: extCollections, Modules: modules,
+		SelectiveTypes: selectiveTypes,
 	})
 }
 
+// SetWriteGateErr installs (non-nil) or clears (nil) the user-write
+// gate — see Store.writeGateErr. Safe at any time; cached Objects read
+// the live value on every write.
+func (s *Store) SetWriteGateErr(err error) {
+	if err == nil {
+		s.writeGateErr.Store(nil)
+		return
+	}
+	s.writeGateErr.Store(&err)
+}
+
+// SetGlobalGate installs an account-wide write gate consulted on every
+// user-authored synced write next to the per-store gate. Nil clears it.
+func (s *Store) SetGlobalGate(fn func() error) {
+	if fn == nil {
+		s.globalGate.Store(nil)
+		return
+	}
+	s.globalGate.Store(&fn)
+}
+
+// CheckWrite applies the gates; nil = writable. Exposed for write entry
+// points that mutate outside the store's own DAG-write funnel (tree
+// deletion, file-node uploads).
+func (s *Store) CheckWrite() error {
+	if p := s.globalGate.Load(); p != nil {
+		if err := (*p)(); err != nil {
+			return err
+		}
+	}
+	if p := s.writeGateErr.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// moduleInfoOf is the compiler's view of a registered module, built the
+// same way for the live catalog and for ValidateExternalModules.
+func moduleInfoOf(m handler.Module) types.ModuleInfo {
+	return types.ModuleInfo{
+		Name:          m.Name,
+		Canonical:     m.Canonical,
+		CanonicalOnly: m.CanonicalOnly,
+		Reserved:      m.Reserved,
+		NoCopy:        m.NoCopy,
+	}
+}
+
 // NewStoreWithConfig constructs a Store from cfg. The async drainer is
-// built and started here — it lives until Close. The subscribe engine
-// is always built (both paths support Query.Subscribe). In raw mode
-// (cfg.Handlers != nil) the LiveRegistry is nil and the schema gate is
-// disabled — see newController / loadObject.
+// built and started here — it lives until Close.
 func NewStoreWithConfig(cfg StoreConfig) *Store {
 	s := &Store{
+		gaps:           NewGapSet(),
 		app:            cfg.App,
 		db:             cfg.DB,
 		signKey:        cfg.SignKey,
 		alloc:          cfg.Alloc,
 		spaceId:        cfg.SpaceId,
 		engine:         subscribe.New(cfg.SpaceId),
-		changeSubs:     newChangeRegistry(),
-		rowEvents:      newRowEventRegistry(),
-		customHandlers: cfg.Handlers,
-		disableGate:    cfg.DisableGate,
+		changeSubs:     fanout.New[ObjectChange](),
+		rowEvents:      fanout.New[RowEvent](),
+		indexBuilds:    fanout.New[IndexBuild](),
+		disableHistory: cfg.DisableHistory,
 	}
-	if cfg.Handlers != nil {
-		// Raw mode: no registry, no built-in dataset versions; the
-		// caller's DataVersions are authoritative.
-		s.dataVersions = cfg.DataVersions
-	} else {
-		dv := make(map[string]string, len(builtinDataVersions))
-		for k, v := range builtinDataVersions {
-			dv[k] = v
+	s.spaceIndexObjId = s.deriveSpaceIndexId()
+	if len(cfg.SelectiveTypes) > 0 {
+		s.selective = make(map[string]struct{}, len(cfg.SelectiveTypes))
+		for _, t := range cfg.SelectiveTypes {
+			s.selective[t] = struct{}{}
 		}
-		owners := make(map[string]string)
-		for _, t := range cfg.ExtTypes {
-			for _, d := range t.Datasets {
-				dv[d.Name] = d.DataVersion
-				owners[d.Name] = t.Id
+	}
+	dv := make(map[string]string, len(builtinDataVersions))
+	for k, v := range builtinDataVersions {
+		dv[k] = v
+	}
+	owners := make(map[string]string)
+	for _, t := range cfg.ExtTypes {
+		for _, d := range t.Datasets {
+			dv[d.Name] = d.DataVersion
+			owners[d.Name] = t.Id
+		}
+	}
+	// System datasets get a stamp but no owner: DatasetOwners stays
+	// false, so the type-membership check is a no-op for them.
+	for _, sd := range cfg.SystemDatasets {
+		dv[sd.Reg.Name] = sd.DataVersion
+		s.systemRegs = append(s.systemRegs, sd.Reg)
+	}
+	// Modules: the canonical collections register statically on every
+	// controller (so inbound changes apply without the declaring type's
+	// definitions), with the module's DataVersion; namespaced instances
+	// come from the catalog. The owner set of a canonical collection is
+	// catalog state, so it is absent from `owners` here.
+	s.modules = make(map[string]handler.Module, len(cfg.Modules))
+	s.canonicalModule = make(map[string]string, len(cfg.Modules))
+	infos := make([]types.ModuleInfo, 0, len(cfg.Modules))
+	for _, m := range cfg.Modules {
+		s.modules[m.Name] = m
+		infos = append(infos, moduleInfoOf(m))
+		if m.Reserved {
+			s.reservedModules = append(s.reservedModules, m.Name)
+		}
+		if m.Canonical != "" {
+			reg, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true})
+			if err != nil {
+				// ValidateExternalModules probes the same construction;
+				// a failure here is a programming error, not a runtime
+				// condition — refuse the module rather than a half set.
+				storeLog.Error("module: canonical registration failed", zap.String("module", m.Name), zap.Error(err))
+				continue
+			}
+			s.canonicalRegs = append(s.canonicalRegs, reg)
+			s.canonicalModule[m.Canonical] = m.Name
+			dv[m.Canonical] = m.DataVersion
+			if reg.ReadTracking != nil {
+				s.modulesTracked = true
 			}
 		}
-		s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes))
-		s.extTypes = cfg.ExtTypes
-		s.dataVersions = dv
-		s.datasetOwners = owners
-	}
-	s.applySeqs = crdt.NewApplySeqAllocator(func(ctx context.Context) (uint64, error) {
-		coll, err := s.applySeqMeta(ctx)
-		if err != nil {
-			return 0, err
+		if !m.CanonicalOnly {
+			probe := m.New(handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"})
+			if probe.ReadTracking != nil {
+				s.modulesTracked = true
+			}
 		}
-		return crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
-	})
+	}
+	s.moduleInfos = types.NewModules(infos...)
+	// Static parts: a registered type's module datasets are ownership
+	// (canonical) or registrations (namespaced), settled once here — the
+	// same footing a runtime declaration reaches through the catalog.
+	// ValidateExternalModules has already refused what cannot resolve.
+	s.staticCanonicalOwners = map[string]map[string]struct{}{}
+	s.staticModuleOwners = map[string]map[string]struct{}{}
+	s.staticInstanceModule = map[string]string{}
+	own := func(set map[string]map[string]struct{}, key, typeId string) {
+		m := set[key]
+		if m == nil {
+			m = map[string]struct{}{}
+			set[key] = m
+		}
+		m[typeId] = struct{}{}
+	}
+	for _, t := range cfg.ExtTypes {
+		mods, err := staticModuleDatasets(t, s.moduleInfos)
+		if err != nil {
+			storeLog.Error("static parts: module datasets", zap.String("typeId", t.Id), zap.Error(err))
+			continue
+		}
+		for _, md := range mods {
+			own(s.staticModuleOwners, md.module, t.Id)
+			if md.canonical {
+				own(s.staticCanonicalOwners, md.collection, t.Id)
+				continue
+			}
+			m := s.modules[md.module]
+			reg, err := moduleReg(m, handler.ModuleInstance{TypeId: t.Id, Key: md.key, Collection: md.collection})
+			if err != nil {
+				storeLog.Error("static parts: instance registration failed",
+					zap.String("typeId", t.Id), zap.String("collection", md.collection), zap.Error(err))
+				continue
+			}
+			// No SchemaRev: a static instance never rotates, so no
+			// controller is ever stale against it.
+			s.staticInstanceRegs = append(s.staticInstanceRegs, reg)
+			s.staticInstanceModule[md.collection] = md.module
+			dv[md.collection] = m.DataVersion
+			owners[md.collection] = t.Id
+			if reg.ReadTracking != nil {
+				s.modulesTracked = true
+			}
+		}
+	}
+	extCollections := withBuiltInCollections(cfg.ExtCollections)
+	s.reg = types.NewLiveRegistry(cfg.DB, buildStaticSchema(cfg.ExtTypes, extCollections, cfg.Modules))
+	s.extTypes = cfg.ExtTypes
+	s.extCollections = extCollections
+	s.dataVersions = dv
+	s.datasetOwners = owners
+	s.staticSchemaHandlers = make(map[string]*crdt.SchemaHandler)
+	for _, t := range cfg.ExtTypes {
+		for _, d := range t.Datasets {
+			if d.Handler != nil {
+				continue
+			}
+			if sh, err := crdt.NewSchemaHandler(datasetSchema(d)); err == nil {
+				s.staticSchemaHandlers[d.Name] = sh
+			}
+		}
+	}
+	s.catalog = newRuntimeCatalog()
+	s.initCatalog(context.Background())
+	s.applySeqs = crdt.NewApplySeqAllocator(s.seedApplySeq)
+	if s.signKey != nil {
+		s.selfIdentity = s.signKey.GetPublic().Account()
+	}
+	s.readTracking = buildReadTracking(s.extTypes, s.systemRegs, append(append([]crdt.HandlerReg(nil), s.canonicalRegs...), s.staticInstanceRegs...))
+	if len(s.readTracking) > 0 || s.modulesTracked {
+		s.readState = readstate.New(s.db, s.spaceId, s.applySeqs.Next, s.readResolver(), s.readLoader())
+		// Eager: the open takes any-store's write lock, and every
+		// later engine call runs inside a write tx or next to one.
+		// The constructor runs outside any tx, before the store is
+		// published. A failure stays with the engine: every engine
+		// call returns it, and inbound changes to read-tracked
+		// datasets fail to apply rather than applying untracked.
+		if err := s.readState.Open(context.Background()); err != nil {
+			storeLog.Error("read state: open", zap.String("spaceId", s.spaceId), zap.Error(err))
+		}
+		if needsReadMaterializer(s.readTracking) {
+			s.readMat = newReadMaterializer(s)
+		}
+	}
 	s.cache = ocache.New(
-		s.loadObject,
+		s.load,
 		ocache.WithTTL(objectCacheTTL),
 		ocache.WithGCPeriod(objectCacheGC),
 	)
+	s.sweepStop = make(chan struct{})
 	s.drainer = newDrainer(s)
 	s.drainer.Run()
 	return s
@@ -280,13 +754,24 @@ func NewStoreWithConfig(cfg StoreConfig) *Store {
 
 // buildStaticSchema assembles the registry's static overlay: the
 // schema for types whose definitions don't live in a per-type-object
-// `properties` collection — the built-in `any` / `spaceIndex` tables
-// and every registered external type's declared Properties. User
-// types are absent (resolved from their defs collection at lookup).
+// `properties` collection — the built-in `any` / `spaceIndex` /
+// `type` tables and every registered external type's declared
+// Properties. User types are absent (resolved from their defs
+// collection at lookup).
+//
+// Modules contribute their objects-row namespace the same way, keyed by
+// module name.
 //
 // Returns typeId → propId → PropInfo. Safe with nil/empty extTypes.
-func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.PropInfo {
-	static := make(map[string]map[string]types.PropInfo, 2+len(extTypes))
+func buildStaticSchema(extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) map[string]map[string]types.PropInfo {
+	static := make(map[string]map[string]types.PropInfo, 4+len(extTypes)+len(extCollections)+len(modules))
+	for _, m := range modules {
+		props := make(map[string]types.PropInfo, len(m.Properties))
+		for _, p := range m.Properties {
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind), Scope: p.Scope}
+		}
+		static[m.Name] = props
+	}
 
 	anyProps := make(map[string]types.PropInfo, len(anytype.Properties))
 	for _, p := range anytype.Properties {
@@ -299,6 +784,30 @@ func buildStaticSchema(extTypes []handler.Type) map[string]map[string]types.Prop
 		siProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
 	}
 	static[spaceindex.TypeId] = siProps
+
+	// The meta-type's namespace. Without this entry every type Create
+	// fails: the `type.xkey` write resolves no type in the registry
+	// and PreValidate rejects the whole change.
+	mtProps := make(map[string]types.PropInfo, len(typetype.Properties))
+	for _, p := range typetype.Properties {
+		mtProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
+	}
+	static[typetype.TypeId] = mtProps
+
+	// The meta-collection's namespace, for the same reason.
+	mcProps := make(map[string]types.PropInfo, len(collectiontype.Properties))
+	for _, p := range collectiontype.Properties {
+		mcProps[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: p.Kind, Scope: p.Scope}
+	}
+	static[collectiontype.TypeId] = mcProps
+
+	for _, c := range extCollections {
+		props := make(map[string]types.PropInfo, len(c.Properties))
+		for _, p := range c.Properties {
+			props[p.Id] = types.PropInfo{Id: p.Id, Name: p.Name, Kind: propertyKindToSchema(p.Kind), Scope: p.Scope}
+		}
+		static[c.Id] = props
+	}
 
 	for _, t := range extTypes {
 		if len(t.Properties) == 0 {
@@ -336,8 +845,93 @@ func propertyKindToSchema(k handler.PropertyKind) schema.Kind {
 		return schema.KindArray
 	case handler.PropertyKindObject:
 		return schema.KindObject
+	case handler.PropertyKindDatetime:
+		return schema.KindDatetime
 	}
 	return schema.KindUnknown
+}
+
+// ReservedTypeIds are the synthetic built-ins: they own a namespace in
+// the static schema and a row in Types().List, so a caller-registered
+// type may not claim one.
+var ReservedTypeIds = map[string]struct{}{
+	anytype.TypeId:        {},
+	spaceindex.TypeId:     {},
+	typetype.TypeId:       {},
+	collectiontype.TypeId: {},
+}
+
+// BuiltInCollections are the collections the SDK registers itself, in
+// listing order, ahead of the consumer's: the template marker. A
+// consumer declaration under one of their ids is refused at Open.
+func BuiltInCollections() []handler.Collection {
+	return []handler.Collection{template.Collection()}
+}
+
+// withBuiltInCollections is the registered set a store serves: the
+// SDK's own first, then the consumer's.
+func withBuiltInCollections(ext []handler.Collection) []handler.Collection {
+	builtIn := BuiltInCollections()
+	out := make([]handler.Collection, 0, len(builtIn)+len(ext))
+	out = append(out, builtIn...)
+	return append(out, ext...)
+}
+
+// isBuiltInCollectionId reports whether id names a collection the SDK
+// registers itself.
+func isBuiltInCollectionId(id string) bool {
+	for _, c := range BuiltInCollections() {
+		if c.Id == id {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateExternalCollections checks the caller-supplied collections:
+// non-empty unique ids, disjoint from the registered types and the
+// reserved ids, and well-formed property declarations. Called once at
+// sdk.Open after ValidateExternalTypes.
+func ValidateExternalCollections(extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) error {
+	typeIds := make(map[string]struct{}, len(extTypes))
+	for _, t := range extTypes {
+		typeIds[t.Id] = struct{}{}
+	}
+	moduleNames := map[string]struct{}{types.RecordsModule: {}}
+	for _, m := range modules {
+		moduleNames[m.Name] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(extCollections))
+	for i, c := range extCollections {
+		if c.Id == "" {
+			return fmt.Errorf("spaceobjects: collection[%d]: empty Id", i)
+		}
+		if _, dup := seen[c.Id]; dup {
+			return fmt.Errorf("spaceobjects: collection[%d]: duplicate collection Id %q", i, c.Id)
+		}
+		if _, reserved := ReservedTypeIds[c.Id]; reserved {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is reserved for a built-in", i, c.Id)
+		}
+		if isBuiltInCollectionId(c.Id) {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is a built-in collection", i, c.Id)
+		}
+		if c.Id == typetype.MetaTypeMarker || c.Id == collectiontype.MetaMarker {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is a reserved marker", i, c.Id)
+		}
+		if _, isType := typeIds[c.Id]; isType {
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is also a registered type", i, c.Id)
+		}
+		if _, isModule := moduleNames[c.Id]; isModule {
+			// Modules own an objects-row namespace under their name;
+			// a collection under the same id would shadow it.
+			return fmt.Errorf("spaceobjects: collection[%d]: Id %q is also a module name", i, c.Id)
+		}
+		seen[c.Id] = struct{}{}
+		if err := validatePropertyDecls(c.Id, c.Properties); err != nil {
+			return fmt.Errorf("spaceobjects: collection[%d]: %w", i, err)
+		}
+	}
+	return nil
 }
 
 // ValidateExternalTypes checks the caller-supplied catalog against
@@ -354,15 +948,41 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 		if _, dup := seenTypeIds[t.Id]; dup {
 			return fmt.Errorf("spaceobjects: type[%d]: duplicate type Id %q", i, t.Id)
 		}
+		if _, reserved := ReservedTypeIds[t.Id]; reserved {
+			// buildStaticSchema writes the built-in tables first and the
+			// ext-type loop REPLACES by id, so a registration under a
+			// built-in id silently takes over its namespace — for `type`
+			// that breaks every Types().Create carrying an XKey. Fail at
+			// boot instead.
+			return fmt.Errorf("spaceobjects: type[%d]: Id %q is reserved for a built-in type", i, t.Id)
+		}
+		if isBuiltInCollectionId(t.Id) {
+			return fmt.Errorf("spaceobjects: type[%d]: Id %q is a built-in collection", i, t.Id)
+		}
 		seenTypeIds[t.Id] = struct{}{}
 		// A type may own datasets, properties, both, or neither (a pure
 		// declaration / tag). Only a non-empty Id is required.
 		for j, d := range t.Datasets {
 			if d.Handler == nil {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: nil Handler", i, t.Id, j)
+				// No bespoke handler: the dataset gets the generic
+				// schema handler, which requires a declared schema and a
+				// well-formed behavioral declaration.
+				if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
+					return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: nil Handler requires a declared Schema", i, t.Id, j)
+				}
+				if err := schema.ValidateDatasetDecl(d.Schema); err != nil {
+					return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): %w", i, t.Id, j, d.Name, err)
+				}
 			}
 			if d.Name == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: empty Name", i, t.Id, j)
+			}
+			if strings.HasPrefix(d.Name, "_") {
+				// The "_" prefix is reserved for internal collections
+				// (`<objectId>__history*`, `_meta`, `_detached`, …) —
+				// a dataset named "_history" would collide with the
+				// per-object history collections.
+				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d]: name %q is reserved (\"_\" prefix)", i, t.Id, j, d.Name)
 			}
 			if d.DataVersion == "" {
 				return fmt.Errorf("spaceobjects: type[%d] (%q) dataset[%d] (%q): empty DataVersion", i, t.Id, j, d.Name)
@@ -375,37 +995,184 @@ func ValidateExternalTypes(extTypes []handler.Type) error {
 			}
 			seenDatasets[d.Name] = struct{}{}
 		}
-		seenProps := make(map[string]struct{}, len(t.Properties))
-		for k, p := range t.Properties {
-			if p.Id == "" {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: empty Id", i, t.Id, k)
-			}
-			if p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: reserved or invalid Id %q (no \"id\", no \"_\" prefix, no dots)", i, t.Id, k, p.Id)
-			}
-			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Kind %d", i, t.Id, k, p.Id, p.Kind)
-			}
-			// Scope: zero (defaults to synced) or an explicit creatable
-			// class. Derived is reserved for SDK built-ins.
-			switch p.Scope {
-			case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
-			default:
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", i, t.Id, k, p.Id, p.Scope)
-			}
-			if _, dup := seenProps[p.Id]; dup {
-				return fmt.Errorf("spaceobjects: type[%d] (%q) property[%d]: duplicate property Id %q", i, t.Id, k, p.Id)
-			}
-			seenProps[p.Id] = struct{}{}
+		if err := validateStaticParts(t); err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
+		}
+		if err := validatePropertyDecls(t.Id, t.Properties); err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
 		}
 	}
 	return nil
 }
 
-// Close shuts down per-Store background workers (drainer +
+// validatePropertyDecls checks a registered type's or collection's
+// static property declarations: well-formed unique ids, a known kind,
+// a creatable scope (zero defaults to synced; derived is reserved for
+// SDK built-ins).
+func validatePropertyDecls(ownerId string, decls []handler.PropertyDecl) error {
+	seenProps := make(map[string]struct{}, len(decls))
+	for k, p := range decls {
+		if p.Id == "" {
+			return fmt.Errorf("(%q) property[%d]: empty Id", ownerId, k)
+		}
+		if p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
+			return fmt.Errorf("(%q) property[%d]: reserved or invalid Id %q (no \"id\", no \"_\" prefix, no dots)", ownerId, k, p.Id)
+		}
+		if propertyKindToSchema(p.Kind) == schema.KindUnknown {
+			return fmt.Errorf("(%q) property[%d] (%q): invalid Kind %d", ownerId, k, p.Id, p.Kind)
+		}
+		switch p.Scope {
+		case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
+		default:
+			return fmt.Errorf("(%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", ownerId, k, p.Id, p.Scope)
+		}
+		if _, dup := seenProps[p.Id]; dup {
+			return fmt.Errorf("(%q) property[%d]: duplicate property Id %q", ownerId, k, p.Id)
+		}
+		seenProps[p.Id] = struct{}{}
+	}
+	return nil
+}
+
+// ValidateExternalModules checks the caller-supplied modules against
+// the built-in and external datasets, the reserved type ids, and each
+// other. Called once at sdk.Open after ValidateExternalTypes.
+func ValidateExternalModules(extTypes []handler.Type, modules []handler.Module) error {
+	names := make(map[string]struct{}, len(modules))
+	datasets := make(map[string]struct{})
+	for _, t := range extTypes {
+		for _, d := range t.Datasets {
+			datasets[d.Name] = struct{}{}
+		}
+	}
+	for i, m := range modules {
+		if m.Name == "" {
+			return fmt.Errorf("spaceobjects: module[%d]: empty Name", i)
+		}
+		if err := schema.ValidateSlug("module", m.Name); err != nil {
+			return fmt.Errorf("spaceobjects: module[%d]: %w", i, err)
+		}
+		if m.Name == types.RecordsModule {
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is the built-in records module", i, m.Name)
+		}
+		if _, reserved := ReservedTypeIds[m.Name]; reserved {
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is reserved for a built-in type", i, m.Name)
+		}
+		if isBuiltInCollectionId(m.Name) {
+			// Modules own an objects-row namespace under their name;
+			// the built-in collection's would shadow it.
+			return fmt.Errorf("spaceobjects: module[%d]: name %q is a built-in collection", i, m.Name)
+		}
+		for _, t := range extTypes {
+			if t.Id == m.Name {
+				return fmt.Errorf("spaceobjects: module[%d]: name %q collides with a registered type id", i, m.Name)
+			}
+		}
+		if _, dup := names[m.Name]; dup {
+			return fmt.Errorf("spaceobjects: module[%d]: duplicate module name %q", i, m.Name)
+		}
+		names[m.Name] = struct{}{}
+		if m.New == nil {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): New is required", i, m.Name)
+		}
+		if m.CanonicalOnly && m.Canonical == "" {
+			return fmt.Errorf("spaceobjects: module[%d] (%q): CanonicalOnly requires Canonical", i, m.Name)
+		}
+		if m.Reserved && !m.CanonicalOnly {
+			// A namespaced instance of a reserved module would be a
+			// per-type collection nobody but the consumer may declare —
+			// reservation exists for the one canonical install.
+			return fmt.Errorf("spaceobjects: module[%d] (%q): Reserved requires CanonicalOnly", i, m.Name)
+		}
+		if m.Canonical != "" {
+			if err := schema.ValidateSlug("canonical collection", m.Canonical); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): %w", i, m.Name, err)
+			}
+			if _, dup := builtinDataVersions[m.Canonical]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical %q is reserved by a built-in", i, m.Name, m.Canonical)
+			}
+			if _, dup := datasets[m.Canonical]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical %q is already a registered dataset", i, m.Name, m.Canonical)
+			}
+			datasets[m.Canonical] = struct{}{}
+			if m.DataVersion == "" {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): empty DataVersion", i, m.Name)
+			}
+			if _, err := moduleReg(m, handler.ModuleInstance{Collection: m.Canonical, Canonical: true}); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): canonical instance: %w", i, m.Name, err)
+			}
+		}
+		if !m.CanonicalOnly {
+			if _, err := moduleReg(m, handler.ModuleInstance{TypeId: "probe", Key: "probe", Collection: "probe_probe"}); err != nil {
+				return fmt.Errorf("spaceobjects: module[%d] (%q): namespaced instance: %w", i, m.Name, err)
+			}
+		}
+		seenProps := make(map[string]struct{}, len(m.Properties))
+		for k, p := range m.Properties {
+			if p.Id == "" || p.Id == "id" || strings.HasPrefix(p.Id, "_") || strings.ContainsAny(p.Id, ".") {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d]: reserved or invalid Id %q", i, m.Name, k, p.Id)
+			}
+			if propertyKindToSchema(p.Kind) == schema.KindUnknown {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d] (%q): invalid Kind %d", i, m.Name, k, p.Id, p.Kind)
+			}
+			switch p.Scope {
+			case 0, schema.ScopeSynced, schema.ScopeAccount, schema.ScopeLocal:
+			default:
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d] (%q): invalid Scope %d (synced/account/local only)", i, m.Name, k, p.Id, p.Scope)
+			}
+			if _, dup := seenProps[p.Id]; dup {
+				return fmt.Errorf("spaceobjects: module[%d] (%q) property[%d]: duplicate property Id %q", i, m.Name, k, p.Id)
+			}
+			seenProps[p.Id] = struct{}{}
+		}
+	}
+	// Static parts naming a module: the collection rule against the
+	// registered modules, and the namespaced collections they mint must
+	// not collide with anything else the catalog registers.
+	infos := make([]types.ModuleInfo, 0, len(modules))
+	byName := make(map[string]handler.Module, len(modules))
+	for _, m := range modules {
+		infos = append(infos, moduleInfoOf(m))
+		byName[m.Name] = m
+	}
+	catalog := types.NewModules(infos...)
+	for i, t := range extTypes {
+		mods, err := staticModuleDatasets(t, catalog)
+		if err != nil {
+			return fmt.Errorf("spaceobjects: type[%d]: %w", i, err)
+		}
+		for _, md := range mods {
+			if md.canonical {
+				continue
+			}
+			if m, ok := byName[md.module]; ok && m.DataVersion == "" {
+				// A static instance has no declaring schema state to stamp
+				// (registered types mint no shortIds): the module's own
+				// version is what peers gate against.
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: module %q needs a DataVersion for a static namespaced instance", i, t.Id, md.partKey, md.module)
+			}
+			if _, dup := builtinDataVersions[md.collection]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: collection %q is reserved by a built-in", i, t.Id, md.partKey, md.collection)
+			}
+			if _, dup := datasets[md.collection]; dup {
+				return fmt.Errorf("spaceobjects: type[%d] (%q) part %q: collection %q is already registered", i, t.Id, md.partKey, md.collection)
+			}
+			datasets[md.collection] = struct{}{}
+		}
+	}
+	return nil
+}
+
+// Close shuts down per-Store background workers (release loop, drainer,
 // dispatcher) and tears down the object cache (which closes every
 // resident Object). Safe to call multiple times.
 func (s *Store) Close() error {
+	s.stopRelease()
+	s.stopSweep()
+	s.stopIndexSync()
+	if s.readMat != nil {
+		s.readMat.close()
+	}
 	derr := s.drainer.Close()
 	if s.cache != nil {
 		_ = s.cache.Close()
@@ -420,33 +1187,88 @@ func (s *Store) Close() error {
 // space layer to back Query.Subscribe.
 func (s *Store) SubEngine() *subscribe.Engine { return s.engine }
 
+// SetPurgeHook registers fn to run for every purged object, after the
+// purge transaction committed and before the object's per-object
+// collections drop — the one point where a layer above the store can
+// still read a purged object's rows to clear its own derived state
+// (the files index). Best-effort like the rest of the purge tail; fn
+// must not load objects. Called once from the space service.
+func (s *Store) SetPurgeHook(fn func(ctx context.Context, objectId string)) {
+	s.purgeHook = fn
+}
+
 // NamedSchema pairs a dataset name with its declared schema. Returned by
 // Schemas for consumer discovery.
 type NamedSchema struct {
 	Name   string
 	Schema schema.Dataset
+	// Owners are the types that declare the dataset: one for a
+	// registered or namespaced dataset, every type declaring it for a
+	// module's canonical collection; empty for space-level built-ins.
+	// External indexers key their gating on it.
+	Owners []string
+	// Module is the serving module (records for the generic kind);
+	// empty for built-ins and registered-type datasets.
+	Module string
+	// Shared marks a shared dataset: every object's records in one
+	// collection per space.
+	Shared bool
+	// Indexes are the dataset's valid declared indexes.
+	Indexes []schema.Index
 }
 
 // Schemas returns the declared schema of every dataset this store hosts —
 // the same schemas its controllers enforce. Used by the space layer to
 // expose dataset discovery to consumers.
 func (s *Store) Schemas() []NamedSchema {
-	if s.customHandlers != nil {
-		out := make([]NamedSchema, 0, len(s.customHandlers))
-		for _, h := range s.customHandlers {
-			out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
-		}
-		return out
-	}
 	out := []NamedSchema{
 		{Name: properties.Dataset, Schema: objectsDatasetSchema()},
 		{Name: typetype.DatasetPropertyDefs, Schema: schema.Dataset{Dynamic: true}},
 		{Name: typetype.ShortIdsDataset, Schema: schema.Dataset{Dynamic: true}},
+		{Name: typetype.DatasetDefs, Schema: schema.Dataset{Dynamic: true}},
+	}
+	for _, h := range s.systemRegs {
+		out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
 	}
 	for _, t := range s.extTypes {
 		for _, d := range t.Datasets {
-			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d)})
+			out = append(out, NamedSchema{Name: d.Name, Schema: datasetSchema(d), Owners: []string{t.Id}})
 		}
+	}
+	snap := s.catalog.snapshot()
+	for _, reg := range s.canonicalRegs {
+		out = append(out, NamedSchema{
+			Name: reg.Name, Schema: reg.Schema,
+			Owners: sortedOwners(snap.canonicalOwners[reg.Name]),
+			Module: s.canonicalModule[reg.Name],
+		})
+	}
+	for _, reg := range s.staticInstanceRegs {
+		out = append(out, NamedSchema{
+			Name: reg.Name, Schema: reg.Schema,
+			Owners: []string{s.datasetOwners[reg.Name]},
+			Module: s.staticInstanceModule[reg.Name],
+		})
+	}
+	for _, name := range sortedCatalogNames(snap) {
+		ds := snap.byName[name]
+		ns := NamedSchema{Name: ds.Name, Schema: snap.regs[name].Schema, Owners: []string{ds.TypeId}, Module: ds.Module, Shared: ds.Shared}
+		for _, idx := range ds.Indexes {
+			if !idx.Invalid {
+				ns.Indexes = append(ns.Indexes, idx.Index)
+			}
+		}
+		out = append(out, ns)
+	}
+	return out
+}
+
+// SystemSchemas returns the declared schema of this store's system
+// datasets only (the tech space's spaces/profile/devices/…).
+func (s *Store) SystemSchemas() []NamedSchema {
+	out := make([]NamedSchema, 0, len(s.systemRegs))
+	for _, h := range s.systemRegs {
+		out = append(out, NamedSchema{Name: h.Name, Schema: h.Schema})
 	}
 	return out
 }
@@ -459,7 +1281,53 @@ func datasetSchema(d handler.Dataset) schema.Dataset {
 	if len(d.Schema.Fields) == 0 && !d.Schema.Dynamic {
 		return schema.Dataset{Dynamic: true}
 	}
-	return d.Schema
+	return d.Schema.Normalized()
+}
+
+// DatasetDefs returns the compiled dataset definitions of one type
+// object (deterministic fold of its `datasets` records), every part's
+// datasets flattened.
+func (s *Store) DatasetDefs(ctx context.Context, typeId string) ([]types.CompiledDataset, error) {
+	return types.CompileDatasetDefs(ctx, s.db, typeId, s.moduleInfos)
+}
+
+// TypeParts returns the compiled parts of one type object with their
+// datasets. Nil when the type declares nothing.
+func (s *Store) TypeParts(ctx context.Context, typeId string) (*types.CompiledType, error) {
+	return types.CompileTypeParts(ctx, s.db, typeId, s.moduleInfos)
+}
+
+// Modules returns the compile-time module catalog (records included).
+// Nil-safe: a nil store carries the built-in records module only.
+func (s *Store) Modules() types.Modules {
+	if s == nil || s.moduleInfos == nil {
+		return types.NewModules()
+	}
+	return s.moduleInfos
+}
+
+// DatasetHeadIds lists the live head ids declaring key on the type
+// object, duplicates included. See types.DatasetHeadIds.
+func (s *Store) DatasetHeadIds(ctx context.Context, typeId, key string) ([]string, error) {
+	return types.DatasetHeadIds(ctx, s.db, typeId, key)
+}
+
+// PartIds lists the live part ids declaring key on the type object,
+// duplicates included. See types.PartIds.
+func (s *Store) PartIds(ctx context.Context, typeId, key string) ([]string, error) {
+	return types.PartIds(ctx, s.db, typeId, key)
+}
+
+// DatasetHeadKey resolves a live head's dataset key by record id.
+// See types.DatasetHeadKey.
+func (s *Store) DatasetHeadKey(ctx context.Context, typeId, defId string) (string, error) {
+	return types.DatasetHeadKey(ctx, s.db, typeId, defId)
+}
+
+// HasDatasetDefs reports whether anything was ever declared on the
+// type object, removed definitions included. See types.HasDatasetDefs.
+func (s *Store) HasDatasetDefs(ctx context.Context, typeId string) (bool, error) {
+	return types.HasDatasetDefs(ctx, s.db, typeId)
 }
 
 // NotifyDrainer is the public hook used by callers (e.g. the
@@ -482,43 +1350,198 @@ func (s *Store) Registry() *types.LiveRegistry { return s.reg }
 // alongside user-created types.
 func (s *Store) ExternalTypes() []handler.Type { return s.extTypes }
 
+// ExternalCollections returns the caller-registered collections
+// (config.Config.Collections).
+func (s *Store) ExternalCollections() []handler.Collection { return s.extCollections }
+
 // SpaceId returns the id of the space this store serves.
 func (s *Store) SpaceId() string { return s.spaceId }
 
-// DatasetOwner returns the typeId that owns an external type-owned
-// dataset, or ("", false) for built-in / unknown datasets. Used by the
-// write path to enforce that an object implements a type before writing
-// into one of its datasets.
-func (s *Store) DatasetOwner(dataset string) (string, bool) {
-	owner, ok := s.datasetOwners[dataset]
-	return owner, ok
+// DatasetOwners returns the types that own a dataset — one for a
+// registered-type or namespaced dataset, the current declaring set for
+// a module's canonical collection (possibly empty: nothing declares it
+// yet) — and false for built-in / unknown datasets. Used by the write
+// path to enforce that an object implements an owner before writing
+// into the dataset.
+func (s *Store) DatasetOwners(dataset string) ([]string, bool) {
+	if owner, ok := s.datasetOwners[dataset]; ok {
+		return []string{owner}, true
+	}
+	if _, canonical := s.canonicalModule[dataset]; canonical {
+		return sortedOwners(s.catalog.snapshot().canonicalOwners[dataset]), true
+	}
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return []string{ds.TypeId}, true
+	}
+	return nil, false
 }
 
-// ObjectTypes returns the typeIds an object implements (its any.types),
-// read from the shared per-space `objects` row. Returns (nil, nil) when
-// the object has no row yet — callers treat that as "implements nothing".
-func (s *Store) ObjectTypes(ctx context.Context, objectId string) ([]string, error) {
+// objectsHandler is the objects-row handler: kinds off the registry,
+// module namespaces off the catalog's owner sets, and the reserved
+// carrier rule off the same sets.
+func (s *Store) objectsHandler() *properties.SystemPropertiesHandler {
+	h := properties.NewWithGrants(s.reg, s.ModuleGrants)
+	h.ReservedCarrier = s.ReservedCarrier
+	h.Classify = s.Classify
+	h.SpaceIndexId = s.spaceIndexObjId
+	return h
+}
+
+// deriveSpaceIndexId is the space's derived spaceIndex object id, a
+// pure function of the space id: the root seedSpaceIndexOnCreate
+// derives. Empty when the derivation fails.
+func (s *Store) deriveSpaceIndexId() string {
+	id, err := s.DeriveId(context.Background(), DeriveOpts{ChangePayload: []byte(spaceindex.WellKnownDeriveSeed)})
+	if err != nil {
+		return ""
+	}
+	return id
+}
+
+// ReservedCarrier reports whether typeId is a user type declaring a
+// dataset of a reserved module (handler.Module.Reserved): the
+// consumer's own install root, carried by nothing else. Registered
+// types with a static declaration of the module are not carriers —
+// the static part is the consumer's compiled-in choice to make the
+// module attachable. The properties handler consults it on the local
+// write pre-flight.
+func (s *Store) ReservedCarrier(typeId string) bool {
+	if s == nil || len(s.reservedModules) == 0 {
+		return false
+	}
+	snap := s.catalog.snapshot()
+	for _, module := range s.reservedModules {
+		if _, static := s.staticModuleOwners[module][typeId]; static {
+			continue
+		}
+		if _, ok := snap.moduleOwners[module][typeId]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ModuleGrants returns the module namespaces an object carrying
+// `members` may hold on its objects row: every module one of the
+// member types declares a dataset of. The properties handler consults
+// it on the local write pre-flight.
+func (s *Store) ModuleGrants(members map[string]struct{}) []string {
+	snap := s.catalog.snapshot()
+	var out []string
+	for module, owners := range snap.moduleOwners {
+		for t := range members {
+			if _, ok := owners[t]; ok {
+				out = append(out, module)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// counterNamespace is the objects-row namespace a tracked dataset's
+// read counters land in: the owning type for a registered-type dataset,
+// the module name for a module collection (canonical or namespaced).
+func (s *Store) counterNamespace(dataset string) string {
+	if module, ok := s.staticInstanceModule[dataset]; ok {
+		return module
+	}
+	if owner, ok := s.datasetOwners[dataset]; ok {
+		return owner
+	}
+	if module, ok := s.canonicalModule[dataset]; ok {
+		return module
+	}
+	return s.catalog.snapshot().moduleOf[dataset]
+}
+
+// ObjectMembers is what an object is: its one type (`any.type` — the
+// marker on a definition object, empty when it has none) and the
+// collections it belongs to (`any.collections`), read from the shared
+// per-space `objects` row. A missing row reads as nothing at all.
+type ObjectMembers struct {
+	Type        string
+	Collections []string
+}
+
+// ObjectMembers reads the object's membership off its row.
+func (s *Store) ObjectMembers(ctx context.Context, objectId string) (ObjectMembers, error) {
 	coll, err := s.SharedObjects(ctx)
 	if err != nil {
-		return nil, err
+		return ObjectMembers{}, err
 	}
 	doc, err := coll.FindId(ctx, objectId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return nil, nil
+			return ObjectMembers{}, nil
 		}
-		return nil, err
+		return ObjectMembers{}, err
+	}
+	return ObjectMembersOfRow(doc.Value()), nil
+}
+
+// ObjectMembersOfRow decodes the membership fields of an objects row.
+func ObjectMembersOfRow(v *anyenc.Value) ObjectMembers {
+	if v == nil {
+		return ObjectMembers{}
+	}
+	m := ObjectMembers{Type: v.GetString(anytype.TypeId, anytype.FieldType)}
+	arr := v.GetArray(anytype.TypeId, anytype.FieldCollections)
+	if len(arr) > 0 {
+		m.Collections = make([]string, 0, len(arr))
+		for _, e := range arr {
+			m.Collections = append(m.Collections, string(e.GetStringBytes()))
+		}
+	}
+	return m
+}
+
+// Classify reports what a definition id names on this device: a type
+// (registered, reserved, or a live `__type__` row), a collection
+// (registered or a live `__collection__` row), or unknown (nothing
+// resolvable here — a definition that has not synced yet, or no
+// definition at all). The properties handler consults it on the local
+// write pre-flight so a known id lands only in its own slot.
+func (s *Store) Classify(ctx context.Context, id string) (properties.OwnerKind, error) {
+	if id == "" {
+		return properties.OwnerUnknown, nil
+	}
+	if _, reserved := ReservedTypeIds[id]; reserved {
+		return properties.OwnerType, nil
+	}
+	for _, t := range s.extTypes {
+		if t.Id == id {
+			return properties.OwnerType, nil
+		}
+	}
+	for _, c := range s.extCollections {
+		if c.Id == id {
+			return properties.OwnerCollection, nil
+		}
+	}
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return properties.OwnerUnknown, err
+	}
+	doc, err := coll.FindId(ctx, id)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return properties.OwnerUnknown, nil
+		}
+		return properties.OwnerUnknown, err
 	}
 	v := doc.Value()
-	if v == nil {
-		return nil, nil
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return properties.OwnerUnknown, nil
 	}
-	arr := v.GetArray("any", "types")
-	out := make([]string, 0, len(arr))
-	for _, e := range arr {
-		out = append(out, string(e.GetStringBytes()))
+	switch v.GetString(anytype.TypeId, anytype.FieldType) {
+	case typetype.MetaTypeMarker:
+		return properties.OwnerType, nil
+	case collectiontype.MetaMarker:
+		return properties.OwnerCollection, nil
 	}
-	return out, nil
+	return properties.OwnerUnknown, nil
 }
 
 // RegularObjectCount returns the count of rows in the per-space
@@ -550,6 +1573,15 @@ func (s *Store) RegularObjectCount(ctx context.Context) int {
 // Open-only: returns anystore.ErrCollectionNotFound if the writer
 // hasn't initialised the dataset yet. Callers should treat that as
 // "no records" — equivalent to an empty controller.
+//
+// Ownership note: handles opened through here bypass the controller's
+// eviction-time release (Controller.CloseOwnedCollections) — they stay
+// in any-store's registry until process exit. Today's callers are the
+// types registry reads (`<typeId>_propertyDefs` / `<typeId>_shortIds`
+// via spaceimpl/types.go) and the tech-space accountvalues dataset —
+// bounded O(types + tech-space objects), deliberately out of scope for
+// the per-object eviction fix. Don't route per-object DATA datasets
+// through here; those belong to the object's controller.
 func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset string) (anystore.Collection, error) {
 	if objectId == "" {
 		return nil, errors.New("spaceobjects: OpenObjectCollection: objectId required")
@@ -558,6 +1590,34 @@ func (s *Store) OpenObjectCollection(ctx context.Context, objectId, dataset stri
 		return nil, errors.New("spaceobjects: OpenObjectCollection: dataset required")
 	}
 	return s.db.OpenCollection(ctx, objectId+"_"+dataset)
+}
+
+// keyedCollection returns the per-space collection of a shared dataset
+// — `<spaceId>_<dataset>` — opening it on first call. Every object's
+// records of the dataset live there, under `<objectId>/<recordId>`;
+// the controllers ensure its indexes.
+func (s *Store) keyedCollection(ctx context.Context, dataset string) (anystore.Collection, error) {
+	s.mu.Lock()
+	if coll, ok := s.keyedColls[dataset]; ok {
+		s.mu.Unlock()
+		return coll, nil
+	}
+	s.mu.Unlock()
+	collName := s.spaceId + "_" + dataset
+	coll, err := s.db.Collection(ctx, collName)
+	if err != nil {
+		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.keyedColls[dataset]; ok {
+		return existing, nil
+	}
+	if s.keyedColls == nil {
+		s.keyedColls = make(map[string]anystore.Collection)
+	}
+	s.keyedColls[dataset] = coll
+	return coll, nil
 }
 
 // SharedObjects returns the per-space `objects` collection, opening
@@ -577,16 +1637,42 @@ func (s *Store) SharedObjects(ctx context.Context) (anystore.Collection, error) 
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: open %s: %w", collName, err)
 	}
-	// Sparse index on `any.types` so the type-marker query
-	// (typesAPI.List → `any.types $in ["__type__"]`) doesn't scan
-	// every object's row. Sparse keeps the index small: only rows
-	// that actually carry a type list contribute entries. EnsureIndex
-	// is idempotent — safe to call on every fresh open.
+	// Indexes on the membership fields, under explicit names so a
+	// changed definition never collides with an index an earlier build
+	// left under the auto name (any-store refuses a same-name index
+	// with a different definition). `any.type` is dense: every object
+	// carries a type (or a marker), and a dense index also serves sorts
+	// and absence checks — it backs the marker scans (Types().List →
+	// `any.type == "__type__"`, the catalog) and member queries by
+	// type. `any.collections` is sparse: only rows filed under
+	// something contribute entries, one per element. EnsureIndex is
+	// idempotent — safe to call on every fresh open. Indexes earlier
+	// builds created under the auto names are dropped best-effort.
+	for _, stale := range []string{"any.types", anytype.TypeId + "." + anytype.FieldType} {
+		_ = coll.DropIndex(ctx, stale)
+	}
 	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
-		Fields: []string{"any.types"},
+		Name:   "idx_any_type",
+		Fields: []string{anytype.TypeId + "." + anytype.FieldType},
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure any.type index: %w", err)
+	}
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Name:   "idx_any_collections",
+		Fields: []string{anytype.TypeId + "." + anytype.FieldCollections},
 		Sparse: true,
 	}); err != nil {
-		return nil, fmt.Errorf("spaceobjects: ensure any.types index: %w", err)
+		return nil, fmt.Errorf("spaceobjects: ensure any.collections index: %w", err)
+	}
+	// Dense ascending index on the derived `modifiedAt` stamp — the
+	// recency ordering (`sort: ["-modifiedAt"]`) is the default object-
+	// list sort for clients, which would otherwise scan the whole
+	// collection per query. Dense, not sparse: a sort index
+	// must cover every row.
+	if err := coll.EnsureIndex(ctx, anystore.IndexInfo{
+		Fields: []string{"modifiedAt"},
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: ensure modifiedAt index: %w", err)
 	}
 	s.mu.Lock()
 	if s.sharedColl == nil {
@@ -608,6 +1694,131 @@ func (s *Store) DataVersion(dataset string) (string, error) {
 		return "", fmt.Errorf("%w: %q", ErrUnknownDataset, dataset)
 	}
 	return v, nil
+}
+
+// DataVersionFor resolves the DataVersion stamp for any known dataset:
+// the static map for built-ins / config-registered datasets, and for
+// runtime datasets the owning type's latest shortId encoded as a
+// `typeId:shortId` pair — so peers gate the data change against the
+// writer's schema state (dataVersionForTypes model). Falls back to the
+// defs handler version when the type has no shortId rows yet (fresh
+// hand-built state; the string parse-fails and passes the gate).
+func (s *Store) DataVersionFor(ctx context.Context, dataset string) (string, error) {
+	if v, ok := s.dataVersions[dataset]; ok {
+		return v, nil
+	}
+	ds, ok := s.catalog.lookup(dataset)
+	if !ok {
+		return "", fmt.Errorf("%w: %q", ErrUnknownDataset, dataset)
+	}
+	latest, err := s.reg.LatestShortId(ctx, ds.TypeId)
+	if err != nil {
+		return "", err
+	}
+	if latest == "" {
+		return typetype.DatasetDefsHandlerVersion, nil
+	}
+	return types.EncodeDataVersion([]types.DataVersionPair{{TypeId: ds.TypeId, ShortId: latest}}), nil
+}
+
+// RuntimeDataset resolves a runtime dataset's compiled declaration by
+// collection name — one atomic snapshot load.
+func (s *Store) RuntimeDataset(dataset string) (types.CompiledDataset, bool) {
+	return s.catalog.lookup(dataset)
+}
+
+// IsKeyedDataset reports whether dataset is a shared dataset: its
+// records from every object live in one per-space collection under
+// `<objectId>/<recordId>`, so a read for one object bounds the
+// collection with crdt.KeyedRows.
+func (s *Store) IsKeyedDataset(dataset string) bool {
+	if s == nil {
+		return false
+	}
+	ds, ok := s.catalog.lookup(dataset)
+	return ok && ds.Shared
+}
+
+// DatasetDecl resolves any known dataset's schema declaration:
+// config-registered datasets first, then the runtime catalog. Built-ins
+// are absent on purpose (their declarations are SDK-internal).
+func (s *Store) DatasetDecl(dataset string) (schema.Dataset, bool) {
+	for _, t := range s.extTypes {
+		for _, d := range t.Datasets {
+			if d.Name == dataset {
+				return datasetSchema(d), true
+			}
+		}
+	}
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return ds.Schema, true
+	}
+	return schema.Dataset{}, false
+}
+
+// SelfIdentity returns this replica's account identity (empty when the
+// store has no signing key — raw/test mode).
+func (s *Store) SelfIdentity() string { return s.selfIdentity }
+
+// EnsureDatasetRegistered makes sure the RESIDENT controller for
+// objectId (if any) carries the dataset's CURRENT registration. A
+// controller built before a runtime dataset was defined lacks its
+// handler; one built before a field was added/removed carries a stale
+// SchemaRev. Both fix by eviction — the next Get rebuilds through
+// buildRegs, which reads the current catalog snapshot. Lazy and
+// demand-driven: cost lands only on the first touch per object, never
+// as a fleet-wide sweep on schema apply.
+func (s *Store) EnsureDatasetRegistered(ctx context.Context, objectId, dataset string) {
+	if _, static := s.dataVersions[dataset]; static {
+		return
+	}
+	ds, known := s.catalog.lookup(dataset)
+	if !known {
+		return
+	}
+	v, err := s.cache.Pick(ctx, objectId)
+	if err != nil {
+		return // not resident: the next load registers it naturally
+	}
+	obj, ok := v.(*object.Object)
+	if !ok || obj.Controller() == nil {
+		return
+	}
+	if ctrl := obj.Controller(); ctrl.HasDataset(dataset) && ctrl.DatasetSchemaRev(dataset) == ds.SchemaRev {
+		return
+	}
+	s.Drop(objectId)
+}
+
+// datasetRegistered reports whether the dataset is currently known to
+// any registration source (static catalog or runtime snapshot).
+func (s *Store) datasetRegistered(dataset string) bool {
+	if _, static := s.dataVersions[dataset]; static {
+		return true
+	}
+	_, known := s.catalog.lookup(dataset)
+	return known
+}
+
+// controllerStaleFor reports whether ctrl's registration for dataset is
+// missing, out of rev against the current catalog snapshot, or carries
+// a runtime dataset the catalog no longer knows (removed definition —
+// residents must stop applying what fresh controllers park, or
+// replicas diverge).
+func (s *Store) controllerStaleFor(ctrl *crdt.Controller, dataset string) bool {
+	if ctrl == nil {
+		return false
+	}
+	if !ctrl.HasDataset(dataset) {
+		return true
+	}
+	rev := ctrl.DatasetSchemaRev(dataset)
+	if ds, ok := s.catalog.lookup(dataset); ok {
+		return rev != ds.SchemaRev
+	}
+	// Rev-tracked (runtime-registered) but absent from the catalog:
+	// the definition was removed since this controller was built.
+	return rev != ""
 }
 
 // Allocator returns the shared per-space VersionAllocator. Exposed so
@@ -633,32 +1844,755 @@ func (s *Store) Drop(objectId string) {
 // locally yet. Falls back to BuildTree on ErrTreeExists, matching
 // the Derive idempotency contract.
 func (s *Store) PutTreeFromPayload(ctx context.Context, payload treestorage.TreeStorageCreatePayload) (*object.Object, error) {
-	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
+	return s.getWithPayload(ctx, payload.RootRawChange.Id, &payload)
 }
 
-// DeleteTree marks the underlying any-sync tree as deleted and drops
-// the cached *object.Object. Wired into the SpaceRegistry's
-// DeleteTree route so the deletion-manager's per-tree cleanup pass
-// removes both the any-sync storage flag and our in-memory state.
+// DeleteTree reflects an any-sync tree deletion into local state: it
+// tombstones the tree in any-sync storage, purges the object's
+// materialized state from the SDK DB, and evicts the cached object.
+// Wired into the SpaceRegistry's DeleteTree route so the deletion
+// manager's per-tree cleanup pass reclaims both any-sync storage and
+// our on-disk + in-memory state.
 //
-// any-store rows for the deleted object are NOT cleaned up — same
-// rationale as Drop: queries skip tombstones, ids are content-
-// addressable.
+// Ordering is deliberate: tree.Delete() runs FIRST, so any-sync marks
+// the tree deleted (a permanent, cross-device-authoritative flag) and
+// then rejects every further apply to it; the cached Object is then
+// flagged deleted (Object.MarkDeleted), so a drained parked change
+// cannot apply either — the purge below therefore cannot race a
+// concurrent materialization of the same object.
+//
+// A purge failure is PROPAGATED, not swallowed: any-sync advances the
+// tree from Queued to Deleted only after this callback returns success,
+// so returning an error keeps it Queued and the deletion loop re-fires
+// the callback until the purge commits — the at-least-once self-heal for
+// a crash between tree.Delete() and the purge.
+//
+// Objects.Delete and any-sync's deletion loop both call it for one
+// tree. Whichever comes second, finding the tree deleted already, still
+// purges, after the first one's purge if it is still running (see
+// purgeAndDrop), so a successful call returns after the object's rows
+// are gone.
 func (s *Store) DeleteTree(ctx context.Context, treeId string) error {
 	obj, err := s.Get(ctx, treeId)
 	if err != nil {
+		if treeDeleted(err) {
+			return s.purgeAbsent(ctx, treeId)
+		}
 		return fmt.Errorf("spaceobjects: load %s: %w", treeId, err)
 	}
 	tree := obj.Tree()
 	if tree == nil {
-		s.Drop(treeId)
-		return nil
+		obj.MarkDeleted()
+		return s.purgeAndDrop(ctx, treeId)
 	}
-	if err := tree.Delete(); err != nil {
+	if err := tree.Delete(); err != nil && !treeDeleted(err) {
 		return fmt.Errorf("spaceobjects: tree.Delete %s: %w", treeId, err)
 	}
-	s.Drop(treeId)
+	// Deleted in any-sync; now the cached Object refuses every write
+	// (waiting for an in-flight apply under the tree lock), so a parked
+	// change drained between the purge below and the eviction cannot
+	// resurrect rows. After tree.Delete, so a failed delete leaves the
+	// object unmarked over its live tree.
+	obj.MarkDeleted()
+	return s.purgeAndDrop(ctx, treeId)
+}
+
+// MarkTreeDeleted is the soft-delete callback any-sync fires when it
+// catches a settings-tree deletion for a tree not present in local
+// storage (a device that never synced the object, or a re-fired callback
+// after tree.Delete() already removed it). Purge any materialized state
+// and evict the cache; there is no local tree to tombstone. Like
+// DeleteTree, a purge failure is returned so the deletion loop re-fires
+// until it commits.
+func (s *Store) MarkTreeDeleted(ctx context.Context, treeId string) error {
+	return s.purgeAbsent(ctx, treeId)
+}
+
+// purgeAbsent purges an object whose tree is not here to tombstone:
+// absent from local storage, or deleted already.
+func (s *Store) purgeAbsent(ctx context.Context, treeId string) error {
+	s.markCachedDeleted(ctx, treeId)
+	return s.purgeAndDrop(ctx, treeId)
+}
+
+// purgeAndDrop purges objectId and evicts it, one purge at a time.
+// Objects.Delete and the deletion loop both purge each object; the
+// second waits for the first one's reclaim, which removes the object's
+// shared-dataset rows, so neither returns while those are still
+// readable. Its own purge then removes, stamps and reclaims nothing.
+func (s *Store) purgeAndDrop(ctx context.Context, objectId string) error {
+	s.purgeMu.Lock()
+	defer s.purgeMu.Unlock()
+	if err := s.purgeObject(ctx, objectId); err != nil {
+		return err
+	}
+	s.Drop(objectId)
 	return nil
+}
+
+// treeDeleted reports an error that means the object's tree is deleted:
+// the cached Object refuses writes (MarkDeleted), the synctree is
+// deleted, or head storage records it deleted and refuses to open it.
+func treeDeleted(err error) bool {
+	return errors.Is(err, synctree.ErrSyncTreeDeleted) ||
+		errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted) ||
+		errors.Is(err, object.ErrDeleted)
+}
+
+// markCachedDeleted flags the cached Object for objectId as deleted
+// (see Object.MarkDeleted) when one is resident; an absent object has
+// nothing to refuse. Never loads.
+func (s *Store) markCachedDeleted(ctx context.Context, objectId string) {
+	if v, err := s.cache.Pick(ctx, objectId); err == nil {
+		if obj, ok := v.(*object.Object); ok {
+			obj.MarkDeleted()
+		}
+	}
+}
+
+// purgeObject hard-removes an object's local projection from the SDK
+// DB — the shared `objects` row, its read state, and every per-object
+// dataset collection (`<objectId>_<dataset>`) — stamps a durable
+// deletion marker for the consumer change-index feed, drops its parked
+// changes, and notifies live subscribers + the account mirror. Callers
+// flag the cached Object deleted first (Object.MarkDeleted), so no apply
+// lands after the purge.
+//
+// The SDK keeps NO local `objects` tombstone: any-sync's head storage is
+// the durable, cross-device record that the tree is deleted (set once,
+// never cleared, no inbound path resurrects it), so the row simply ceases
+// to exist. Instead the object's `_meta` row (deliberately KEPT) is stamped
+// del=true with a fresh applySeq, so the deletion surfaces through the
+// change-index feed as ObjectChange{Deleted:true} — the consumer's durable
+// eviction signal (see PersistDeletionMark). The `_meta` row is kept
+// anyway: the applySeq allocator seeds from max(applySeq) over these rows,
+// so removing the highest-applySeq row would rewind the allocator.
+//
+// Atomicity: the `objects` row removal, the read-state purge AND the
+// del-stamp commit in ONE WriteTx, mirroring the apply path (record +
+// watermark move together). A
+// crash before commit persists neither; any-sync keeps the tree Queued
+// (it advances Queued->Deleted only after the callback returns success) and
+// re-fires on restart. There is no window where the row is gone but the
+// deletion unannounced, nor announced but the row still live.
+//
+// Device-local: no DAG or ACL write; idempotent (a second call with the
+// row already gone and the mark set removes, stamps and reclaims nothing
+// and fires no event).
+//
+// Error contract: the correctness-critical steps — removing the shared
+// `objects` row and stamping the deletion — RETURN an error on failure so
+// the caller propagates it and any-sync re-fires the callback until the
+// purge commits (a stale row would surface a deleted object as live; a
+// missing stamp would leave it forever in a consumer's index). The
+// per-object data-collection drop and the notifications stay best-effort.
+func (s *Store) purgeObject(ctx context.Context, objectId string) error {
+	// A purged object has nothing left to catch up.
+	s.gaps.Set(objectId, false)
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge open shared objects %s: %w", objectId, err)
+	}
+	metaColl, err := s.metaCollection(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge open _meta %s: %w", objectId, err)
+	}
+
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: purge tx %s: %w", objectId, err)
+	}
+	res, perr := s.purgeRowInTx(tx.Context(), coll, metaColl, objectId)
+	if perr != nil {
+		_ = tx.Rollback()
+		return perr
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("spaceobjects: purge commit %s: %w", objectId, err)
+	}
+
+	// Best-effort from here — disk reclaim + notifications, not correctness.
+	// A purge that removed and stamped nothing repeats one that ran
+	// already (Objects.Delete and the deletion loop both purge each
+	// object), so it skips the reclaim and only closes what came up
+	// since: subscriptions, parked changes, the skip marker. A reclaim
+	// cut short (a crash, a cancelled ctx) leaves collections the next
+	// boot's deletion reconcile reclaims (PurgeObjects reclaims every
+	// materialized id). The purge hook reads the object's collections,
+	// so it runs first.
+	// dropObjectCollections sweeps every `<objectId>_*` collection, which
+	// includes the per-object history collections; the space-level history
+	// leftovers (trace rows, stale-flag row) need their own purge.
+	reclaim := (res.removed || res.stamped) && ctx.Err() == nil
+	if reclaim {
+		s.runPurgeHook(ctx, objectId)
+		s.dropObjectCollections(ctx, objectId)
+		s.purgeKeyedRows(ctx, objectId)
+		s.purgeHistoryRows(ctx, objectId)
+	}
+	s.unparkObject(ctx, objectId)
+	_ = s.unmarkSkipped(ctx, objectId)
+	// A deleted TYPE object must leave the runtime catalog, or its
+	// dataset names stay occupied forever (blocking e.g. a bundle
+	// reinstall after uninstall). refreshType compiles from the now-
+	// dropped defs collection — empty — and removes the entry. Gated
+	// on catalog membership so a bulk purge of ordinary objects never
+	// pays a rebuild per row.
+	if reclaim && s.catalogHasType(objectId) {
+		s.refreshType(ctx, objectId)
+	}
+	s.fireDeletionEvents(objectId, res.removed, res.stamped, res.seq)
+	return nil
+}
+
+// purgeResult is one object's outcome in a purge transaction.
+type purgeResult struct {
+	// removed: a live `objects` row was removed.
+	removed bool
+	// materialized: the object had a live row or a scoped `_meta` row
+	// here, so its per-object collections and rows are the caller's to
+	// reclaim.
+	materialized bool
+	// stamped: a deletion mark was written, at seq.
+	stamped bool
+	seq     uint64
+}
+
+// purgeRowInTx removes the shared `objects` row for objectId (if present),
+// its read state, and stamps its kept `_meta` row as deleted with a fresh
+// applySeq — all inside the caller's WriteTx. Stamps when the object was
+// materialized in the feed — a live `objects` row (removed) OR a
+// base-dataset-only object with a scoped `_meta` row — and the mark is not
+// set yet: a second purge (another caller, a re-fired callback, a
+// reconcile pass) stamps and announces nothing, yet still reports the
+// object materialized so its leftovers are reclaimed. A never-materialized
+// id (a delete callback for an object this device never had) stamps
+// nothing. The read-state rows go unconditionally: an object tracked on
+// this device has them whether or not it has an `objects` row, and a
+// surviving row would skip first-sight seeding for a re-materialized id
+// (see readstate.PurgeObject).
+func (s *Store) purgeRowInTx(txCtx context.Context, coll, metaColl anystore.Collection, objectId string) (res purgeResult, err error) {
+	if rerr := readstate.PurgeObject(txCtx, s.db, objectId); rerr != nil {
+		return res, fmt.Errorf("spaceobjects: purge read state %s: %w", objectId, rerr)
+	}
+	if _, ferr := coll.FindId(txCtx, objectId); ferr == nil {
+		if derr := coll.DeleteId(txCtx, objectId); derr != nil {
+			return res, fmt.Errorf("spaceobjects: purge remove row %s: %w", objectId, derr)
+		}
+		res.removed = true
+	} else if !errors.Is(ferr, anystore.ErrDocNotFound) {
+		return res, fmt.Errorf("spaceobjects: purge read row %s: %w", objectId, ferr)
+	}
+
+	stamp := res.removed
+	res.materialized = res.removed
+	if !res.removed {
+		exists, deleted, merr := crdt.MetaStatus(txCtx, metaColl, objectId, s.spaceId)
+		if merr != nil {
+			return res, fmt.Errorf("spaceobjects: purge meta check %s: %w", objectId, merr)
+		}
+		res.materialized = exists
+		stamp = exists && !deleted
+	}
+	if stamp {
+		if res.seq, err = s.applySeqs.Next(txCtx); err != nil {
+			return res, fmt.Errorf("spaceobjects: purge alloc applySeq %s: %w", objectId, err)
+		}
+		if err = crdt.PersistDeletionMark(txCtx, metaColl, objectId, s.spaceId, res.seq); err != nil {
+			return res, fmt.Errorf("spaceobjects: purge stamp del %s: %w", objectId, err)
+		}
+		res.stamped = true
+	}
+	return res, nil
+}
+
+// fireDeletionEvents emits the best-effort notifications after a committed
+// purge: the live query engine + row-event Removed (only when a live row was
+// actually removed, so a redundant purge fires nothing), and the
+// change-index deletion entry (when a del-stamp was written).
+func (s *Store) fireDeletionEvents(objectId string, removed, stamped bool, seq uint64) {
+	if removed {
+		if s.engine != nil {
+			s.engine.NotifyDeleted(s.spaceId, properties.Dataset, objectId)
+		}
+		if s.rowEvents != nil && s.rowEvents.HasSubscribers() {
+			s.rowEvents.Dispatch(RowEvent{ObjectId: objectId, Deleted: true})
+		}
+	}
+	if s.engine != nil {
+		// Per-object subscriptions (any dataset) end here: the object
+		// is gone, nothing will reach them again. After the Removed
+		// above, so a consumer sees the row leave before the close.
+		s.engine.CloseObject(objectId, space.ErrObjectDeleted)
+	}
+	if stamped && s.changeSubs.HasSubscribers() {
+		s.changeSubs.Dispatch(ObjectChange{ObjectId: objectId, ApplySeq: seq, Deleted: true})
+	}
+}
+
+// runPurgeHook fires the registered purge hook, if any.
+func (s *Store) runPurgeHook(ctx context.Context, objectId string) {
+	if s.purgeHook != nil {
+		s.purgeHook(ctx, objectId)
+	}
+}
+
+// unparkObject drops the purged object's parked changes. Best-effort:
+// a row left behind is unparked by the drainer when its replay finds
+// the object deleted.
+func (s *Store) unparkObject(ctx context.Context, objectId string) {
+	if err := s.UnparkObject(ctx, objectId); err != nil {
+		storeLog.Warn("purge: parked changes", zap.String("treeId", objectId), zap.Error(err))
+	}
+}
+
+// PurgeObjects hard-removes the local projection for a batch of objectIds in
+// ONE WriteTx (row removal + read-state purge + del-stamp per materialized
+// id not marked yet), then reclaims per-object collections listing collection names ONCE,
+// drops the cache, and emits one deletion feed entry per stamped id. Used by
+// the startup deletion-reconcile to purge many stale rows off the SDK.Open
+// path without the O(N x all-collections) cost of per-id purgeObject. Ids
+// with neither a live `objects` row nor a scoped `_meta` row (never
+// materialized here) skip the collection reclaim; the purge hook, the
+// parked-change and subscription cleanup run for every id, since those
+// hold state for an object that never had a row (a payloads object whose
+// owner was skipped, a subscription waiting for the object). Idempotent.
+func (s *Store) PurgeObjects(ctx context.Context, objectIds []string) error {
+	if len(objectIds) == 0 {
+		return nil
+	}
+	// One pass per object: a repeated id would find what its first
+	// occurrence removed and stamped, and announce nothing.
+	seen := make(map[string]struct{}, len(objectIds))
+	unique := objectIds[:0:0]
+	for _, id := range objectIds {
+		if _, dup := seen[id]; !dup {
+			seen[id] = struct{}{}
+			unique = append(unique, id)
+		}
+	}
+	objectIds = unique
+	coll, err := s.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge open shared objects: %w", err)
+	}
+	metaColl, err := s.metaCollection(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge open _meta: %w", err)
+	}
+
+	for _, id := range objectIds {
+		s.markCachedDeleted(ctx, id)
+	}
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return fmt.Errorf("spaceobjects: batch purge tx: %w", err)
+	}
+	txCtx := tx.Context()
+	purged := make(map[string]purgeResult, len(objectIds))
+	for _, id := range objectIds {
+		res, perr := s.purgeRowInTx(txCtx, coll, metaColl, id)
+		if perr != nil {
+			_ = tx.Rollback()
+			return perr
+		}
+		purged[id] = res
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("spaceobjects: batch purge commit: %w", err)
+	}
+
+	// Best-effort tail — list collection names ONCE for the whole batch,
+	// and scan the parked changes ONCE.
+	names, nerr := s.db.GetCollectionNames(ctx)
+	if nerr != nil {
+		storeLog.Warn("batch purge: list collections", zap.Error(nerr))
+	}
+	parked, perr := s.ParkedObjects(ctx)
+	if perr != nil {
+		storeLog.Warn("batch purge: list parked changes", zap.Error(perr))
+	}
+	for _, id := range objectIds {
+		p := purged[id]
+		materialized := p.materialized
+		s.runPurgeHook(ctx, id)
+		if materialized {
+			if nerr == nil {
+				s.dropObjectCollectionsNamed(ctx, id, names)
+			}
+			if nerr != nil {
+				// The batch listing failed — drop per object so the defs
+				// collection is gone before the catalog recompile, or the
+				// refresh below would re-add the deleted type's names.
+				s.dropObjectCollections(ctx, id)
+			}
+			s.purgeKeyedRows(ctx, id)
+			s.purgeHistoryRows(ctx, id)
+		}
+		if _, ok := parked[id]; ok || perr != nil {
+			s.unparkObject(ctx, id)
+		}
+		s.Drop(id)
+		// See purgeObject: a deleted type object leaves the catalog.
+		if materialized && s.catalogHasType(id) {
+			s.refreshType(ctx, id)
+		}
+		s.fireDeletionEvents(id, p.removed, p.stamped, p.seq)
+	}
+	if s.SelectiveMode() {
+		// Skip markers exist for ids that never materialized, so sweep
+		// the full input list, not just the purged rows.
+		for _, id := range objectIds {
+			_ = s.unmarkSkipped(ctx, id)
+		}
+	}
+	return nil
+}
+
+// keyedPurgeChunk bounds one delete transaction of purgeKeyedRows.
+const keyedPurgeChunk = 5000
+
+// keyedDatasets lists the shared datasets of the current catalog,
+// sorted.
+func (s *Store) keyedDatasets() []string {
+	snap := s.catalog.snapshot()
+	var names []string
+	for name, ds := range snap.byName {
+		if ds.Shared {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// purgeKeyedRows deletes objectId's rows from the per-space collection
+// of every shared dataset and tells live queries which rows went.
+// Best-effort like the rest of the purge: a failure is logged and the
+// rows stay until a later reconcile purges the object again.
+func (s *Store) purgeKeyedRows(ctx context.Context, objectId string) {
+	for _, dataset := range s.purgeDatasets() {
+		if err := s.deleteKeyedRows(ctx, dataset, objectId); err != nil {
+			storeLog.Warn("purge: shared dataset rows",
+				zap.String("treeId", objectId), zap.String("dataset", dataset), zap.Error(err))
+		}
+	}
+}
+
+// purgeDatasets lists the shared datasets a purge clears: the
+// catalog's, and every one whose collection this store opened — a
+// definition removed, or absent while its type object replays, still
+// holds the object's rows.
+func (s *Store) purgeDatasets() []string {
+	names := s.keyedDatasets()
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		seen[name] = struct{}{}
+	}
+	s.mu.Lock()
+	for name := range s.keyedColls {
+		if _, ok := seen[name]; !ok {
+			names = append(names, name)
+		}
+	}
+	s.mu.Unlock()
+	sort.Strings(names)
+	return names
+}
+
+// keyedChunkIds reads the document ids of the next chunk a
+// deleteKeyedRows transaction removes.
+func keyedChunkIds(ctx context.Context, coll anystore.Collection, rows query.Filter) ([]string, error) {
+	iter, err := coll.Find(rows).Limit(keyedPurgeChunk).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var ids []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			return nil, err
+		}
+		ids = append(ids, doc.Value().GetString(crdt.IdField))
+	}
+	return ids, iter.Err()
+}
+
+// KeyedCollection returns the per-space collection of the shared
+// dataset: every object's records, each under `<objectId>/<recordId>`.
+// ok is false when dataset is not a shared dataset of this space.
+func (s *Store) KeyedCollection(ctx context.Context, dataset string) (coll anystore.Collection, ok bool, err error) {
+	if !s.IsKeyedDataset(dataset) {
+		return nil, false, nil
+	}
+	coll, err = s.keyedCollection(ctx, dataset)
+	return coll, err == nil, err
+}
+
+// deleteKeyedRows removes objectId's rows from one shared dataset's
+// collection — a range of its primary key — in bounded transactions,
+// and tells live queries which rows went once each chunk is gone. The
+// ids are read whether or not anyone listens: a query that subscribes
+// while a delete runs saw the rows. An object with no rows costs one
+// read and no write.
+func (s *Store) deleteKeyedRows(ctx context.Context, dataset, objectId string) error {
+	coll, err := s.keyedCollection(ctx, dataset)
+	if err != nil {
+		return err
+	}
+	filter := crdt.KeyedRows(objectId)
+	for {
+		ids, err := keyedChunkIds(ctx, coll, filter)
+		if err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			return nil
+		}
+		res, err := coll.Find(filter).Limit(keyedPurgeChunk).Delete(ctx)
+		if err != nil {
+			return err
+		}
+		if s.engine != nil {
+			s.engine.NotifyRecordsDeleted(s.spaceId, dataset, objectId, ids)
+		}
+		if res.Matched == 0 && res.Modified == 0 {
+			return nil
+		}
+	}
+}
+
+// dropObjectCollections drops every `<objectId>_<dataset>` collection
+// owned by objectId — mirroring the per-object sweep the space offload
+// path performs, scoped to a single object. The id segment is matched
+// exactly (up to the first `_`) so an object whose id merely shares a
+// prefix is never touched.
+func (s *Store) dropObjectCollections(ctx context.Context, objectId string) {
+	names, err := s.db.GetCollectionNames(ctx)
+	if err != nil {
+		storeLog.Warn("purge: list collections", zap.String("treeId", objectId), zap.Error(err))
+		return
+	}
+	s.dropObjectCollectionsNamed(ctx, objectId, names)
+}
+
+// dropObjectCollectionsNamed drops every `<objectId>_<dataset>` collection
+// found in the pre-listed names slice. The batch purge lists collection
+// names once and calls this per id, avoiding an O(N x all-collections)
+// re-listing.
+func (s *Store) dropObjectCollectionsNamed(ctx context.Context, objectId string, names []string) {
+	for _, name := range names {
+		i := strings.IndexByte(name, '_')
+		if i <= 0 || name[:i] != objectId {
+			continue
+		}
+		s.dropCollectionByName(ctx, name)
+	}
+}
+
+// dropCollectionByName opens and drops one collection, retrying once
+// when the handle turns out closed: an eviction (or the twin deletion
+// callback's own drop) can close the handle between our open and the
+// Drop, and without the retry the purge would report success while the
+// collection survives on disk. The retry's fresh open disambiguates
+// what the error alone cannot — ErrCollectionClosed WRAPS
+// ErrCollectionNotFound by definition, so "closed but still on disk"
+// and "concurrently reclaimed" look identical on the failed Drop. The
+// reopen resolves from the catalog: a live handle to drop, or a bare
+// ErrCollectionNotFound meaning the concurrent path already reclaimed
+// it (the goal state, not worth a warn).
+func (s *Store) dropCollectionByName(ctx context.Context, name string) {
+	for attempt := 0; ; attempt++ {
+		coll, err := s.db.OpenCollection(ctx, name)
+		if err != nil {
+			if !errors.Is(err, anystore.ErrCollectionNotFound) {
+				storeLog.Warn("purge: open collection", zap.String("coll", name), zap.Error(err))
+			}
+			return
+		}
+		err = coll.Drop(ctx)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, anystore.ErrCollectionClosed) && attempt == 0 {
+			continue // reopen resolves: still on disk → drop; gone → silent
+		}
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return // already reclaimed by the concurrent deletion path
+		}
+		storeLog.Warn("purge: drop collection", zap.String("coll", name), zap.Error(err))
+		return
+	}
+}
+
+// headStorage returns the space's head storage; ok is false when the
+// space has no storage attached: the tree probes read that as "nothing
+// here", CheckDeriveParent as a refusal.
+func (s *Store) headStorage(ctx context.Context) (hs headstorage.HeadStorage, ok bool, err error) {
+	handle, err := s.app.GetSpace(ctx, s.spaceId)
+	if err != nil {
+		return nil, false, err
+	}
+	st := handle.Inner().Storage()
+	if st == nil {
+		return nil, false, nil
+	}
+	return st.HeadStorage(), true, nil
+}
+
+// TreeDeleted reports whether any-sync's head storage records treeId as
+// deleted — the permanent, cross-device-authoritative deletion flag
+// (set once, never cleared, no inbound path resurrects the tree). Lets
+// consumers tell a deleted object (whose local row was hard-removed)
+// apart from one that was never materialized.
+func (s *Store) TreeDeleted(ctx context.Context, treeId string) (bool, error) {
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Deleted, err
+}
+
+// TreeIsDerived reports whether treeId is a DERIVED object — the root's
+// IsDerived flag, mirrored into head storage at tree-storage creation
+// (see objecttree.createTreeStorage) — and whether the tree is present
+// in local storage. A tree absent locally reports (false, false, nil):
+// its class can't be read, so the caller can't classify it.
+//
+// Distinguishing a derived owner from a signed one is what lets its
+// payloads child pick a derivation: a derived object cannot be a tree
+// parent (objecttree.ErrDerivedParent, refused by deriveChildGate), so
+// a derived owner's payloads object is derived unparented (see
+// payloads.DerivedOwnerSeed) while a signed owner's stays parented.
+func (s *Store) TreeIsDerived(ctx context.Context, treeId string) (isDerived bool, present bool, err error) {
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Derived, e.Present, err
+}
+
+// TreeEntry is what head storage records for one tree.
+type TreeEntry struct {
+	// Present: head storage has an entry for the tree — a full tree, a
+	// heads-only stub (selective sync), or a deleted tree, which keeps
+	// its entry.
+	Present bool
+	// Deleted: deleted or queued for deletion (see TreeDeleted).
+	Deleted bool
+	// Derived: the root is derived (see TreeIsDerived).
+	Derived bool
+}
+
+// TreeEntry reads treeId's head entry once: HasTree, TreeDeleted and
+// TreeIsDerived in one lookup. A tree absent here is the zero value.
+func (s *Store) TreeEntry(ctx context.Context, treeId string) (TreeEntry, error) {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil || !ok {
+		return TreeEntry{}, err
+	}
+	return treeEntryOf(ctx, hs, treeId)
+}
+
+// HoldsTree reports whether this device stores treeId's content: a
+// non-deleted head entry that is not a selective-sync stub. It reads
+// only a loaded space — never loads one or waits on a load in flight —
+// and a space that is not loaded holds no tree it can vouch for.
+func (s *Store) HoldsTree(ctx context.Context, treeId string) bool {
+	st, resident := s.peekStorage()
+	if !resident || st == nil {
+		return false
+	}
+	e, err := treeEntryOf(ctx, st.HeadStorage(), treeId)
+	if err != nil || !e.Present || e.Deleted {
+		return false
+	}
+	skipped, err := s.IsTreeSkipped(ctx, treeId)
+	return err == nil && !skipped
+}
+
+// peekStorage returns the storage of the space if it is already
+// loaded, without loading it or waiting on a load in flight. resident
+// is false while it is not; st is nil for a resident space that holds
+// no storage (closing, or not fully opened).
+func (s *Store) peekStorage() (st spacestorage.SpaceStorage, resident bool) {
+	if s.app == nil {
+		return nil, false
+	}
+	handle, ok := s.app.PeekSpace(s.spaceId)
+	if !ok {
+		return nil, false
+	}
+	return handle.Inner().Storage(), true
+}
+
+// treeEntryOf reads one head entry; an absent tree is the zero value.
+func treeEntryOf(ctx context.Context, hs headstorage.HeadStorage, treeId string) (TreeEntry, error) {
+	entry, err := hs.GetEntry(ctx, treeId)
+	if err != nil {
+		if isDocNotFound(err) {
+			return TreeEntry{}, nil
+		}
+		return TreeEntry{}, err
+	}
+	return TreeEntry{
+		Present: true,
+		Deleted: entry.DeletedStatus != headstorage.DeletedStatusNotDeleted,
+		Derived: entry.IsDerived,
+	}, nil
+}
+
+// ErrSpaceStorageUnavailable: the space holds no storage to read head
+// entries from (closing, or not fully opened). Not a sync state.
+var ErrSpaceStorageUnavailable = errors.New("spaceobjects: space storage unavailable")
+
+// TreeEntries reads the head entries of several trees over one storage
+// handle, in the order given; an absent tree is the zero value. Unlike
+// TreeEntry, a space without storage is an error, so a caller that
+// acts on absence never mistakes a closed space for trees not synced.
+func (s *Store) TreeEntries(ctx context.Context, treeIds []string) ([]TreeEntry, error) {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrSpaceStorageUnavailable
+	}
+	out := make([]TreeEntry, len(treeIds))
+	for i, id := range treeIds {
+		if out[i], err = treeEntryOf(ctx, hs, id); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// isDocNotFound matches any-store's document-not-found across BOTH
+// major versions: any-sync's storage returns any-store v1's instance,
+// the SDK's own DB returns v2's — same text, different error values,
+// so a single errors.Is silently misses one of them.
+func isDocNotFound(err error) bool {
+	return errors.Is(err, anystore.ErrDocNotFound) || errors.Is(err, anystorev1.ErrDocNotFound)
+}
+
+// PeekLoaded returns the resident, loaded object for objectId without
+// loading or waiting: nil when none is loaded, or one is still
+// loading or closing. Safe under the subscribe engine's fence, where a
+// Get on an object whose load fired the apply would wait on itself.
+func (s *Store) PeekLoaded(objectId string) *object.Object {
+	if s.Rebuilding(objectId) {
+		return nil
+	}
+	peeker, ok := s.cache.(ocache.Peeker)
+	if !ok {
+		return nil
+	}
+	v, state := peeker.Peek(objectId, false)
+	if state != ocache.PeekHit {
+		return nil
+	}
+	return v.(*object.Object)
+}
+
+// Rebuilding reports whether a load is rebuilding objectId's rows.
+func (s *Store) Rebuilding(objectId string) bool {
+	_, ok := s.rebuilding.Load(objectId)
+	return ok
 }
 
 // Get returns the *object.Object for objectId, lazy-loading on first
@@ -671,6 +2605,7 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 	if err != nil {
 		return nil, err
 	}
+	s.touchReleased(objectId)
 	return v.(*object.Object), nil
 }
 
@@ -679,6 +2614,12 @@ func (s *Store) Get(ctx context.Context, objectId string) (*object.Object, error
 // land on the root any-sync change; for the MVP they're informational
 // only.
 func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, error) {
+	if err := s.CheckWrite(); err != nil {
+		return nil, err
+	}
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -692,7 +2633,7 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
-		IsEncrypted:   true,
+		IsEncrypted:   !opts.Unencrypted,
 		Seed:          seed,
 		// Timestamp is the creation moment baked into the immutable
 		// root change. SystemPropertiesHandler reads it back via
@@ -705,38 +2646,210 @@ func (s *Store) Create(ctx context.Context, opts CreateOpts) (*object.Object, er
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: CreateTree: %w", err)
 	}
-	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
+	return s.getWithPayload(ctx, payload.RootRawChange.Id, &payload)
 }
 
-// Derive makes a deterministic object on the space. Idempotent — a
-// second Derive with the same opts.ChangePayload returns the same
-// objectId. If the tree already exists locally, ocache's per-id
-// LoadFunc serialization deduplicates parallel callers.
-func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
+// DeriveId computes the deterministic objectId Derive(opts) would
+// produce, WITHOUT creating or loading anything. Pure: the root change
+// is built in memory from SpaceId, ChangeType, ChangePayload and
+// ParentId, which are the id. Unencrypted is not in the root; it is pinned per
+// ChangeType by validateEncryptionClass. Read paths use this to resolve
+// lazily-created objects and treat a missing tree as "no rows yet".
+func (s *Store) DeriveId(ctx context.Context, opts DeriveOpts) (string, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return "", err
+	}
+	// The id is a pure function of the root; built without the space's
+	// TreeBuilder, which also enforces creation rules (a derived parent
+	// refuses) that an id lookup must not trip.
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
+		ChangeType:    opts.ChangeType,
+		ChangePayload: opts.ChangePayload,
+		SpaceId:       s.spaceId,
+		IsEncrypted:   !opts.Unencrypted,
+		ParentId:      opts.ParentId,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("spaceobjects: derive root: %w", err)
+	}
+	return root.Id, nil
+}
+
+// HasTree reports whether the tree exists in local storage (deleted
+// trees count as existing — TreeDeleted distinguishes them).
+func (s *Store) HasTree(ctx context.Context, treeId string) (bool, error) {
+	e, err := s.TreeEntry(ctx, treeId)
+	return e.Present, err
+}
+
+// TreeIdsByChangeType returns the ids of every materialized tree in
+// this space whose root changeType equals changeType. The root is the
+// typed source of truth — signed, content-addressed (the tree id is the
+// cid of the root bytes) and cleartext, so keyed and keyless readers
+// classify identically and a peer can't relabel a tree into the result.
+//
+// Two-phase like the spacesync catch-up: collect ids while the
+// headstorage iterator is open, classify after. Trees whose root can't
+// be read are skipped — heads-only stubs (selective sync) have no
+// change rows by construction, and an unreadable root is not evidence
+// of the requested type.
+func (s *Store) TreeIdsByChangeType(ctx context.Context, changeType string) ([]string, error) {
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
 	}
-	payload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, objecttree.ObjectTreeDerivePayload{
+	st := handle.Inner().Storage()
+	if st == nil {
+		return nil, errors.New("spaceobjects: space storage unavailable")
+	}
+	var candidates []string
+	if err := st.HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		if e.DeletedStatus != headstorage.DeletedStatusNotDeleted {
+			return true, nil
+		}
+		candidates = append(candidates, e.Id)
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceobjects: iterate heads entries: %w", err)
+	}
+	var out []string
+	for _, id := range candidates {
+		ts, err := st.TreeStorage(ctx, id)
+		if err != nil {
+			continue
+		}
+		rootCh, err := ts.Root(ctx)
+		if err != nil {
+			continue
+		}
+		root, err := parseVerifiedRoot(rootCh.RawTreeChangeWithId())
+		if err != nil {
+			continue
+		}
+		if root.ChangeType == changeType {
+			out = append(out, id)
+		}
+	}
+	return out, nil
+}
+
+// Derive makes a deterministic object on the space. Idempotent — a
+// second Derive with the same opts.ChangePayload returns the same
+// objectId. ocache shares one load among parallel callers;
+// getWithPayload retries one it did not run.
+//
+// A child (opts.ParentId set) that is already stored here is loaded as
+// is, whatever its parent's local state: any-sync stores a child in any
+// arrival order, so a synced child may precede its parent. Creating a
+// child goes through deriveChildGate, which owns the parent rules here;
+// the root is built by the pure derivation so no builder-side check
+// runs ahead of the gate.
+func (s *Store) Derive(ctx context.Context, opts DeriveOpts) (*object.Object, error) {
+	if err := validateEncryptionClass(opts.ChangeType, opts.Unencrypted); err != nil {
+		return nil, err
+	}
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
 		ChangeType:    opts.ChangeType,
 		ChangePayload: opts.ChangePayload,
 		SpaceId:       s.spaceId,
-		IsEncrypted:   true,
-	})
+		IsEncrypted:   !opts.Unencrypted,
+		ParentId:      opts.ParentId,
+	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: DeriveTree: %w", err)
+		return nil, fmt.Errorf("spaceobjects: derive root: %w", err)
 	}
-	return s.Get(ctxWithLoadPayload(ctx, &payload), payload.RootRawChange.Id)
+	if opts.ParentId != "" {
+		present, err := s.CheckDeriveParent(ctx, root.Id, opts.ParentId)
+		if err != nil {
+			return nil, err
+		}
+		if present {
+			// The gate saw the child's entry: load it as is, with no
+			// create payload, so PutTree's write transaction is not
+			// opened just to report ErrTreeExists.
+			return s.Get(ctx, root.Id)
+		}
+	}
+	payload := treestorage.TreeStorageCreatePayload{
+		RootRawChange: root,
+		Changes:       []*treechangeproto.RawTreeChangeWithId{root},
+		Heads:         []string{root.Id},
+	}
+	return s.getWithPayload(ctx, root.Id, &payload)
 }
 
-// loadObject is the ocache.LoadFunc. Builds Controller + Object +
-// any-sync tree + ColdRestore in one atomic step under ocache's
-// per-id load lock. Reads an optional TreeStorageCreatePayload from
-// ctx (set by Create / Derive / PutTreeFromPayload via
-// ctxWithLoadPayload) — payload present takes the PutTree path with
-// BuildTree fallback on ErrTreeExists; absent takes BuildTree
-// directly.
-func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object, error) {
+// CheckDeriveParent runs deriveChildGate for the child childId bound to
+// parentId against this space's head storage; childPresent reports a
+// child already stored here. Derive runs it before creating; a caller
+// that must refuse before Derive (Objects.Derive with no type yet) runs
+// it first so a missing parent is reported as such.
+func (s *Store) CheckDeriveParent(ctx context.Context, childId, parentId string) (childPresent bool, err error) {
+	hs, ok, err := s.headStorage(ctx)
+	if err != nil {
+		return false, fmt.Errorf("spaceobjects: get space: %w", err)
+	}
+	if !ok {
+		return false, fmt.Errorf("spaceobjects: derive under %s: space storage unavailable", parentId)
+	}
+	return deriveChildGate(ctx, hs.GetEntry, childId, parentId)
+}
+
+// deriveChildGate decides whether a child bound to parentId may be
+// created or opened here. A child already stored passes (childPresent
+// true) whatever its parent's state, unless its own entry is queued or
+// deleted: then it is refused with space.ErrObjectNotFound, the
+// sentinel every per-object op raises for a deleted tree. Otherwise
+// one read of the parent's head entry, as it stands at creation time,
+// settles it:
+//
+//   - absent: refused with space.ErrObjectNotFound. any-sync stores a
+//     child of an absent parent, but the derived-parent rule below needs
+//     the entry, so with none a child could be minted under a derived
+//     parent and its binding would never cascade. A synced parent lifts
+//     the refusal.
+//   - deleted (queued or done): refused with space.ErrObjectDeleted.
+//     any-sync would store the child pre-queued for the deleter, and a
+//     live object handed back would be reclaimed under the caller.
+//   - derived: refused with objecttree.ErrDerivedParent. A derived
+//     object is never deleted, so the binding could never cascade.
+func deriveChildGate(ctx context.Context, getEntry func(context.Context, string) (headstorage.HeadsEntry, error), childId, parentId string) (childPresent bool, err error) {
+	if child, err := getEntry(ctx, childId); err == nil {
+		if child.DeletedStatus != headstorage.DeletedStatusNotDeleted {
+			return false, fmt.Errorf("spaceobjects: derive %s: %w", childId, space.ErrObjectNotFound)
+		}
+		return true, nil
+	} else if !isDocNotFound(err) {
+		return false, fmt.Errorf("spaceobjects: derive %s: %w", childId, err)
+	}
+	parent, err := getEntry(ctx, parentId)
+	switch {
+	case err != nil && isDocNotFound(err):
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectNotFound)
+	case err != nil:
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, err)
+	case parent.DeletedStatus != headstorage.DeletedStatusNotDeleted:
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, space.ErrObjectDeleted)
+	case parent.IsDerived:
+		return false, fmt.Errorf("spaceobjects: derive under %s: %w", parentId, objecttree.ErrDerivedParent)
+	}
+	return false, nil
+}
+
+// SetGapSet replaces the store's gap set with one the caller owns
+// across store rebuilds. Call before the store serves loads.
+func (s *Store) SetGapSet(g *GapSet) {
+	if g != nil {
+		s.gaps = g
+	}
+}
+
+// loadObject is the body of the cache's LoadFunc (load). Builds
+// Controller + Object + any-sync tree + ColdRestore in one atomic step
+// under ocache's per-id load lock. payload is the caller's creation
+// payload (getWithPayload: Create / Derive / PutTreeFromPayload):
+// present takes the PutTree path with BuildTree fallback on
+// ErrTreeExists; absent takes BuildTree directly.
+func (s *Store) loadObject(ctx context.Context, objectId string, payload *treestorage.TreeStorageCreatePayload) (ocache.Object, error) {
 	handle, err := s.app.GetSpace(ctx, s.spaceId)
 	if err != nil {
 		return nil, fmt.Errorf("spaceobjects: get space: %w", err)
@@ -745,33 +2858,162 @@ func (s *Store) loadObject(ctx context.Context, objectId string) (ocache.Object,
 	if err != nil {
 		return nil, err
 	}
-	payload := loadPayloadFromCtx(ctx)
-	var gate object.ApplyGate
-	if !s.disableGate {
-		gate = s.gateFor(objectId)
+	// A handler-version bump recorded on the object's _meta row rebuilds
+	// the object before anything reads it (see reindex.go). The verdict is
+	// read here; the wipe itself waits until the tree is open, below. A
+	// rebuild an earlier load started and never finished (its captured
+	// local leaves are still on the row) resumes: the replay continues
+	// from the persisted watermark and the leaves are restored after it.
+	stale := ctrl.StaleDatasets()
+	resume := len(stale) == 0 && ctrl.ReindexPending()
+	rebuilding := len(stale) > 0 || resume
+	if resume {
+		// A resumed rebuild: the rows are not final until this load ends.
+		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
 	}
+	// First tracked load: prefer the account's published read state
+	// (tech-space KV usually syncs before chat trees) — restore with
+	// tracking ON and merge the published frontiers after. Only when
+	// nothing was published does first-sight seeding apply, with
+	// tracking skipped during the restore (the seed covers it all).
+	seedPending := false
+	var publishedSets [][]string
+	if s.readSeedable() {
+		if seeded, sErr := s.readState.Seeded(ctx, objectId); sErr == nil && !seeded {
+			seedPending = true
+			publishedSets = s.publishedSeedHeads(ctx, objectId)
+			if len(publishedSets) == 0 {
+				s.readSeedPending.Store(objectId, struct{}{})
+				defer s.readSeedPending.Delete(objectId)
+			}
+		}
+	}
+	if rebuilding {
+		// The replay re-applies every change in the tree, which would mark
+		// the whole object unread. Read state itself survives the wipe (it
+		// lives outside the object's collections) and the materializer
+		// re-projects the flags once the rows are back.
+		s.readSeedPending.Store(objectId, struct{}{})
+		defer s.readSeedPending.Delete(objectId)
+	}
+	gate := s.gateFor(objectId, ctrl)
 	obj, err := object.New(object.Config{
-		SpaceId:    s.spaceId,
-		SignKey:    s.signKey,
-		Controller: ctrl,
-		Allocator:  s.alloc,
-		Gate:       gate,
-		AfterApply: s.afterApplyFor(),
+		SpaceId:        s.spaceId,
+		SignKey:        s.signKey,
+		Controller:     ctrl,
+		Allocator:      s.alloc,
+		Gate:           gate,
+		AfterApply:     s.afterApplyFor(),
+		AfterReplay:    s.afterReplayFor(),
+		WriteGate:      s.CheckWrite,
+		PlaintextSpecs: plaintextSpecs,
+		OnClose: func() {
+			s.releaseHistoryHandle(objectId)
+			s.stampPending.Delete(objectId)
+		},
+		ApplyGap: s.gaps.Has(objectId),
+		OnGap:    func(gap bool) { s.gaps.Set(objectId, gap) },
 	}, func(listener updatelistener.UpdateListener) (objecttree.ObjectTree, error) {
 		return s.openTree(ctx, handle, objectId, payload, listener)
 	})
 	if err != nil {
 		return nil, err
 	}
+	// Tree is open, so the replay can actually run: capture device-local
+	// values, rewind and wipe. Doing this before object.New would leave a
+	// failed open (offline, tree removed, selective-mode reject) with the
+	// rows gone, nothing to replay them back, and the captured local
+	// values dropped on the error path.
+	var reindexLeaves []localLeaf
+	if len(stale) > 0 {
+		// The wipe starts here.
+		s.rebuilding.Store(objectId, struct{}{})
+		defer s.rebuilding.Delete(objectId)
+		if reindexLeaves, err = s.reindexPrepare(ctx, objectId, ctrl, stale); err != nil {
+			return nil, err
+		}
+	} else if resume {
+		storeLog.Info("reindex: resuming interrupted rebuild", zap.String("objectId", objectId))
+		reindexLeaves = ctrl.ReindexLocalLeaves()
+	}
+	// First materialization (fresh controller, no watermark): the cold
+	// restore may drain the whole tree — skip per-change history-index
+	// rows (protected perf path, proposal §4.4) and mark the object
+	// stale for lazy backfill if anything was actually restored. A
+	// resumed rebuild is the same case mid-way: its first attempt skipped
+	// the rows and never reached the mark.
+	firstRestore := ctrl.MaxAddSeq() == 0 || resume
+	if firstRestore {
+		s.historySkipIndex.Store(objectId, struct{}{})
+		defer s.historySkipIndex.Delete(objectId)
+	}
 	if err := obj.ColdRestore(ctx); err != nil {
 		return nil, fmt.Errorf("spaceobjects: cold restore %s: %w", objectId, err)
+	}
+	if firstRestore && ctrl.MaxAddSeq() > 0 {
+		if ix, ixErr := s.HistoryIndex(ctx); ixErr == nil {
+			if mErr := ix.MarkStale(ctx, objectId); mErr != nil {
+				storeLog.Warn("history: mark stale failed", zap.String("objectId", objectId), zap.Error(mErr))
+				s.historyPendingStale.Store(objectId, struct{}{})
+			}
+		} else if !errors.Is(ixErr, ErrHistoryUnavailable) {
+			// Index not openable right now: queue the mark so the next
+			// successful open repairs it.
+			s.historyPendingStale.Store(objectId, struct{}{})
+		}
+	}
+	if rebuilding {
+		s.reindexFinish(ctx, obj, ctrl, reindexLeaves)
+		s.rebuilding.Delete(objectId)
+		if s.engine != nil {
+			// Re-read the windows the rebuild deferred.
+			s.engine.Resync(objectId, obj)
+		}
+	}
+	if seedPending {
+		if len(publishedSets) > 0 {
+			s.seedFromPublished(ctx, objectId, publishedSets)
+		} else {
+			s.seedReadState(ctx, obj, objectId)
+		}
 	}
 	return obj, nil
 }
 
+// releaseHistoryHandle closes the registry handle of the object's
+// `<objectId>__history` collection on eviction — the history index
+// opens it by name per write/read (never caching), but any-store keeps
+// every opened handle in its registry, so without this the handle (and
+// its planner sketch + caches) outlives the object's residency, one
+// per object ever applied. Best-effort: a collection that was never
+// materialised (ErrCollectionNotFound) or a concurrent close are both
+// fine — the next history write/read re-opens by name.
+//
+// Serialization mirrors the controller handles: the only `__history`
+// writer inside an apply runs under this object's tree.Lock, which the
+// Object close path holds/held before firing OnClose. The lazy history
+// backfill iterates a separate history tree without that lock — it can
+// race this close, fail one flush with ErrCollectionClosed, and be
+// retried by the next history query (the stale flag only clears on a
+// completed backfill).
+func (s *Store) releaseHistoryHandle(objectId string) {
+	if s.disableHistory {
+		return
+	}
+	coll, err := s.db.OpenCollection(context.Background(), objectId+history.HistoryCollectionSuffix)
+	if err != nil {
+		return
+	}
+	if err := coll.Close(); err != nil {
+		storeLog.Warn("close history handle", zap.String("objectId", objectId), zap.Error(err))
+	}
+}
+
 // openTree picks PutTree vs BuildTree based on whether the caller has
 // a creation payload in hand. Falls through to BuildTree when PutTree
-// reports ErrTreeExists — supports idempotent Derive.
+// reports ErrTreeExists — supports idempotent Derive. BuildTree itself
+// is retried once on ErrTreeExists (buildTreeOrStored).
 //
 // Sets SetDeferredUpdater(true) on the resulting tree: any-sync's
 // default order in AddRawChangesWithUpdater is
@@ -800,16 +3042,75 @@ func (s *Store) openTree(ctx context.Context, handle anysyncx.SpaceHandle, objec
 			return tree, nil
 		}
 		if !errors.Is(err, treestorage.ErrTreeExists) {
-			return nil, fmt.Errorf("spaceobjects: PutTree %s: %w", objectId, err)
+			// PutTree checks the deleted status first, so a re-created
+			// id whose tree was deleted here reports it on this branch.
+			return nil, treeOpenError("PutTree", objectId, err)
 		}
 		// fall through to BuildTree on ErrTreeExists
 	}
-	tree, err := tb.BuildTree(ctx, objectId, objecttreebuilder.BuildTreeOpts{Listener: listener})
+	opts := objecttreebuilder.BuildTreeOpts{Listener: listener}
+	if s.SelectiveMode() {
+		// Probe-first: a remote fetch of an unknown tree asks for root +
+		// heads only; the validator classifies by root changeType before
+		// anything is persisted. Local trees are unaffected (probe only
+		// applies when tree storage misses).
+		opts.Probe = true
+		opts.TreeValidator = s.selectiveTreeValidator(true)
+	}
+	build := func(o objecttreebuilder.BuildTreeOpts) (objecttree.ObjectTree, error) {
+		return buildTreeOrStored(func() (objecttree.ObjectTree, error) {
+			return tb.BuildTree(ctx, objectId, o)
+		})
+	}
+	tree, err := build(opts)
+	if errors.Is(err, errProbeSelectedType) {
+		// Selected type — fetch for real. The validator re-checks the
+		// type (a different peer may serve this request) and then
+		// delegates to any-sync's default validation.
+		tree, err = build(objecttreebuilder.BuildTreeOpts{
+			Listener:      listener,
+			TreeValidator: s.selectiveTreeValidator(false),
+		})
+	}
 	if err != nil {
-		return nil, fmt.Errorf("spaceobjects: BuildTree %s: %w", objectId, err)
+		return nil, treeOpenError("BuildTree", objectId, err)
 	}
 	deferIfSyncTree(tree)
 	return tree, nil
+}
+
+// buildTreeOrStored runs build, and once more when it reports
+// treestorage.ErrTreeExists. BuildTree fetches a tree missing from
+// storage from a peer, and the sync job's storage fetcher
+// (anysyncx.storageFetcher) stores trees outside the object cache's
+// per-id load lock: when it stores this tree while the request is out,
+// any-sync refuses the peer's answer with ErrTreeExists instead of
+// opening the stored copy. The tree is in storage by then, so the second
+// build takes the local path, which never reports ErrTreeExists; one
+// retry is enough, and any other error is returned as is.
+func buildTreeOrStored(build func() (objecttree.ObjectTree, error)) (objecttree.ObjectTree, error) {
+	tree, err := build()
+	if errors.Is(err, treestorage.ErrTreeExists) {
+		tree, err = build()
+	}
+	return tree, err
+}
+
+// treeOpenError wraps a failure to open an object's tree, joining
+// space.ErrObjectNotFound when the tree is unknown here or already
+// deleted — the two ways an object is not addressable on this device.
+// Both tree-open routes go through it: BuildTree reports a missing or
+// deleted tree, and PutTree reports a deleted one (it checks the
+// deleted status before creating storage).
+//
+// Consumers match that one sentinel at the API boundary instead of
+// any-sync's storage errors; the underlying error stays in the chain,
+// so callers branching on treestorage.ErrUnknownTreeId still match.
+func treeOpenError(op, objectId string, err error) error {
+	if errors.Is(err, treestorage.ErrUnknownTreeId) || errors.Is(err, spacestorage.ErrTreeStorageAlreadyDeleted) {
+		return fmt.Errorf("spaceobjects: %s %s: %w: %w", op, objectId, space.ErrObjectNotFound, err)
+	}
+	return fmt.Errorf("spaceobjects: %s %s: %w", op, objectId, err)
 }
 
 // deferIfSyncTree flips the SyncTree into deferred-updater mode (see
@@ -837,61 +3138,60 @@ func deferIfSyncTree(tree objecttree.ObjectTree) {
 // stays per-type-object.
 // objectsDatasetSchema is the per-space `objects` (properties) dataset
 // schema: Dynamic (user props are `{typeId}.{propId}`, allowed as
-// synced) with the built-in `any` fields declared by their unified
-// schema.Scope class — derived auto-fields (author/createdAt/spaceId/
-// id) are handler-only, the rest synced.
+// synced) with the derived row-root fields (id/author/spaceId/
+// createdAt/modifiedAt/modifiedBy) declared handler-only.
 //
-// Note this declares the TOP-LEVEL field heads only (`any`, typeIds are
-// dynamic). Per-PROPERTY scope (synced/account/local on a user propId)
-// is enforced by SystemPropertiesHandler against the type Registry —
-// the dataset schema can't see second path segments.
+// Only TOP-LEVEL field heads can be declared, and the synced `any`
+// values (name/description/icon/types/tags) are not heads — they live
+// under the dynamic `any` namespace, described by the `any` type's
+// properties (Types().Properties), so declaring them here would
+// advertise a root path nothing accepts. Per-PROPERTY scope
+// (synced/account/local on a user propId) is enforced by
+// SystemPropertiesHandler against the type Registry — the dataset
+// schema can't see second path segments.
 func objectsDatasetSchema() schema.Dataset {
 	fields := make([]schema.Field, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
-		fields = append(fields, schema.Field{Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope})
+		if p.Scope != schema.ScopeDerived {
+			continue
+		}
+		fields = append(fields, schema.Field{
+			Id: p.Id, Name: p.Name, Schema: schema.Leaf(p.Kind), Scope: p.Scope,
+			Description: p.Description, XFormat: types.CloneXFormat(p.XFormat),
+		})
 	}
 	return schema.Dataset{Fields: fields, Dynamic: true}
 }
 
 func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Controller, error) {
-	if s.customHandlers != nil {
-		// Raw mode: exactly the caller's handlers, each on its own
-		// per-object collection (<objectId>_<dataset>). No shared
-		// `objects` collection, no built-in regs.
-		ctrl, err := crdt.NewController(ctx, objectId, s.db, s.customHandlers...)
-		if err != nil {
-			return nil, err
-		}
-		ctrl.SetSpaceId(s.spaceId)
-		ctrl.SetApplySeqAllocator(s.applySeqs)
-		return ctrl, nil
-	}
-	coll, err := s.SharedObjects(ctx)
+	regs, sharedNames, err := s.buildRegs()
 	if err != nil {
 		return nil, err
 	}
-	shared := crdt.SharedCollections{properties.Dataset: coll}
-	regs := []crdt.HandlerReg{
-		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
-		// per-PROPERTY scopes resolved from the type registry — the
-		// handler enforces them on the DAG route, Properties.Set on
-		// the local/account routes. Declared derived heads (author /
-		// createdAt / spaceId) stay controller-enforced.
-		{Name: properties.Dataset, Handler: properties.New(s.reg), Schema: objectsDatasetSchema(), DynamicScopeByKey: true},
-		// `properties` defs + `shortIds` carry content-addressed / dynamic
-		// keyspaces — declared Dynamic (synced).
-		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}},
-		// `_ver.id` index backs LiveRegistry.LatestShortId, which reads the
-		// greatest `_ver.id` (Sort("-_ver.id").Limit(1)) to derive a type's
-		// DataVersion. `_ver.id` is stamped on every row, so the index is
-		// dense (never sparse) — a reverse-scan to the last key replaces a
-		// full-collection scan+sort as the shortIds dataset grows.
-		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}, Indexes: []anystore.IndexInfo{{Name: "idx__ver_id", Fields: []string{"_ver.id"}}}},
-	}
-	for _, t := range s.extTypes {
-		for _, d := range t.Datasets {
-			regs = append(regs, crdt.HandlerReg{Name: d.Name, Handler: d.Handler, Indexes: d.Indexes, Schema: datasetSchema(d)})
+	// Open the history index eagerly, outside any apply tx, so the
+	// apply hook only ever reads the atomic pointer (see HistoryIndex
+	// for why opening in-tx is unsafe). A failure here is tolerated —
+	// the hook defers to the stale/backfill path and the next open
+	// retries.
+	if !s.disableHistory {
+		if _, ixErr := s.HistoryIndex(ctx); ixErr != nil {
+			storeLog.Warn("history index open failed; deferring to backfill", zap.Error(ixErr))
 		}
+	}
+	shared := crdt.SharedCollections{}
+	for _, name := range sharedNames {
+		coll, cerr := s.SharedObjects(ctx)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
+	}
+	for _, name := range crdt.KeyedNames(regs) {
+		coll, cerr := s.keyedCollection(ctx, name)
+		if cerr != nil {
+			return nil, cerr
+		}
+		shared[name] = coll
 	}
 	ctrl, err := crdt.NewControllerWithShared(ctx, objectId, s.db, shared, regs...)
 	if err != nil {
@@ -899,5 +3199,284 @@ func (s *Store) newController(ctx context.Context, objectId string) (*crdt.Contr
 	}
 	ctrl.SetSpaceId(s.spaceId)
 	ctrl.SetApplySeqAllocator(s.applySeqs)
+	ctrl.SetApplyHook(s.composedApplyHook(ctrl))
 	return ctrl, nil
+}
+
+// buildRegs returns the handler registrations every controller in this
+// store runs, plus the dataset names that project into a per-space
+// shared collection (row id = ObjectId). Shared collections are NOT
+// opened here — the live path opens the space one (SharedObjects), the
+// history replay path opens scratch ones (proposal §4.1).
+func (s *Store) buildRegs() ([]crdt.HandlerReg, []string, error) {
+	regs := []crdt.HandlerReg{
+		// DynamicScopeByKey: undeclared heads (`any`, typeIds) carry
+		// per-PROPERTY scopes resolved from the type registry — the
+		// handler enforces them on the DAG route, Properties.Set on
+		// the local/account routes. Declared derived heads (author /
+		// createdAt / spaceId) stay controller-enforced. Module
+		// namespaces are granted off the catalog's owner sets.
+		{Name: properties.Dataset, Handler: s.objectsHandler(), Schema: objectsDatasetSchema(), DynamicScopeByKey: true, Version: properties.LocalVersion},
+		// `properties` defs + `shortIds` carry content-addressed / dynamic
+		// keyspaces — declared Dynamic (synced).
+		{Name: typetype.DatasetPropertyDefs, Handler: typetype.PropertyHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.PropertyHandlerLocalVersion},
+		// `_ver.id` index backs LiveRegistry.LatestShortId, which reads the
+		// greatest `_ver.id` (Sort("-_ver.id").Limit(1)) to derive a type's
+		// DataVersion. `_ver.id` is stamped on every row, so the index is
+		// dense (never sparse) — a reverse-scan to the last key replaces a
+		// full-collection scan+sort as the shortIds dataset grows.
+		{Name: typetype.ShortIdsDataset, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}, Indexes: []anystore.IndexInfo{{Name: "idx__ver_id", Fields: []string{"_ver.id"}}}},
+		// `datasets` — runtime dataset definitions on type objects
+		// (docs: SYN-147). Dynamic keyspace; the handler pins the
+		// schema-bearing fields and projects shortId rows so the
+		// DataVersion gate covers dataset-def state too.
+		{Name: typetype.DatasetDefs, Handler: typetype.DatasetDefsHandler{}, Schema: schema.Dataset{Dynamic: true}, Version: typetype.DatasetDefsLocalVersion},
+		// `payloads` — the node-readable per-file index. Registered on
+		// every controller (uniform handler set), but only payloads
+		// objects (plaintext class, see plaintextSpecs) ever write it:
+		// LocalWrite on a regular object could technically carry it,
+		// which is harmless (encrypted change, empty collection) and
+		// fenced off at the public Modify API anyway.
+		{Name: payloads.Dataset, Handler: payloads.Handler{}, Schema: payloads.Schema()},
+		// `bundles` — the per-space installed-bundles registry.
+		// Registered on every controller (uniform handler set); only the
+		// spaceIndex object carries rows by convention — the typed
+		// Bundles API always targets it.
+		{Name: spaceindex.BundlesDataset, Handler: spaceindex.BundlesHandler{}, Schema: spaceindex.BundlesSchema()},
+		// `identityKeys` — the one-to-one participants' metadata symkey
+		// exchange. Same footing as bundles: registered everywhere, rows
+		// only on a 1-1's spaceIndex object; the handler admits a row
+		// only from the identity it is keyed by.
+		{Name: spaceindex.IdentityKeysDataset, Handler: spaceindex.IdentityKeysHandler{}, Schema: spaceindex.IdentityKeysSchema()},
+	}
+	// Per-store system datasets: same footing as payloads/bundles.
+	regs = append(regs, s.systemRegs...)
+	for _, t := range s.extTypes {
+		for _, d := range t.Datasets {
+			h := d.Handler
+			if h == nil {
+				// Declared-schema dataset with no bespoke behavior: the
+				// generic schema handler enforces the declaration.
+				// Memoized at store open (SchemaHandler is read-only
+				// after construction — sharing across controllers and
+				// history scratch replays is safe).
+				if h = s.staticSchemaHandlers[d.Name]; h == nil {
+					sh, err := crdt.NewSchemaHandler(datasetSchema(d))
+					if err != nil {
+						return nil, nil, fmt.Errorf("spaceobjects: dataset %q: %w", d.Name, err)
+					}
+					h = sh
+				}
+			}
+			version := crdt.NormalizedVersion(d.HandlerVersion)
+			if d.Handler == nil {
+				// Declared-schema dataset: the SDK owns the apply logic,
+				// so its version participates too. Encoded as a pair
+				// rather than summed — a sum lets a consumer bump cancel
+				// an SDK bump and suppress the rebuild both asked for.
+				version = crdt.ComposeVersion(crdt.SchemaHandlerVersion, version)
+			}
+			regs = append(regs, crdt.HandlerReg{
+				Name: d.Name, Handler: h, Indexes: d.Indexes, Schema: datasetSchema(d),
+				Version:               version,
+				ReadTracking:          d.ReadTracking,
+				SkipHistory:           d.SkipHistory,
+				DisableFilteredReplay: d.DisableFilteredReplay,
+			})
+		}
+	}
+	// Module canonical collections and the namespaced instances
+	// registered types declare statically: on every controller, built
+	// once at store open.
+	regs = append(regs, s.canonicalRegs...)
+	regs = append(regs, s.staticInstanceRegs...)
+	// Namespaced runtime datasets: one pre-built reg per catalog entry
+	// (the generic schema handler for records, a module instance
+	// otherwise). One atomic snapshot load — no storage reads or
+	// declaration compiles on the controller-construction path.
+	snap := s.catalog.snapshot()
+	for _, name := range sortedCatalogNames(snap) {
+		if reg, ok := snap.regs[name]; ok {
+			regs = append(regs, reg)
+		}
+	}
+	return regs, []string{properties.Dataset}, nil
+}
+
+// HistoryReplayRegs returns a fresh handler-reg set plus the shared
+// dataset names for a history scratch replay (history.ViewParams).
+// Fresh per call: handlers like properties.New hold registry pointers
+// and must not be shared with live controllers' mutable state.
+func (s *Store) HistoryReplayRegs() ([]crdt.HandlerReg, []string, error) {
+	return s.buildRegs()
+}
+
+// ErrHistoryUnavailable — this store has no history index
+// (DisableHistory: the tech space carries internal bookkeeping only,
+// no history surface).
+var ErrHistoryUnavailable = errors.New("spaceobjects: history index unavailable for this store")
+
+// HistoryIndex returns the per-space version-history index, opening it
+// on first use. The skip list is derived from the registered datasets'
+// SkipHistory flags. Open failures are returned but NOT cached — the
+// next call retries. Every successful call also flushes pending stale
+// marks and deferred history purges recorded while the index was
+// unavailable.
+//
+// Never call this from inside an apply WriteTx (the collection DDL
+// would nest in — and be reverted with — the apply tx while the opened
+// handles survive in memory); the apply hook reads the atomic pointer
+// instead and defers indexing via historyPendingStale until an
+// out-of-tx caller (newController, a history query) has opened it.
+func (s *Store) HistoryIndex(ctx context.Context) (*history.Index, error) {
+	if s.disableHistory {
+		return nil, ErrHistoryUnavailable
+	}
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyMu.Lock()
+		if ix = s.historyIx.Load(); ix == nil {
+			regs, _, err := s.buildRegs()
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
+			}
+			var skip []string
+			for _, reg := range regs {
+				if reg.SkipHistory {
+					skip = append(skip, reg.Name)
+				}
+			}
+			ix, err = history.OpenIndex(ctx, s.db, s.spaceId, skip)
+			if err != nil {
+				s.historyMu.Unlock()
+				return nil, err
+			}
+			s.historyIx.Store(ix)
+		}
+		s.historyMu.Unlock()
+	}
+	s.flushPendingStale(ctx, ix)
+	s.flushPendingPurge(ctx, ix)
+	return ix, nil
+}
+
+// flushPendingStale marks every deferred object stale so the lazy
+// backfill repairs rows the warm path could not write. Entries that
+// fail to mark stay queued for the next flush.
+func (s *Store) flushPendingStale(ctx context.Context, ix *history.Index) {
+	s.historyPendingStale.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.MarkStale(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending stale mark failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingStale.Delete(objectId)
+		return true
+	})
+}
+
+// purgeHistoryRows removes a deleted object's space-level history rows
+// (trace rows, _history_meta), queueing a retry when the index is
+// unavailable or the purge fails. A queued purge supersedes any queued
+// stale mark — a deleted object must not be re-marked for backfill.
+func (s *Store) purgeHistoryRows(ctx context.Context, objectId string) {
+	if s.disableHistory {
+		return
+	}
+	s.historyPendingStale.Delete(objectId)
+	ix := s.historyIx.Load()
+	if ix == nil {
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	if err := ix.PurgeObject(ctx, objectId); err != nil {
+		storeLog.Warn("purge: history index cleanup", zap.String("treeId", objectId), zap.Error(err))
+		s.historyPendingPurge.Store(objectId, struct{}{})
+		return
+	}
+	s.historyPendingPurge.Delete(objectId)
+}
+
+// flushPendingPurge retries deferred history purges. Runs AFTER
+// flushPendingStale so a pending purge also removes any meta row a
+// stale flush just (re)wrote for the same object. Entries that fail
+// stay queued.
+func (s *Store) flushPendingPurge(ctx context.Context, ix *history.Index) {
+	s.historyPendingPurge.Range(func(key, _ any) bool {
+		objectId := key.(string)
+		if err := ix.PurgeObject(ctx, objectId); err != nil {
+			storeLog.Warn("history: pending purge failed",
+				zap.String("objectId", objectId), zap.Error(err))
+			return true
+		}
+		s.historyPendingPurge.Delete(objectId)
+		return true
+	})
+}
+
+// composedApplyHook chains the read-tracking hook and the history-index
+// hook. Nil when both are disabled so untracked spaces keep paying a
+// single nil check per apply.
+func (s *Store) composedApplyHook(ctrl *crdt.Controller) crdt.ApplyHook {
+	read := s.readApplyHook(ctrl)
+	hist := s.historyApplyHook()
+	switch {
+	case read == nil && hist == nil:
+		return nil
+	case hist == nil:
+		return read
+	case read == nil:
+		return hist
+	}
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, res *crdt.ApplyResult) error {
+		if err := read(txCtx, ch, recordIds, res); err != nil {
+			return err
+		}
+		return hist(txCtx, ch, recordIds, res)
+	}
+}
+
+// historyApplyHook writes warm-path history-index rows in the apply tx
+// (proposal §4.4). Nil under DisableHistory (tech space): its objects
+// are internal bookkeeping with no history surface, and indexing them
+// would grow a permanent index nobody can query. Objects mid-cold-
+// restore are skipped — they're marked stale and lazily backfilled
+// instead. Index failures never fail the apply (history is best-effort
+// metadata; a genuine storage fault surfaces through the apply tx
+// itself) but they DO mark the object stale so the lazy backfill
+// closes the gap instead of it becoming permanent.
+func (s *Store) historyApplyHook() crdt.ApplyHook {
+	if s.disableHistory {
+		return nil
+	}
+	return func(txCtx context.Context, ch *crdt.Change, recordIds []string, _ *crdt.ApplyResult) error {
+		if ch.ChangeId == "" || ch.Local || ch.Injected {
+			return nil
+		}
+		if _, restoring := s.historySkipIndex.Load(ch.ObjectId); restoring {
+			return nil
+		}
+		// Atomic read only — never open the index from inside the
+		// apply tx (see HistoryIndex). Not open yet: defer to the
+		// stale/backfill path.
+		ix := s.historyIx.Load()
+		if ix == nil {
+			s.historyPendingStale.Store(ch.ObjectId, struct{}{})
+			return nil
+		}
+		if err := ix.IndexChange(txCtx, ch, recordIds); err != nil {
+			storeLog.Warn("history index row failed; marking object stale",
+				zap.String("changeId", ch.ChangeId), zap.Error(err))
+			// In-tx mark: atomic with the apply. If the tx is already
+			// poisoned this fails too — queue for the next flush (a
+			// poisoned tx also rolls back the apply, which re-replays
+			// and re-indexes the change anyway).
+			if mErr := ix.MarkStale(txCtx, ch.ObjectId); mErr != nil {
+				s.historyPendingStale.Store(ch.ObjectId, struct{}{})
+			}
+		}
+		return nil
+	}
 }

@@ -7,12 +7,12 @@ import (
 	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/app/logger"
 	"go.uber.org/zap"
-	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -94,6 +94,7 @@ func newAccountMirror(ctx context.Context, store *spaceobjects.Store, tsp *techs
 			ObjectId: carrier.Id(),
 			Dataset:  accountvalues.Dataset,
 		},
+		Refill: ObjectRefill(tsp.Store(), carrier.Id(), accountvalues.Dataset),
 	}, func(yield func(id string, doc *anyenc.Value)) error { return nil })
 
 	m := &accountMirror{
@@ -298,6 +299,14 @@ func (m *accountMirror) readTargetRow(ctx context.Context, objectId string) (*an
 	doc, err := coll.FindId(ctx, objectId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
+			// A deleted object's row is hard-removed (the SDK keeps no
+			// tombstone), so an absent row is ambiguous — the object was
+			// either deleted or never materialized. any-sync's head storage
+			// is the durable deletion record: consult it so the carrier is
+			// GC'd for a real deletion and kept as a replay trigger otherwise.
+			if deleted, dErr := m.store.TreeDeleted(ctx, objectId); dErr == nil && deleted {
+				return nil, targetTombstoned
+			}
 			return nil, targetAbsent
 		}
 		return nil, targetAbsent
@@ -309,9 +318,7 @@ func (m *accountMirror) readTargetRow(ctx context.Context, objectId string) (*an
 	if v.Get(crdt.DeletedAtField) != nil {
 		return nil, targetTombstoned
 	}
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	return cloned.Value, mirrorDone
+	return anyencx.Clone(v), mirrorDone
 }
 
 // newResolver snapshots the registry into a memoizing ScopeResolver

@@ -10,7 +10,7 @@ import (
 // targets a non-existent id (the record starts empty with `_ver = {}` and the
 // op then runs as normal). This eliminates the dual-insert convergence
 // problem and the "skip if exists" footgun. See the spec divergence memory
-// note and docs/05a-crdt-spec.md §5 for rationale.
+// note and docs/crdt-spec.md §5 for rationale.
 type OpType string
 
 const (
@@ -50,7 +50,8 @@ type Op struct {
 // batch:
 //
 //   - false (default, strict): if the target id has no record, every modify
-//     in Ops is a silent no-op. Use this for "update if exists" semantics —
+//     in Ops is skipped and reported as an ErrStrictSkipAbsent rejection. Use
+//     this for "update if exists" semantics —
 //     the safe default that prevents accidental record creation from typos
 //     or stale ids.
 //
@@ -96,6 +97,12 @@ type Change struct {
 	ChangeId  string
 	VersionId VersionId
 	AddSeq    uint64
+	// PrevIds are the DAG parents of this change (the any-sync change's
+	// PreviousIds), stamped by the apply pipeline next to Creator. Empty
+	// on Local/Injected changes (no DAG) and on hand-built test changes.
+	// Consumed by read tracking: unread entries persist them so the
+	// mark-read ancestor closure never needs the tree.
+	PrevIds []string
 	// ApplySeq is the per-space apply sequence the Controller allocates
 	// inside the apply transaction (never set by callers, never on the
 	// wire). Stamped on every written record as _applySeq and persisted
@@ -104,17 +111,13 @@ type Change struct {
 	// device-local writes). Zero when the Controller has no allocator.
 	ApplySeq uint64
 	Records  []RecordChange
-	// DataVersion pins the change to a specific schema/handler version. Its
-	// meaning depends on the dataset:
-	//
-	//   - Data dataset on a user object: handler version (Phase 1: hardcoded
-	//     in the SDK; later: a user-type-defined schema version).
-	//   - `properties` dataset (per-space or per-type-object): shortId of the
-	//     last "important" change to the governing type object.
+	// DataVersion pins the change to the schema or handler state its writer
+	// used: `typeId:shortId` pairs for schema state, or a handler version
+	// string. The per-dataset mapping is in
+	// docs/types-properties-proposal.md § "Change-level DataVersion".
 	//
 	// The string is opaque to the CRDT layer — only equality matters, not
 	// ordering. Empty is invalid and causes ApplyChange to reject the change.
-	// See docs/types-properties-proposal.md § "Change-level DataVersion".
 	DataVersion string
 	// Timestamp carried alongside the change for tombstones (delete writes a
 	// `deletedAt` field). The CRDT layer treats it as advisory metadata; it is

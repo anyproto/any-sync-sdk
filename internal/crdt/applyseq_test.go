@@ -28,7 +28,7 @@ func newApplySeqController(t *testing.T, seed uint64) (*Controller, anystore.Col
 	}))
 	metaColl, err := db.Collection(ctx, MetaCollectionName)
 	require.NoError(t, err)
-	require.NoError(t, ensureMetaIndexes(ctx, metaColl))
+	require.NoError(t, EnsureMetaIndexes(ctx, metaColl))
 	return ctrl, metaColl
 }
 

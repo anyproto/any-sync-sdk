@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
 	"testing"
 	"time"
 
@@ -28,6 +30,7 @@ import (
 //     row, demoted to sentinel) — no any-store query fires.
 //   - Sub.Close() releases the mailbox cleanly (Err() == nil).
 func TestSDK_QuerySubscribe(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -59,14 +62,14 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	require.NoError(t, err)
 
 	// Seed two movies BEFORE subscribing — they show up in Initial.
-	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idA, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idA, typeId, map[string]any{
 		titleProp: "Aliens", yearProp: 1986,
 	})
 	require.NoError(t, err)
 
-	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idB, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idB, typeId, map[string]any{
 		titleProp: "Brazil", yearProp: 1985,
@@ -130,7 +133,7 @@ func TestSDK_QuerySubscribe(t *testing.T) {
 	// new arrival has the smallest tuple (sorted first), so it enters
 	// visible at the top; the prior visible-bottom (Brazil 1985) gets
 	// demoted to sentinel.
-	idC, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	idC, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, idC, typeId, map[string]any{
 		titleProp: "Dune Part Two", yearProp: 2024,
@@ -194,6 +197,7 @@ func addedIds(rs []space.SubRecord) []string {
 // still in the database — no data is lost, no records leak across
 // sub instances.
 func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -216,14 +220,14 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 
 	// Subscribe, then close immediately.
 	res1, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
 	beforeIds := idsOfInitial(res1.Initial)
 	require.Len(t, beforeIds, 3)
 
 	res2, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	require.NotNil(t, res2.Sub)
@@ -235,7 +239,7 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 
 	// Resubscribe — same data, same ids.
 	res3, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = res3.Sub.Close() })
@@ -248,6 +252,7 @@ func TestSDK_QuerySubscribe_ResubscribeAfterClose(t *testing.T) {
 // resubscribed snapshot must reflect every record written before
 // shutdown — cold-restore through any-store, no events replayed.
 func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -294,7 +299,7 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 		require.NoError(t, err)
 
 		res, err := sp.QueryObjects().
-			Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+			Filter(map[string]any{"any.type": typeId}).
 			Sort(typeId+"."+titleProp).
 			Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
 		require.NoError(t, err)
@@ -307,12 +312,13 @@ func TestSDK_QuerySubscribe_RestoreAfterRestart(t *testing.T) {
 	}
 }
 
-// TestSDK_QuerySubscribe_DriftCloseAndResubscribe drives the held
-// window past its drift budget by deleting most of its records,
-// confirms the sub closes with ErrSubscriptionDrifted, and verifies
-// that a follow-up Subscribe rebuilds a correct snapshot — the
-// resubscribe path is the engine's primary recovery contract.
-func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
+// TestSDK_QuerySubscribe_WindowRefillsPastEdge deletes rows from a
+// window with rows past its edge, well past the drift budget, and
+// confirms the window refills from storage: the subscription stays
+// open and its folded view equals a fresh snapshot of the same body.
+// A window over the same query that holds every match stays open too.
+func TestSDK_QuerySubscribe_WindowRefillsPastEdge(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -328,55 +334,104 @@ func TestSDK_QuerySubscribe_DriftCloseAndResubscribe(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk.Close() })
 
-	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Drift"})
+	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Refill"})
 	require.NoError(t, err)
 	typeId, titleProp := setupMovieType(t, ctx, sp)
 
-	// Seed 10 movies. Limit=10 → drift budget defaults to 30% → 3 losses
-	// closes the sub. We'll delete 5 to be safely over the threshold.
-	titles := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+	// Seed 15 movies. Limit=10 leaves 5 past the edge; the drift
+	// budget defaults to 30% of the limit, which 5 deletions exceed.
+	titles := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O"}
 	ids := seedMovies(t, ctx, sp, typeId, titleProp, titles)
-	require.Len(t, ids, 10)
+	require.Len(t, ids, 15)
 
 	res, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
 		Limit(10).
 		Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
-	assert.Len(t, res.Initial, 10)
+	t.Cleanup(func() { _ = res.Sub.Close() })
+	require.Len(t, res.Initial, 10)
+	view := map[string]*anyenc.Value{}
+	for _, v := range res.Initial {
+		view[string(v.GetStringBytes("id"))] = v
+	}
+
+	// Limit=20 holds every match: nothing past the edge to refill.
+	whole, err := sp.QueryObjects().
+		Filter(map[string]any{"any.type": typeId}).
+		Sort(typeId+"."+titleProp).
+		Limit(20).
+		Subscribe(ctx, space.QueryOpts{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = whole.Sub.Close() })
+	assert.Len(t, whole.Initial, 15)
 
 	// Delete the first 5 — well past 30% of limit.
 	for _, id := range ids[:5] {
 		require.NoError(t, sp.Objects().Delete(ctx, id))
 	}
 
-	// Drain whatever events arrived before the close. The mailbox
-	// eventually closes; subsequent Wait returns mb.ErrClosed.
-	closedCtx, closedCancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer closedCancel()
+	// Fold events until the view shows the ten survivors: each delete
+	// removes one row and the refill adds one from past the edge.
+	remainingTitles := titles[5:]
+	foldCtx, foldCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer foldCancel()
 	for {
-		if _, err := res.Sub.Events().Wait(closedCtx); err != nil {
-			assert.True(t, errors.Is(err, mb.ErrClosed), "expected mailbox closed, got %v", err)
+		titlesNow := extractTitles(t, valuesOf(view), typeId, titleProp)
+		sort.Strings(titlesNow)
+		if slices.Equal(titlesNow, remainingTitles) {
 			break
 		}
+		evs, err := res.Sub.Events().Wait(foldCtx)
+		require.NoError(t, err, "the window must stay open while it refills; view %v", titlesNow)
+		for _, ev := range evs {
+			for _, r := range ev.Added {
+				view[r.Id] = r.Doc
+			}
+			for _, r := range ev.Updated {
+				view[r.Id] = r.Doc
+			}
+			for _, r := range ev.Removed {
+				assert.Equal(t, space.RemoveDeleted, r.Reason)
+				delete(view, r.Id)
+			}
+		}
 	}
-	assert.True(t, errors.Is(res.Sub.Err(), space.ErrSubscriptionDrifted),
-		"sub must close with ErrSubscriptionDrifted after losing >30%% of limit; got %v", res.Sub.Err())
+	assert.NoError(t, res.Sub.Err(), "a window that refills from storage does not drift")
 
-	// Resubscribe — fresh snapshot of the *current* state.
-	res2, err := sp.QueryObjects().
-		Filter(map[string]any{"any.types": map[string]any{"$in": []any{typeId}}}).
+	wholeCtx, wholeCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer wholeCancel()
+	removed := map[string]bool{}
+	for len(removed) < 5 {
+		evs, err := whole.Sub.Events().Wait(wholeCtx)
+		require.NoError(t, err, "a window holding every match must stay open")
+		for _, ev := range evs {
+			for _, r := range ev.Removed {
+				removed[r.Id] = true
+			}
+		}
+	}
+	assert.NoError(t, whole.Sub.Err())
+
+	// A fresh snapshot of the same body agrees with the folded view.
+	fresh, err := sp.QueryObjects().
+		Filter(map[string]any{"any.type": typeId}).
 		Sort(typeId+"."+titleProp).
 		Limit(10).
-		Subscribe(ctx, space.QueryOpts{IncludeTotal: true})
+		Snapshot(ctx, space.QueryOpts{IncludeTotal: true})
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = res2.Sub.Close() })
+	assert.Equal(t, 10, fresh.Total, "remaining-movies count must match (15 created - 5 deleted)")
+	assert.Equal(t, remainingTitles, extractTitles(t, fresh.Initial, typeId, titleProp))
+}
 
-	assert.Equal(t, 5, res2.Total, "remaining-movies count must match (10 created - 5 deleted)")
-	remainingTitles := titles[5:]
-	assert.ElementsMatch(t, remainingTitles, extractTitles(t, res2.Initial, typeId, titleProp),
-		"resubscribe must show only the still-alive records")
+// valuesOf returns the rows of a folded view.
+func valuesOf(view map[string]*anyenc.Value) []*anyenc.Value {
+	out := make([]*anyenc.Value, 0, len(view))
+	for _, v := range view {
+		out = append(out, v)
+	}
+	return out
 }
 
 // setupMovieType creates a "Movie" type with a Title property and
@@ -392,13 +447,27 @@ func setupMovieType(t *testing.T, ctx context.Context, sp space.Space) (string, 
 	return typeId, titleProp
 }
 
+// setupTagCollection creates a "Tag" collection carrying one Title
+// property and returns (collectionId, titleProp). A collection has
+// properties and nothing else — no parts, no layout.
+func setupTagCollection(t *testing.T, ctx context.Context, sp space.Space) (string, string) {
+	t.Helper()
+	collId, err := sp.Collections().Create(ctx, space.CollectionCreateParams{Name: "Tag"})
+	require.NoError(t, err)
+	titleProp, err := sp.Collections().AddProperty(ctx, collId, space.PropertyDraft{
+		Name: "Title", XKey: "title", Kind: space.PropertyKindString,
+	})
+	require.NoError(t, err)
+	return collId, titleProp
+}
+
 // seedMovies writes one Movie per title with titleProp set; returns
 // the created object ids in order.
 func seedMovies(t *testing.T, ctx context.Context, sp space.Space, typeId, titleProp string, titles []string) []string {
 	t.Helper()
 	ids := make([]string, 0, len(titles))
 	for _, title := range titles {
-		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+		id, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 		require.NoError(t, err)
 		_, err = sp.Properties().Set(ctx, id, typeId, map[string]any{titleProp: title})
 		require.NoError(t, err)

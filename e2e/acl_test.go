@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -31,12 +32,15 @@ func anySyncCryptoGenerate() (crypto.PrivKey, crypto.PubKey, error) {
 //     with PermissionOwner;
 //   - ACL.CreateInvite mints a valid share token (round-trips through
 //     EncodeInvite/DecodeInvite back to the same spaceId);
-//   - MembersAPI.Invites lists the active invite;
+//   - MembersAPI.Invites lists the active invite and recovers the
+//     minting account's key from custody (token re-encodes identically;
+//     a re-mint recovers the replacement, not the stale key);
 //   - ACL.RevokeAllInvites tears it down.
 //
 // The owner-on-empty-space surface needs no second peer, so it runs
 // against staging without a parallel SDK instance.
 func TestSDK_ACL_OwnerSurface(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -97,17 +101,40 @@ func TestSDK_ACL_OwnerSurface(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, sp.Id(), decoded.SpaceId)
 
-	// Invites() lists exactly one active invite.
+	// Invites() lists exactly one active invite, and the minting
+	// account's custody makes the private key — and therefore the
+	// original share token — recoverable from the listing.
 	invs, err = sp.Members().Invites(ctx)
 	require.NoError(t, err)
 	require.Len(t, invs, 1)
 	require.NotEmpty(t, invs[0].RecordId)
+	require.NotNil(t, invs[0].Key, "minting account recovers the invite key from custody")
+	recovered, err := space.EncodeInvite(space.Invite{SpaceId: sp.Id(), InviteKey: invs[0].Key})
+	require.NoError(t, err)
+	assert.Equal(t, token, recovered, "recovered token re-encodes byte-identical")
 
-	// RevokeAllInvites tears it down.
+	// RevokeAllInvites tears it down and clears the custody.
 	require.NoError(t, sp.ACL().RevokeAllInvites(ctx))
 	invs, err = sp.Members().Invites(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, invs)
+
+	// Revoke-then-mint (the replacement flow — a second CreateInvite
+	// while one is active is ErrDuplicateInvite): custody follows the
+	// fresh invite, the old token is gone for good.
+	inv2, err := sp.ACL().CreateInvite(ctx)
+	require.NoError(t, err)
+	token2, err := space.EncodeInvite(inv2)
+	require.NoError(t, err)
+	assert.NotEqual(t, token, token2)
+	invs, err = sp.Members().Invites(ctx)
+	require.NoError(t, err)
+	require.Len(t, invs, 1)
+	require.NotNil(t, invs[0].Key)
+	recovered2, err := space.EncodeInvite(space.Invite{SpaceId: sp.Id(), InviteKey: invs[0].Key})
+	require.NoError(t, err)
+	assert.Equal(t, token2, recovered2)
+	require.NoError(t, sp.ACL().RevokeAllInvites(ctx))
 
 	// JoinRequests is empty on a fresh space.
 	reqs, err := sp.Members().JoinRequests(ctx)
@@ -150,6 +177,7 @@ func newRandomIdentity(t *testing.T) string {
 // Skips if staging is unreachable. Each Open uses a separate temp dir
 // and a fresh account key so the two SDKs are genuinely distinct.
 func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -159,20 +187,21 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 
-	mkSDK := func(name string) *anysyncsdk.SDK {
+	mkSDK := func(name string) (*anysyncsdk.SDK, string) {
 		t.Helper()
+		dir := t.TempDir()
 		cfg := config.Config{
-			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
 		}
 		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
-		return sdk
+		return sdk, dir
 	}
 
-	owner := mkSDK("owner")
-	joiner := mkSDK("joiner")
+	owner, _ := mkSDK("owner")
+	joiner, joinerDir := mkSDK("joiner")
 	require.NotEqual(t, owner.Account().Id(), joiner.Account().Id(),
 		"owner and joiner must have distinct account ids")
 
@@ -241,6 +270,16 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	assert.Equal(t, sp.Id(), joinerSpaces[0].Id)
 	assert.Equal(t, space.StatusJoining, joinerSpaces[0].Status)
 
+	// While the join is pending, a read path must not materialize the
+	// space: Get is guarded, and no any-sync storage may exist — a load
+	// with no local storage triggers a SpacePull bootstrap, which would
+	// download the whole space ciphertext before the owner accepted.
+	_, err = joiner.Spaces().Get(ctx, sp.Id())
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"Get on a pending join must refuse to materialize")
+	require.NoFileExists(t, filepath.Join(joinerDir, "anysync", sp.Id()+".db"),
+		"a pending join must not create any-sync space storage")
+
 	// 4. Owner polls JoinRequests until the joiner's request lands.
 	// The request arrives via the owner's per-space headsync pulling
 	// fresh ACL records from the consensus node — period 30s.
@@ -259,6 +298,15 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 
 	assert.Equal(t, joiner.Account().Id(), joinReq.Identity)
 	assert.NotEmpty(t, joinReq.RecordId)
+
+	// Owner resolves the requester's name from identityRepo — the join
+	// record carries only the joiner's metadata symkey, and the joiner
+	// published "Joiner Live Name" before requesting. Polled because
+	// identityRepo propagation is eventual.
+	require.Eventually(t, func() bool {
+		reqs, err := sp.Members().JoinRequests(ctx)
+		return err == nil && len(reqs) == 1 && reqs[0].Name == "Joiner Live Name"
+	}, 30*time.Second, 2*time.Second, "owner should resolve the requester's name from identityRepo")
 
 	// Wait for the watcher to fire Added(Joining) BEFORE accepting.
 	// Otherwise on a fast local stack the AcceptRequest can land between
@@ -308,6 +356,21 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	reqs, err := sp.Members().JoinRequests(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, reqs, "no pending requests after Accept")
+
+	// Owner's own tech-space row mirrors the ACL role (async, via the
+	// ACL mirror watcher primed at space wiring).
+	require.Eventually(t, func() bool {
+		infos, lErr := owner.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.OwnRole == space.PermissionOwner
+			}
+		}
+		return false
+	}, 15*time.Second, 250*time.Millisecond, "owner's space row should mirror OwnRole=owner")
 
 	// Subscribe firehose: the watcher's polling tick (~250 ms) lags
 	// the local AclList update, so allow up to 5 s for events to
@@ -366,7 +429,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.Len(t, all, 2)
 	assert.NotEqual(t, all[0].GetString("id"), all[1].GetString("id"))
 
-	// Phase 3: identityRepo. The owner publishes a profile; the
+	// identityRepo: the owner publishes a profile; the
 	// per-space members watcher fetches it (immediately, because
 	// UpdateMetadata kicks every running watcher) and overrides the
 	// owner's Member.Name. The override path doesn't depend on the
@@ -376,7 +439,6 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 	require.NoError(t, owner.Account().UpdateMetadata(ctx, space.AccountMetadata{
 		Name:        "Owner Live Name",
 		Description: "Live description",
-		IconCID:     "owner-icon-cid",
 	}))
 
 	// After the kick, the watcher's profileLoop fetches in a
@@ -388,8 +450,7 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 			return false
 		}
 		return me.Name == "Owner Live Name" &&
-			me.Description == "Live description" &&
-			me.IconCID == "owner-icon-cid"
+			me.Description == "Live description"
 	}, 5*time.Second, 100*time.Millisecond, "owner profile override never applied")
 
 	// And the materialised members collection picks up the same
@@ -416,12 +477,49 @@ func TestE2E_OwnerInviteJoinerAccept(t *testing.T) {
 		}
 		return j.Name == "Joiner Live Name"
 	}, 5*time.Second, 100*time.Millisecond, "joiner profile override never applied on owner side")
+
+	// Joiner side: acceptance flips the row to active (ACL waiter →
+	// loadJoinedSpace, which loads while the row still says "joining")
+	// and from then on Get passes the pending guard.
+	require.Eventually(t, func() bool {
+		infos, lErr := joiner.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.Status == space.StatusActive
+			}
+		}
+		return false
+	}, 90*time.Second, 2*time.Second, "joiner row never flipped to active after acceptance")
+	joinerSp, err := joiner.Spaces().Get(ctx, sp.Id())
+	require.NoError(t, err, "Get must succeed once the join is accepted")
+
+	// Custody boundary: the invite key is recoverable only on the
+	// minting account's devices. The owner's listing carries it; the
+	// joiner sees the same record with Key nil — their account never
+	// held the private half.
+	ownerInvs, err := sp.Members().Invites(ctx)
+	require.NoError(t, err)
+	require.Len(t, ownerInvs, 1)
+	assert.NotNil(t, ownerInvs[0].Key, "minting account recovers the key")
+	var joinerInvs []space.InviteInfo
+	require.Eventually(t, func() bool {
+		var iErr error
+		joinerInvs, iErr = joinerSp.Members().Invites(ctx)
+		return iErr == nil && len(joinerInvs) == 1
+	}, 60*time.Second, 2*time.Second, "joiner never saw the invite record")
+	assert.Equal(t, ownerInvs[0].RecordId, joinerInvs[0].RecordId)
+	assert.Nil(t, joinerInvs[0].Key, "non-minting account must not recover the invite key")
 }
 
 // TestSDK_Spaces_Derive verifies the deterministic-derive surface:
-// same (account, seed) lands on the same spaceId across calls, the
-// space appears in List with StatusActive, and the OwnRole is owner.
+// same (account, seed) lands on the same spaceId across calls, and the
+// space appears in List. (OwnRole mirroring is covered by
+// TestOwnRole_MirroredToSpaceRow.)
 func TestSDK_Spaces_Derive(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -439,13 +537,15 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	t.Cleanup(func() { _ = sdk.Close() })
 
 	seed := []byte("project:demo:2026-05")
-	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
+	sp1, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed, Name: "Demo"})
 	require.NoError(t, err)
 	require.NotEmpty(t, sp1.Id())
+	assert.Equal(t, "Demo", sp1.Info().Name, "first materialization writes the name")
 
 	sp2, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: seed})
 	require.NoError(t, err)
-	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed")
+	assert.Equal(t, sp1.Id(), sp2.Id(), "Derive must be idempotent for the same seed — the name is not part of the id")
+	assert.Equal(t, "Demo", sp2.Info().Name, "re-derive keeps existing metadata")
 
 	// Different seed → different space.
 	sp3, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("different")})
@@ -456,12 +556,45 @@ func TestSDK_Spaces_Derive(t *testing.T) {
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)
 	require.Len(t, list, 2)
+
+	// Derived spaces are permanent: Delete refuses, the row stays
+	// active and carries the flag.
+	err = sdk.Spaces().Delete(ctx, sp1.Id())
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
+	list, err = sdk.Spaces().List(ctx)
+	require.NoError(t, err)
+	require.Len(t, list, 2, "refused delete must not tombstone the row")
+	for _, info := range list {
+		assert.True(t, info.Derived, "derived rows carry the flag")
+		assert.Equal(t, space.StatusActive, info.Status)
+	}
+
+	// A regular created space stays unflagged and deletable — the flag
+	// must not leak onto non-derived rows.
+	created, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "NotDerived"})
+	require.NoError(t, err)
+	assert.False(t, created.Info().Derived, "created spaces must not carry the flag")
+	require.NoError(t, sdk.Spaces().Delete(ctx, created.Id()))
+
+	// A row that predates the flag (here: written by Track of the
+	// derived id) is healed by Derive, after which Delete refuses.
+	healReq := space.DeriveRequest{Seed: []byte("heal-me")}
+	healId, err := sdk.Spaces().DeriveId(ctx, healReq)
+	require.NoError(t, err)
+	require.NoError(t, sdk.Spaces().Track(ctx, healId))
+	healed, err := sdk.Spaces().Derive(ctx, healReq)
+	require.NoError(t, err)
+	require.Equal(t, healId, healed.Id())
+	assert.True(t, healed.Info().Derived, "Derive must flag a pre-existing unflagged row")
+	err = sdk.Spaces().Delete(ctx, healId)
+	require.ErrorIs(t, err, space.ErrIsDerivedSpace)
 }
 
 // TestSDK_Spaces_DeriveId confirms DeriveId is a pure, side-effect-free
 // computation: it returns the same id as Derive for the same request and
 // does not create or register a space.
 func TestSDK_Spaces_DeriveId(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -507,6 +640,7 @@ func TestSDK_Spaces_DeriveId(t *testing.T) {
 // coordinator-gated header Type, and survives a cold restart — recovered
 // from the space header.
 func TestSDK_Spaces_DeriveType(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -537,12 +671,12 @@ func TestSDK_Spaces_DeriveType(t *testing.T) {
 
 	info := sp.Info()
 	assert.Equal(t, "copilot.agent", info.SpaceType, "app tag surfaced in SpaceInfo.SpaceType")
-	assert.Equal(t, space.SpaceTypeRegular, info.Type, "header Type stays the gated regular type")
+	assert.Equal(t, space.SpaceTypeAny, info.Type, "header Type stays the gated regular type")
 
 	// Empty SpaceType defaults to the regular tag.
 	spReg, err := sdk.Spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("plain")})
 	require.NoError(t, err)
-	assert.Equal(t, space.SpaceTypeRegular, spReg.Info().SpaceType)
+	assert.Equal(t, space.SpaceTypeAny, spReg.Info().SpaceType)
 
 	require.NoError(t, sdk.Close())
 
@@ -559,7 +693,7 @@ func TestSDK_Spaces_DeriveType(t *testing.T) {
 		if sinfo.Id == id {
 			found = true
 			assert.Equal(t, "copilot.agent", sinfo.SpaceType, "SpaceType survives cold restart")
-			assert.Equal(t, space.SpaceTypeRegular, sinfo.Type)
+			assert.Equal(t, space.SpaceTypeAny, sinfo.Type)
 		}
 	}
 	assert.True(t, found, "derived space present after restart")
@@ -572,6 +706,7 @@ func TestSDK_Spaces_DeriveType(t *testing.T) {
 // follow-up. This test is gated on staging being available; the
 // invite is generated by the same SDK instance for self-test purposes.
 func TestSDK_Join_PendingErrIsExpected(t *testing.T) {
+	t.Parallel()
 	// Self-join attempt is rejected by any-sync (you can't join a space
 	// you already own). We simulate the codepath: build an invite for a
 	// space owned by us, then call Join with it. The expected behavior

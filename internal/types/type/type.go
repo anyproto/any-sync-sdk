@@ -26,10 +26,89 @@ import (
 // peer.
 const WellKnownDeriveSeed = "builtin:type"
 
+// MetaTypeMarker is the reserved value every type object carries in
+// `any.type` — what distinguishes a type object from a regular one
+// (see spaceobjects.LiveTypeRowsFilter). A definition object has no
+// type of its own: the slot holds the marker.
+//
+// TypeId is the meta-type's id: the namespace its type-only property
+// values live under (`record.type.xkey`) and the id surfaced through
+// Space.Types(). The two differ because a `_`-prefixed top-level field
+// is protocol-owned (crdt.validatePath), so the marker cannot double
+// as a storage namespace.
+//
+// Both are reserved — user-derived type ids are content-addressable
+// and never produce either string.
+const (
+	MetaTypeMarker = "__type__"
+	TypeId         = "type"
+)
+
 // Display metadata for the `type` meta-type object.
 const (
 	Name        = "Type"
-	Description = "A type — defines properties (and optionally datasets) for the objects that implement it"
+	Description = "A type — defines the properties, parts and layout of the objects that have it"
+)
+
+// FieldXKeyProp is the property id of the meta-type's `xkey` — the
+// caller-side programmatic handle for the type itself, stored at
+// `record.type.xkey`. Distinct from FieldXKey (`x-key`), which is the
+// same idea one level down, on a property DEFINITION record.
+const FieldXKeyProp = "xkey"
+
+// BuiltInProperty is one hardcoded property definition. Same shape as
+// anytype.BuiltInProperty so the types registry surfaces built-ins
+// uniformly with user-defined types.
+type BuiltInProperty struct {
+	Id    string
+	Name  string
+	Kind  schema.Kind
+	Scope schema.Scope
+	// Description and XFormat are the descriptive slice: a display
+	// description and the opaque descriptor bag (docs/data-structure.md § The
+	// `x-format` descriptor). Surfaced by Types().Properties and
+	// dataset discovery like a user definition's; never interpreted
+	// or enforced by the SDK.
+	Description string
+	XFormat     map[string]any
+}
+
+// Properties lists the meta-type's hardcoded property definitions —
+// the values that are meaningful only on a type object. They live in
+// the `type` namespace rather than `any` so the membership check in
+// properties.SystemPropertiesHandler fences them off: a row that
+// doesn't carry the marker cannot hold them at all.
+//
+// The `objects` DataVersion is deliberately NOT bumped for the move
+// off `any.xkey`: a peer that doesn't know a version parks every
+// change for that dataset, so bumping would halt all property sync
+// with older peers to protect one field. Mixed versions instead drop
+// the unknown-namespace op per-op — the type's other metadata still
+// applies, and its xkey resolves on upgraded peers only.
+var Properties = []BuiltInProperty{
+	{Id: FieldXKeyProp, Name: "XKey", Kind: schema.KindString, Scope: schema.ScopeSynced,
+		Description: "Programmatic handle of the type; consumers keep it unique per space."},
+	{Id: FieldLayoutProp, Name: "Layout", Kind: schema.KindObject, Scope: schema.ScopeSynced,
+		Description: "Layout descriptor of the primary type: {type, config}."},
+	{Id: FieldHiddenProp, Name: "Hidden", Kind: schema.KindBoolean, Scope: schema.ScopeSynced,
+		Description: "Keeps the type out of default listings and pickers.",
+		XFormat:     map[string]any{"type": "checkbox"}},
+	{Id: FieldMetaProp, Name: "Meta", Kind: schema.KindObject, Scope: schema.ScopeSynced,
+		Description: "Consumer flags, one scalar per key."},
+}
+
+// Rendering metadata a type object carries in its own namespace:
+// `type.layout` is the type's layout descriptor ({type, config},
+// written whole, opaque to the SDK).
+const FieldLayoutProp = "layout"
+
+// `type.hidden` keeps a type out of default listings and pickers
+// (self-typed bundle roots carry it); `type.meta` is the open bag of
+// consumer flags — one scalar per key, written per key so writers
+// touching different keys merge (`meta.index`, a client's own tags).
+const (
+	FieldHiddenProp = "hidden"
+	FieldMetaProp   = "meta"
 )
 
 // DatasetPropertyDefs is the dataset on a type object that holds its
@@ -49,21 +128,48 @@ const DatasetPropertyDefs = "properties"
 // rules ever change in a way that must reject stale writers.
 const HandlerVersion = "typePropertyHandler-v1"
 
+// PropertyHandlerLocalVersion is this handler's LOCAL logic version
+// (HandlerReg.Version) — bumped when a validation change means an
+// already-materialized set of definitions would come out different, so
+// the SDK replays the type object's tree (docs/versioning.md).
+//
+// It is also how a peer recovers definitions its previous build dropped:
+// the wire DataVersion deliberately stays put (bumping it would park
+// every property change on peers that don't know the new version — see
+// the Properties note above), so an older build rejects a definition it
+// cannot validate, and the replay after the upgrade applies it.
+//
+// v2: `datetime` is a kind, and the date formats accept it.
+// v3: the typed `format` object is gone (no format→kind coupling, no
+// pinned `format.type`); `x-format` must be an object, created whole.
+const PropertyHandlerLocalVersion = 3
+
 // Property-record field names. The shape is hardcoded in Go (no JSON
 // Schema applies on this dataset — see
 // docs/types-properties-proposal.md § "Schema format — decision").
 const (
 	FieldKey         = "key"         // user-facing stable identifier (e.g. "actors")
-	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"
+	FieldKind        = "kind"        // "string"/"number"/"boolean"/"null"/"array"/"object"/"datetime"
 	FieldScope       = "scope"       // "synced"/"account"/"local" — write/sync class, pinned
 	FieldName        = "name"        // human label, mutable
 	FieldDescription = "description" // mutable
-	FieldXKey        = "x-key"       // caller-side mapping key, mutable
+	FieldXKey        = "x-key"       // caller-side handle, mutable
 	FieldItems       = "items"       // recursive sub-shape for arrays
 	FieldProperties  = "properties"  // recursive sub-shape for objects
-	FieldRequired    = "required"    // []string, mutable per docs/06
+	FieldRequired    = "required"    // []string, mutable per docs/data-structure.md
 	FieldMeta        = "meta"        // opaque consumer flag map (string→string), mutable
+	FieldXFormat     = "x-format"    // opaque descriptor object, mutable — see below
 )
+
+// `x-format` is the descriptor bag: everything descriptive about a
+// property or a dataset field — semantic slug, icon, ordering key,
+// option set, relation targets, per-format config. The SDK stores it
+// opaquely. Two structural rules and nothing else: it is an object,
+// and a creation writes it whole (dotted `x-format.*` keys at create
+// are rejected, so there is exactly one creation shape to validate).
+// Afterwards it is patched per path like any CRDT member — the
+// vocabulary, the leaf-only patch rule and value validation belong to
+// the consumer (the `any` server), never to a handler.
 
 // schemaBearingFields are pinned for the life of the property record.
 // Edits to any of these on an existing record drop the offending op.
@@ -84,6 +190,24 @@ var schemaBearingFields = map[string]struct{}{
 	FieldProperties: {},
 }
 
+// isPinnedPath reports whether a write targeting `path` touches pinned
+// state: the head segment is a schema-bearing field, so the whole
+// subtree is pinned. Everything else — including every path under
+// `x-format` — is mutable.
+func isPinnedPath(path []string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	_, locked := schemaBearingFields[path[0]]
+	return locked
+}
+
+// IsPinnedPath is the exported form of isPinnedPath, so the space layer
+// (PatchProperty) can reject writes to pinned state client-side and
+// fail the whole patch fast, rather than relying on the handler's
+// per-op drop (which would partially apply a mixed patch).
+func IsPinnedPath(path []string) bool { return isPinnedPath(path) }
+
 // ErrMissingKind indicates a property record was created without a
 // `kind` field. Wraps crdt.ErrValidation so callers can match either.
 var ErrMissingKind = errors.New("typetype: property record requires `kind`")
@@ -92,6 +216,12 @@ var ErrMissingKind = errors.New("typetype: property record requires `kind`")
 // label, or the reserved "derived" scope (SDK built-ins only). Wraps
 // crdt.ErrValidation so callers can match either.
 var ErrBadScope = errors.New("typetype: property `scope` must be one of synced/account/local")
+
+// ErrBadXFormat indicates a structurally malformed `x-format` in a
+// creation change: not an object, or written through dotted
+// `x-format.*` keys instead of as one whole object. Shared by property
+// and dataset-field records. Wraps crdt.ErrValidation.
+var ErrBadXFormat = errors.New("typetype: `x-format` must be an object created whole")
 
 // PropertyHandler validates ops on a type object's `properties`
 // dataset and projects shortId rows into the sibling shortIds dataset
@@ -123,21 +253,118 @@ func (PropertyHandler) BeforeCreate(ctx *crdt.ChangeCtx, rec *crdt.RecordChange,
 			return fmt.Errorf("%w: %w (got %q)", crdt.ErrValidation, ErrBadScope, scopeLabel)
 		}
 	}
+	if err := validateXFormatCreate(rec.Ops); err != nil {
+		return err
+	}
 	sink.Project(ShortIdsDataset, shortIdRow(ctx.Change.ChangeId, rec.Id, kindLabel))
 	return nil
 }
 
-// BeforeModify rejects edits to schema-bearing fields on an existing
-// record (`key`, `kind`, `items`, `properties`). Display-only edits
-// (`name`, `description`, `x-key`, `required`) pass through.
-// Not an "important" change — no shortId minting.
-func (PropertyHandler) BeforeModify(_ *crdt.ChangeCtx, _ *crdt.RecordChange, op *crdt.Op, _ *crdt.Sink) error {
-	if len(op.Path) == 0 {
-		// Multi-field $set/$unset — guard each top-level key.
-		return rejectIfMultiFieldTouchesSchema(op.Payload)
+// validateXFormatCreate checks the one structural rule on `x-format` in
+// a creation change: when present it is an object written whole under
+// the `x-format` key (the shape AddProperty / AddDataset emit) — dotted
+// `x-format.*` keys and deep-path ops are rejected so there is exactly
+// one creation shape. Nothing inside the object is inspected.
+func validateXFormatCreate(ops []crdt.Op) error {
+	_, err := extractObjectField(ops, FieldXFormat)
+	return err
+}
+
+// extractObjectField walks creation ops looking for the object-valued
+// `field`, mirroring extractField's two accepted shapes (multi-field
+// $set payload key, or single-field $set with Path = [field]). Any
+// other op shape touching the field — dotted `<field>.*` payload keys,
+// a deeper path, a non-object value — is an error rather than a silent
+// skip, so a creation can't smuggle a half-written object past
+// validation. Returns nil, nil when the field is absent.
+func extractObjectField(ops []crdt.Op, field string) (*anyenc.Value, error) {
+	var found *anyenc.Value
+	for i := range ops {
+		op := &ops[i]
+		if len(op.Path) > 0 {
+			if op.Path[0] != field {
+				continue
+			}
+			if op.Type != crdt.OpSet || len(op.Path) != 1 || op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+				return nil, fmt.Errorf("%w: %w: %s must be created as a whole object", crdt.ErrValidation, ErrBadXFormat, field)
+			}
+			found = op.Payload
+			continue
+		}
+		if op.Type != crdt.OpSet || op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+			continue
+		}
+		obj, _ := op.Payload.Object()
+		var shapeErr error
+		obj.Visit(func(k []byte, v *anyenc.Value) {
+			if shapeErr != nil {
+				return
+			}
+			key := string(k)
+			if key == field {
+				if v.Type() != anyenc.TypeObject {
+					shapeErr = fmt.Errorf("%w: %w: `%s` must be an object", crdt.ErrValidation, ErrBadXFormat, field)
+					return
+				}
+				found = v
+				return
+			}
+			if strings.HasPrefix(key, field+".") {
+				shapeErr = fmt.Errorf("%w: %w: dotted key %q not allowed at create", crdt.ErrValidation, ErrBadXFormat, key)
+			}
+		})
+		if shapeErr != nil {
+			return nil, shapeErr
+		}
 	}
-	if _, locked := schemaBearingFields[op.Path[0]]; locked {
-		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, op.Path[0])
+	return found, nil
+}
+
+// BeforeModify rejects edits to pinned state on an existing record:
+// the schema-bearing fields (`key`, `kind`, `scope`, `items`,
+// `properties`). Everything else — `name`, `description`, `x-key`,
+// `required`, `meta.*` and every path under `x-format` — passes
+// through with no value checks, bar one: a $set of the whole
+// `x-format` must be an object (checkXFormatWholeSet), so the
+// create-time shape holds for the record's life. Not an "important"
+// change — no shortId minting — with one exception: a creation-shaped
+// upsert landing on an existing record.
+//
+// That is a concurrent duplicate create — two devices declaring a
+// bundle property under its deterministic id while apart. The change
+// is a create on its author's replica (BeforeCreate projected its
+// shortId row there) and a modify everywhere else. The author stamps
+// its later data writes with the newest shortId it knows, which may
+// be this one, so every replica must know it too or those writes park
+// forever: the row is projected here as well. Idempotent — the same
+// row id on every replica — and the record itself merges as any
+// modify does (the pinned keys are shed, the rest is identical).
+func (PropertyHandler) BeforeModify(ctx *crdt.ChangeCtx, rec *crdt.RecordChange, op *crdt.Op, sink *crdt.Sink) error {
+	if len(op.Path) == 0 {
+		if rec.Upsert && op.Type == crdt.OpSet {
+			if kindLabel, ok := extractKind([]crdt.Op{*op}); ok {
+				sink.Project(ShortIdsDataset, shortIdRow(ctx.Change.ChangeId, rec.Id, kindLabel))
+			}
+		}
+		// Multi-field $set/$unset — guard each key.
+		return rejectIfMultiFieldTouchesPinned(op)
+	}
+	if isPinnedPath(op.Path) {
+		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, strings.Join(op.Path, "."))
+	}
+	return checkXFormatWholeSet(op.Type, op.Path, op.Payload)
+}
+
+// checkXFormatWholeSet keeps `x-format` an object on every peer: a $set
+// whose path is exactly `x-format` must carry an object. Paths below it
+// are free, and $unset of the whole bag is a clear, not a shape change.
+// Shared by the property and dataset-def handlers.
+func checkXFormatWholeSet(opType crdt.OpType, path []string, payload *anyenc.Value) error {
+	if opType != crdt.OpSet || len(path) != 1 || path[0] != FieldXFormat {
+		return nil
+	}
+	if payload == nil || payload.Type() != anyenc.TypeObject {
+		return fmt.Errorf("%w: %w: a whole `%s` set must carry an object", crdt.ErrValidation, ErrBadXFormat, FieldXFormat)
 	}
 	return nil
 }
@@ -190,34 +417,30 @@ func extractField(ops []crdt.Op, field string) (string, bool) {
 	return "", false
 }
 
-// rejectIfMultiFieldTouchesSchema scans a multi-field $set/$unset
-// payload for keys in schemaBearingFields. Returns an error wrapping
-// crdt.ErrValidation on the first hit; nil otherwise.
+// rejectIfMultiFieldTouchesPinned scans a multi-field $set/$unset
+// payload for keys whose dotted path is pinned (isPinnedPath), and
+// applies the whole-`x-format` object rule to a bare `x-format` key.
+// Returns an error wrapping crdt.ErrValidation on the first hit; nil
+// otherwise.
 //
-// Dotted-path keys (e.g. "items.kind") count as touching the
-// top-level field that owns the schema-bearing prefix.
-func rejectIfMultiFieldTouchesSchema(payload *anyenc.Value) error {
-	if payload == nil || payload.Type() != anyenc.TypeObject {
+// Dotted-path keys (e.g. "items.kind") count as touching the pinned
+// path that owns them.
+func rejectIfMultiFieldTouchesPinned(op *crdt.Op) error {
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
 		return nil
 	}
-	obj, _ := payload.Object()
-	var hit string
-	obj.Visit(func(k []byte, _ *anyenc.Value) {
-		if hit != "" {
+	obj, _ := op.Payload.Object()
+	var hit error
+	obj.Visit(func(k []byte, v *anyenc.Value) {
+		if hit != nil {
 			return
 		}
-		key := string(k)
-		// Top-level field is everything before the first '.'.
-		head := key
-		if i := strings.IndexByte(head, '.'); i >= 0 {
-			head = head[:i]
+		path := strings.Split(string(k), ".")
+		if isPinnedPath(path) {
+			hit = fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, string(k))
+			return
 		}
-		if _, locked := schemaBearingFields[head]; locked {
-			hit = head
-		}
+		hit = checkXFormatWholeSet(op.Type, path, v)
 	})
-	if hit != "" {
-		return fmt.Errorf("%w: %q is pinned after first write", crdt.ErrValidation, hit)
-	}
-	return nil
+	return hit
 }

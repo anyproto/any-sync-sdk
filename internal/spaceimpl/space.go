@@ -2,18 +2,27 @@ package spaceimpl
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"slices"
+	"strings"
+	"time"
 
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/valyala/fastjson"
 
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -29,72 +38,79 @@ type spaceImpl struct {
 	tsp    *techspace.Service
 	store  *spaceobjects.Store
 	parent *Service
+	// techIndexId is set on the inner impl of the tech-space handle:
+	// the resident tech index object stands in for the per-space
+	// spaceIndex object (no derive, no index watcher wiring).
+	techIndexId string
 
-	objects    *objectService
-	types      *typesAPI
-	properties *propertiesAPI
-	acl        *aclAPI
-	members    *membersAPI
+	objects     *objectService
+	types       *typesAPI
+	collections *collectionsAPI
+	properties  *propertiesAPI
+	acl         *aclAPI
+	members     *membersAPI
+	bundles     *bundlesAPI
 }
 
 func newSpace(id string, app *anysyncx.App, tsp *techspace.Service, store *spaceobjects.Store, parent *Service) *spaceImpl {
 	s := &spaceImpl{id: id, app: app, tsp: tsp, store: store, parent: parent}
 	s.objects = newObjectService(s)
 	s.types = newTypesAPI(s)
+	s.collections = newCollectionsAPI(s, s.types)
 	s.properties = newPropertiesAPI(s)
 	s.acl = newACLAPI(s)
 	s.members = newMembersAPI(s)
+	s.bundles = newBundlesAPI(s)
 	return s
 }
 
 func (s *spaceImpl) Id() string { return s.id }
 
+// indexObjectId resolves this space's spaceIndex object: the tech
+// index on the tech handle's inner impl, otherwise the per-space
+// derived object (which also wires the index watcher and mirrors —
+// never for the tech id).
+func (s *spaceImpl) indexObjectId(ctx context.Context) (string, error) {
+	if s.techIndexId != "" {
+		return s.techIndexId, nil
+	}
+	return s.parent.spaceIndexObjectIdFor(ctx, s.id)
+}
+
 // Info reads the space-index snapshot.
 //
-// LocalStatus="joining" is fact-checked against the live AclList: if
-// the local identity is already StatusActive in the ACL (owner accepted,
-// records replicated locally) we return StatusActive without waiting
-// for the tech-space record to flip. The self-heal write that updates
-// the cached tech-space row lives in the members watcher
-// (memberWatcher.tick), so the fix here covers the read path even when
-// the watcher hasn't been started yet (e.g. caller hits Info() before
-// any Members().Subscribe / Query).
+// A row still reading joining or ended is fact-checked against the live
+// AclList: if the local identity is already StatusActive in the ACL
+// (owner accepted, records replicated locally) we return StatusActive
+// without waiting for the tech-space record to flip. The self-heal
+// write that updates the cached tech-space row is the members watcher's
+// too (memberWatcher.tick), so the fix here covers the read path even
+// when the watcher hasn't been started yet (e.g. caller hits Info()
+// before any Members().Subscribe / Query).
 func (s *spaceImpl) Info() space.SpaceInfo {
 	ctx := context.Background()
 	rec, ok := s.tsp.Get(ctx, s.id)
 	if !ok {
-		return space.SpaceInfo{Id: s.id}
+		// the row is the only carrier of the switch; without it the default holds
+		return space.SpaceInfo{Id: s.id, P2PAdvertise: true}
 	}
 	info := s.parent.recordToInfo(ctx, rec)
-	if info.Status == space.StatusJoining && s.localIdentityActive(ctx) {
+	if (info.Status == space.StatusJoining || rec.JoinEnded()) && s.localIdentityActive(ctx) {
 		info.Status = space.StatusActive
 		// Fire-and-forget self-heal so the next List() / Get() reads
 		// the right cached status without a live AclList round-trip.
 		// Members watcher does the same flip when running; this path
 		// covers callers that never start the watcher.
-		go s.healJoiningStatus()
+		go s.parent.healJoinMembership(context.Background(), s.id)
 	}
 	return info
 }
 
-// healJoiningStatus writes LocalStatus="active" if the cached row
-// still says "joining". Idempotent guard via the tsp Get; intended to
-// be called from a goroutine with no return path. Failures are
-// dropped — the next Info() / watcher tick retries.
-func (s *spaceImpl) healJoiningStatus() {
-	ctx := context.Background()
-	rec, ok := s.tsp.Get(ctx, s.id)
-	if !ok || rec.LocalStatus != joiningLocalStatus {
-		return
-	}
-	_, _ = s.tsp.SetLocalStatus(ctx, s.id, techspace.StatusActive)
-}
-
 // localIdentityActive returns true when the live AclList places our
-// account in StatusActive. Used by Info() to override a stale
-// LocalStatus="joining" left over from before the owner's accept
-// landed. Best-effort: any failure to load the space / read the ACL
-// returns false (caller falls back to the cached status).
+// account in StatusActive. Used by Info() to override a stale joining /
+// ended row left over from before the owner's accept landed.
+// Best-effort: any failure to load the space / read the ACL returns
+// false (caller falls back to the cached status).
 func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 	handle, err := s.app.GetSpace(ctx, s.id)
 	if err != nil {
@@ -106,28 +122,74 @@ func (s *spaceImpl) localIdentityActive(ctx context.Context) bool {
 	}
 	acl.RLock()
 	defer acl.RUnlock()
-	state := acl.AclState()
-	me := state.Identity()
-	for _, acc := range state.CurrentAccounts() {
-		if acc.PubKey.Equals(me) {
-			return acc.Status == list.StatusActive
-		}
-	}
-	return false
+	return selfAclActive(acl.AclState())
 }
 
-func (s *spaceImpl) Objects() space.ObjectService    { return s.objects }
-func (s *spaceImpl) Types() space.TypesAPI           { return s.types }
-func (s *spaceImpl) Properties() space.PropertiesAPI { return s.properties }
+// writeGate rejects user mutations on a read-only space (guest-mode
+// row, or an ACL role without write permission) with ErrReadOnlySpace.
+// Reads the store's cached gate — seeded at store build, maintained by
+// the ACL mirror — for entry points that mutate outside the store's
+// DAG-write funnel (tree deletion, file-node uploads).
+func (s *spaceImpl) writeGate(_ context.Context) error {
+	return s.store.CheckWrite()
+}
+
+// canWrite reports whether this account currently has write permission
+// in the space ACL. Used to gate durability takeover — only a writer may
+// upload a downloaded file to the file nodes. Best-effort: any load/read
+// failure returns false (we simply don't take over).
+func (s *spaceImpl) canWrite(ctx context.Context) bool {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return false
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	state := acl.AclState()
+	return state.Permissions(state.Identity()).CanWrite()
+}
+
+func (s *spaceImpl) Objects() space.ObjectService      { return s.objects }
+func (s *spaceImpl) Types() space.TypesAPI             { return s.types }
+func (s *spaceImpl) Collections() space.CollectionsAPI { return s.collections }
+func (s *spaceImpl) Properties() space.PropertiesAPI   { return s.properties }
 
 func (s *spaceImpl) ACL() space.ACL            { return s.acl }
 func (s *spaceImpl) Members() space.MembersAPI { return s.members }
+func (s *spaceImpl) Bundles() space.BundlesAPI { return s.bundles }
 
 // SyncHeads forces an immediate head-sync (diff) round on this space
 // instead of waiting for the periodic timer. Blocks until the round
 // completes and returns its error verbatim.
 func (s *spaceImpl) SyncHeads(ctx context.Context) error {
 	return s.app.SyncHeads(ctx, s.id)
+}
+
+// TreeHeads reads the space frontier straight from any-sync's
+// headstorage: one entry per live (non-deleted) tree — materialized
+// trees and heads-only selective-sync stubs alike, system trees
+// (settings) included. See space.Space.TreeHeads.
+func (s *spaceImpl) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
+	handle, err := s.app.GetSpace(ctx, s.id)
+	if err != nil {
+		return nil, err
+	}
+	hs := handle.Inner().Storage().HeadStorage()
+	var out []space.TreeHeads
+	if err = hs.IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		out = append(out, space.TreeHeads{
+			TreeId: e.Id,
+			Heads:  slices.Clone(e.Heads),
+		})
+		return true, nil
+	}); err != nil {
+		return nil, fmt.Errorf("spaceimpl: iterate heads: %w", err)
+	}
+	return out, nil
 }
 
 // SyncStatus returns the per-space sync-status accessor backed by the
@@ -153,10 +215,41 @@ func (s *spaceImpl) Changes() space.ChangeIndexAPI {
 	return newChangeIndexAPI(s)
 }
 
+// History returns the version-history surface for this space. See
+// space.HistoryAPI and docs/version-history-proposal.md.
+func (s *spaceImpl) History() space.HistoryAPI {
+	return newHistoryAPI(s)
+}
+
+// ReadState exposes the read/unread tracking surface —
+// space.ReadStateAPI.
+func (s *spaceImpl) ReadState() space.ReadStateAPI {
+	return newReadStateAPI(s)
+}
+
+// PubSub returns the ephemeral pub/sub surface for this space.
+// Constructed on every call; the subscriptions live on the app-level
+// engine. See space.PubSubAPI.
+func (s *spaceImpl) PubSub() space.PubSubAPI {
+	return NewPubSubAPI(s.app, s.id)
+}
+
 // Query builds a chainable read query against (objectId, dataset).
 // The query is single-shot; call Space.Query() again per read.
 func (s *spaceImpl) Query(objectId, dataset string) space.Query {
 	return newQuery(s.store, objectId, dataset)
+}
+
+// QueryDataset builds a chainable query over a shared dataset across
+// every object that holds it.
+func (s *spaceImpl) QueryDataset(dataset string) space.Query {
+	return newDatasetQuery(s.store, dataset)
+}
+
+// AggregateDataset builds an aggregation pipeline over a shared dataset
+// across every object that holds it.
+func (s *spaceImpl) AggregateDataset(dataset string, pipeline any) space.Agg {
+	return newDatasetAgg(s.store, dataset, pipeline)
 }
 
 // QueryObjects builds a chainable query against the per-space
@@ -184,36 +277,96 @@ func (s *spaceImpl) Datasets() []space.DatasetSchema {
 	return toDatasetSchemas(s.store.Schemas())
 }
 
-// checkDatasetMembership enforces the unified ownership invariant for
-// type-owned datasets: an object may only hold a type's dataset if it
-// implements that type (any.types ∋ owner). No-op for built-in / unknown
-// datasets (DatasetOwner returns false) — property-namespace membership
-// is enforced separately by SystemPropertiesHandler.PreValidate. Local
-// write-time only; inbound apply stays read-tolerant.
+// checkPublicDataset rejects writes to SDK-internal datasets through
+// the public Modify/ModifyMany/Delete/Upsert surface. The payloads
+// dataset is written only by the SDK's files layer (its change shapes
+// are fixed and its object class ships changes unencrypted).
+func checkPublicDataset(dataset string) error {
+	// bundles: registry writes go through the typed BundlesAPI only — a
+	// raw Modify could assert an arbitrary winner (passing the handler's
+	// claim invariant) and turn the genuine root into a deletable
+	// "loser", and a raw Delete would be signed into the DAG before the
+	// apply-time rejection.
+	// identityKeys: the 1-1 key exchange is written by the SDK from the
+	// account's own key; a raw Delete would likewise be signed into the
+	// DAG before the apply-time rejection.
+	if dataset == payloads.Dataset || dataset == spaceindex.BundlesDataset || dataset == spaceindex.IdentityKeysDataset {
+		return fmt.Errorf("spaceimpl: dataset %q is SDK-internal", dataset)
+	}
+	return nil
+}
+
+// checkDatasetMembership enforces the ownership invariant for
+// type-declared datasets: an object may only hold a dataset if its
+// type declares it — the one owner of a registered-type or namespaced
+// dataset, any owner of a module's canonical collection — or if the
+// object IS the declaring type (a definition object implicitly
+// implements itself, which is how a bundle root hosts its own
+// records). No-op for built-in / unknown datasets (DatasetOwners
+// returns false) — property-namespace membership is enforced
+// separately by SystemPropertiesHandler.PreValidate. Local write-time
+// only; inbound apply stays read-tolerant, and no type is ever set on
+// write.
 func (s *spaceImpl) checkDatasetMembership(ctx context.Context, objectId, dataset string) error {
-	owner, ok := s.store.DatasetOwner(dataset)
-	if !ok {
+	owners, gated := s.store.DatasetOwners(dataset)
+	if !gated {
 		return nil
 	}
-	types, err := s.store.ObjectTypes(ctx, objectId)
+	members, err := s.store.ObjectMembers(ctx, objectId)
 	if err != nil {
 		return err
 	}
-	for _, t := range types {
-		if t == owner {
+	for _, o := range owners {
+		if o == objectId || (members.Type != "" && members.Type == o) {
 			return nil
 		}
 	}
-	return &properties.ValidationError{
-		Reason: properties.ReasonTypeNotImplemented,
-		TypeId: owner,
-		Types:  types,
+	return fmt.Errorf("%w: dataset %q on object %q — its type %q is not among the declaring types [%s]",
+		space.ErrDatasetNotDeclared, dataset, objectId, members.Type, strings.Join(owners, ", "))
+}
+
+// localWriteRetry runs a LocalWrite, retrying once with a fresh
+// resolve when the object was evicted between Get and the write — the
+// lazy schema-refresh Drop (EnsureDatasetRegistered / drain) closes
+// resident handles, and an in-flight caller must not surface that
+// transient as a user error.
+func (s *spaceImpl) localWriteRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
+	return s.localWriteRetryIf(ctx, obj, objectId, ch, nil)
+}
+
+// localWriteRetryIf is localWriteRetry with an optional precondition
+// (ModifyBatch.IfUnchangedSince).
+func (s *spaceImpl) localWriteRetryIf(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change, ifUnchangedSince *uint64) (object.WriteResult, error) {
+	res, err := obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
+	if !errors.Is(err, object.ErrClosed) {
+		return res, wrapSlotErr(err)
 	}
+	obj, gerr := s.store.Get(ctx, objectId)
+	if gerr != nil {
+		return object.WriteResult{}, gerr
+	}
+	res, err = obj.LocalWriteIf(ctx, ch, ifUnchangedSince)
+	return res, wrapSlotErr(err)
+}
+
+// localSetRetry is localWriteRetry for the LocalSet route.
+func (s *spaceImpl) localSetRetry(ctx context.Context, obj *object.Object, objectId string, ch crdt.Change) (object.WriteResult, error) {
+	res, err := obj.LocalSet(ctx, ch)
+	if !errors.Is(err, object.ErrClosed) {
+		return res, err
+	}
+	obj, gerr := s.store.Get(ctx, objectId)
+	if gerr != nil {
+		return object.WriteResult{}, gerr
+	}
+	return obj.LocalSet(ctx, ch)
 }
 
 // Modify resolves the target object via the per-space store, builds a
-// crdt.Change from the public batch, and submits it through the
-// Object's local-write path. Returns the bundled identifiers.
+// crdt.Change from the public batch, and submits it on the route the
+// batch's Scope selects: the Object's local-write (DAG) path for
+// synced (the default), Object.LocalSet for local. Returns the
+// bundled identifiers.
 func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
 	if batch.ObjectId == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: ObjectId required")
@@ -221,7 +374,24 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if batch.Dataset == "" {
 		return space.ModifyResult{}, errors.New("spaceimpl: Dataset required")
 	}
-	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := checkObjectsRowBatch(batch); err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := checkRecordShapes(batch.Records); err != nil {
+		return space.ModifyResult{}, err
+	}
+	switch batch.Scope {
+	case 0, space.ScopeSynced:
+		// The DAG route below.
+	case space.ScopeLocal:
+		return s.modifyLocal(ctx, batch)
+	default:
+		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: scope %s is not writable via Modify (synced and local only)", batch.Scope)
+	}
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -229,6 +399,7 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 		return space.ModifyResult{}, err
 	}
 
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err
@@ -238,8 +409,83 @@ func (s *spaceImpl) Modify(ctx context.Context, batch space.ModifyBatch) (space.
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, change.Records); err != nil {
+		return space.ModifyResult{}, err
+	}
 
-	res, err := obj.LocalWrite(ctx, change)
+	res, err := s.localWriteRetryIf(ctx, obj, batch.ObjectId, change, batch.IfUnchangedSince)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	return modifyResultFromWrite(res), nil
+}
+
+// modifyLocal is the ScopeLocal route of Modify: the batch is
+// materialised straight into the object's rows via Object.LocalSet —
+// no DAG change, nothing syncs; VersionIds come from the local lexid
+// allocator and the write flows through Query/Subscribe like any
+// apply (the techspace localStatus / identities pattern, opened to
+// public datasets).
+//
+// Strict by construction: local fields annotate records that already
+// exist on the synced route, so record creation is refused up front
+// (explicit ids, no Upsert) rather than minting a local-only record
+// no other device would ever see. Scope enforcement itself lives in
+// the apply layer (classifyFieldWrite, route=local): ops targeting
+// fields the schema doesn't declare ScopeLocal come back in
+// ModifyResult.Rejections, exactly like handler rejections on the
+// synced route, as does a strict-mode miss on an absent record
+// (ErrStrictSkipAbsent).
+func (s *spaceImpl) modifyLocal(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
+	// The shared objects dataset is DynamicScopeByKey: the apply layer
+	// exempts its undeclared heads from the route check and relies on
+	// the WRITER to enforce per-property scope + kind — which for the
+	// local route is PropertiesAPI.Set (validateRoutedPatch). Letting a
+	// generic local batch through here would bypass that validation
+	// and write synced property paths into the local version domain.
+	if batch.Dataset == properties.Dataset {
+		return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: local-scope writes to the %s dataset go through Properties().Set (per-property scope enforcement)", properties.Dataset)
+	}
+	if len(batch.TraceIds) > 0 {
+		return space.ModifyResult{}, errors.New("spaceimpl: Modify: TraceIds ride the any-sync change and are not supported on the local scope")
+	}
+	if batch.IfUnchangedSince != nil {
+		return space.ModifyResult{}, errors.Join(crdt.ErrValidation, errors.New("spaceimpl: Modify: IfUnchangedSince is supported on the synced scope only"))
+	}
+	for i := range batch.Records {
+		if isDelete(&batch.Records[i]) {
+			return space.ModifyResult{}, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot delete records", i))
+		}
+		if batch.Records[i].Id == "" {
+			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes require explicit record ids", i)
+		}
+		if batch.Records[i].Upsert {
+			return space.ModifyResult{}, fmt.Errorf("spaceimpl: Modify: record %d: local-scope writes cannot create records (Upsert unsupported)", i)
+		}
+	}
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := s.checkDatasetMembership(ctx, batch.ObjectId, batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
+	obj, err := s.store.Get(ctx, batch.ObjectId)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	change, err := buildChange(batch, dataVersion)
+	if err != nil {
+		return space.ModifyResult{}, err
+	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, change.Records); err != nil {
+		return space.ModifyResult{}, err
+	}
+
+	res, err := s.localSetRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -267,7 +513,27 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 				i, batches[i].ObjectId, objectId)
 		}
 	}
+	for i := range batches {
+		if batches[i].Scope != 0 && batches[i].Scope != space.ScopeSynced {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: scope %s not supported (synced only) — issue scoped batches through Modify",
+				i, batches[i].Scope)
+		}
+		// Each batch is its own change, so a precondition could not hold
+		// across them.
+		if batches[i].IfUnchangedSince != nil {
+			return nil, errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: ModifyMany: batch %d: IfUnchangedSince is supported by Modify only", i))
+		}
+		if err := checkObjectsRowBatch(batches[i]); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
+		}
+		if err := checkRecordShapes(batches[i].Records); err != nil {
+			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d: %w", i, err)
+		}
+	}
 
+	for i := range batches {
+		s.store.EnsureDatasetRegistered(ctx, objectId, batches[i].Dataset)
+	}
 	obj, err := s.store.Get(ctx, objectId)
 	if err != nil {
 		return nil, err
@@ -279,7 +545,11 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	changes := make([]crdt.Change, len(batches))
 	var validationErrs []error
 	for i, b := range batches {
-		dataVersion, err := s.store.DataVersion(b.Dataset)
+		if err := checkPublicDataset(b.Dataset); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
+			continue
+		}
+		dataVersion, err := s.store.DataVersionFor(ctx, b.Dataset)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
@@ -287,6 +557,10 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 		ch, err := buildChange(b, dataVersion)
 		if err != nil {
 			validationErrs = append(validationErrs, fmt.Errorf("batch %d: build: %w", i, err))
+			continue
+		}
+		if err := s.changeRecordIds(objectId, b.Dataset, ch.Records); err != nil {
+			validationErrs = append(validationErrs, fmt.Errorf("batch %d: %w", i, err))
 			continue
 		}
 		if err := s.checkDatasetMembership(ctx, objectId, b.Dataset); err != nil {
@@ -307,7 +581,7 @@ func (s *spaceImpl) ModifyMany(ctx context.Context, batches []space.ModifyBatch)
 	// still surface in each ModifyResult.Rejections.
 	out := make([]space.ModifyResult, 0, len(changes))
 	for i := range changes {
-		res, err := obj.LocalWrite(ctx, changes[i])
+		res, err := s.localWriteRetry(ctx, obj, objectId, changes[i])
 		if err != nil {
 			return nil, fmt.Errorf("spaceimpl: ModifyMany: batch %d write: %w", i, err)
 		}
@@ -322,10 +596,14 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 	if len(batch.RecordIds) == 0 {
 		return space.ModifyResult{}, errors.New("spaceimpl: DeleteBatch.RecordIds empty")
 	}
-	dataVersion, err := s.store.DataVersion(batch.Dataset)
+	if err := checkPublicDataset(batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+	dataVersion, err := s.store.DataVersionFor(ctx, batch.Dataset)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
+	s.store.EnsureDatasetRegistered(ctx, batch.ObjectId, batch.Dataset)
 	obj, err := s.store.Get(ctx, batch.ObjectId)
 	if err != nil {
 		return space.ModifyResult{}, err
@@ -338,17 +616,42 @@ func (s *spaceImpl) Delete(ctx context.Context, batch space.DeleteBatch) (space.
 			Ops: []crdt.Op{{Type: crdt.OpDelete}},
 		}
 	}
+	if err := s.changeRecordIds(batch.ObjectId, batch.Dataset, records); err != nil {
+		return space.ModifyResult{}, err
+	}
 	change := crdt.Change{
 		Dataset:     batch.Dataset,
 		DataVersion: dataVersion,
 		TraceIds:    batch.TraceIds,
 		Records:     records,
 	}
-	res, err := obj.LocalWrite(ctx, change)
+	res, err := s.localWriteRetry(ctx, obj, batch.ObjectId, change)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
 	return modifyResultFromWrite(res), nil
+}
+
+// changeRecordIds puts the record ids of a write to a shared dataset
+// in the form a change carries: the plain record id. Reads return such
+// a record as `<objectId>/<recordId>` and a caller may write it back
+// that way; the object's own prefix is dropped here. An id that still
+// holds a "/" names another object's record, or is no id of this
+// dataset at all. A no-op for every other dataset.
+func (s *spaceImpl) changeRecordIds(objectId, dataset string, records []crdt.RecordChange) error {
+	if !s.store.IsKeyedDataset(dataset) {
+		return nil
+	}
+	for i := range records {
+		id := crdt.KeyedRecordId(objectId, records[i].Id)
+		// The bare prefix names no record: left alone it would read as
+		// an empty id, which a create derives.
+		if strings.Contains(id, "/") || (id == "" && records[i].Id != "") {
+			return fmt.Errorf("spaceimpl: record %d: %w: %q", i, space.ErrRecordIdOfAnotherObject, records[i].Id)
+		}
+		records[i].Id = id
+	}
+	return nil
 }
 
 // buildChange converts a public space.ModifyBatch into the internal
@@ -371,6 +674,66 @@ func buildChange(batch space.ModifyBatch, dataVersion string) (crdt.Change, erro
 		TraceIds:    batch.TraceIds,
 		Records:     records,
 	}, nil
+}
+
+// checkRecordShapes refuses malformed delete records before anything
+// loads: a delete is its record's only op, takes no path or value,
+// names an explicit id and is no upsert; and no other record of the
+// batch writes an id the batch deletes, since the outcome would depend
+// on their order.
+func checkRecordShapes(records []space.RecordModify) error {
+	deleted := map[string]bool{}
+	for i := range records {
+		rec := &records[i]
+		if !isDelete(rec) {
+			continue
+		}
+		var err error
+		switch {
+		case len(rec.Ops) != 1:
+			err = errors.New("delete must be the record's only op")
+		case rec.Ops[0].Path != "" || rec.Ops[0].Value != nil:
+			err = errors.New("delete tombstones the whole record: it takes no path or value")
+		case rec.Id == "":
+			err = errors.New("delete needs an explicit record id")
+		case rec.Upsert:
+			err = errors.New("delete cannot be an upsert")
+		}
+		if err != nil {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %w", i, err))
+		}
+		deleted[rec.Id] = true
+	}
+	for i := range records {
+		if !isDelete(&records[i]) && records[i].Id != "" && deleted[records[i].Id] {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("record %d: %q is deleted by the same batch", i, records[i].Id))
+		}
+	}
+	return nil
+}
+
+// checkObjectsRowBatch refuses what the objects dataset cannot take
+// through Modify: every record there lands on the object's one row, so
+// a delete in a batch tombstones that row for good whatever record id
+// it names, and the row is stamped by every change to the object, so a
+// precondition on it would mean "nothing in the object changed".
+func checkObjectsRowBatch(batch space.ModifyBatch) error {
+	if batch.Dataset != properties.Dataset {
+		return nil
+	}
+	if batch.IfUnchangedSince != nil {
+		return errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: IfUnchangedSince is not supported on the %s dataset", properties.Dataset))
+	}
+	for i := range batch.Records {
+		if isDelete(&batch.Records[i]) {
+			return errors.Join(crdt.ErrValidation, fmt.Errorf("spaceimpl: Modify: record %d: the %s dataset takes no deletes", i, properties.Dataset))
+		}
+	}
+	return nil
+}
+
+func isDelete(rec *space.RecordModify) bool {
+	return slices.ContainsFunc(rec.Ops, func(op space.Op) bool { return op.Type == space.OpDelete })
 }
 
 func buildRecord(a *anyenc.Arena, rec *space.RecordModify) (crdt.RecordChange, error) {
@@ -422,19 +785,49 @@ func splitPath(p string) []string {
 	return out
 }
 
+// jsonParsers backs goToAnyencJSON. A parser is held only for the
+// duration of one conversion; NewFromFastJson copies every byte onto
+// the arena, so nothing aliases its buffer afterwards.
+var jsonParsers fastjson.ParserPool
+
 // goToAnyenc converts a Go value into an anyenc.Value on the given
-// arena. Accepts:
+// arena. One rule on every write path: a value means what its JSON
+// form means, and the Extended-JSON wrappers ({"$date": …},
+// {"$binary": …}, {"$oid": …}, {"$vector": …}) are typed values — a
+// record holds the same instant whether it was written from a Go map,
+// a parsed HTTP body, or named in a query filter literal.
 //
-//   - Native Go types (string, bool, ints, float64, []byte, []any,
-//     []string, map[string]any) for in-process callers.
-//   - *fastjson.Value for HTTP / JSON callers — they parse the
-//     request body once with a pooled fastjson.Parser, then hand the
-//     parsed values straight through. anyenc.Arena.NewFromFastJson
-//     does the conversion in one walk on our arena, no Go-native
-//     intermediate.
-//   - *anyenc.Value passes through unchanged (already on the right
-//     arena, or cross-arena — caller's responsibility).
+//   - *fastjson.Value (HTTP / JSON callers parse the body once with a
+//     pooled parser) is decoded by anyenc.Arena.NewFromFastJson, which
+//     owns the wrapper rule. *anyenc.Value is taken verbatim, wrapper-
+//     shaped or not. Both are accepted at any depth of map[string]any
+//     / []any.
+//   - Go-native typed values: time.Time is a datetime (millisecond
+//     precision), []byte is binary — the anyenc types the $date and
+//     $binary wrappers decode to.
+//   - nil, bool, string, int, int64, float64, json.Number, []string,
+//     []any, []map[string]any and map[string]any are built directly:
+//     numbers keep their bits and keys go in sorted order, so the
+//     encoding is deterministic and matches the fastjson route byte
+//     for byte (fastjson itself rounds a few exponent-form floats). A
+//     nil slice or map of these kinds is an empty container. Nesting
+//     deeper than fastjson.MaxDepth levels — a cycle included — is an
+//     error, as on the fastjson route.
+//   - A wrapper-shaped map (single key $date / $binary / $oid /
+//     $vector with a payload that is not an object or a parsed value)
+//     and every other Go value (structs, other slices and maps, other
+//     numeric kinds) go through json.Marshal and NewFromFastJson;
+//     inside those a time.Time or []byte takes the string form
+//     encoding/json gives it and a nil is null. Values encoding/json
+//     rejects (NaN, ±Inf, channels) return its error.
 func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
+	return goToAnyencDepth(a, v, 0)
+}
+
+func goToAnyencDepth(a *anyenc.Arena, v any, depth int) (*anyenc.Value, error) {
+	if depth > fastjson.MaxDepth {
+		return nil, fmt.Errorf("nesting deeper than %d levels", fastjson.MaxDepth)
+	}
 	switch x := v.(type) {
 	case nil:
 		return a.NewNull(), nil
@@ -444,42 +837,57 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return a.NewFromFastJson(x), nil
 	case *anyenc.Value:
+		if x == nil {
+			return a.NewNull(), nil
+		}
 		return x, nil
 	case bool:
-		if x {
-			return a.NewTrue(), nil
-		}
-		return a.NewFalse(), nil
+		return a.NewBool(x), nil
 	case string:
 		return a.NewString(x), nil
 	case int:
 		return a.NewNumberInt(x), nil
 	case int64:
-		return a.NewNumberInt(int(x)), nil
+		return a.NewNumberFloat64(float64(x)), nil
 	case float64:
-		return a.NewNumberFloat64(x), nil
+		return newFiniteNumber(a, x)
+	case json.Number:
+		f, err := x.Float64()
+		if err != nil {
+			return nil, err
+		}
+		return newFiniteNumber(a, f)
+	case time.Time:
+		return a.NewDateTime(x), nil
 	case []byte:
 		return a.NewBinary(x), nil
-	case []any:
-		arr := a.NewArray()
-		for i, e := range x {
-			ev, err := goToAnyenc(a, e)
-			if err != nil {
-				return nil, fmt.Errorf("[%d]: %w", i, err)
-			}
-			arr.SetArrayItem(i, ev)
-		}
-		return arr, nil
 	case []string:
 		arr := a.NewArray()
-		for i, e := range x {
-			arr.SetArrayItem(i, a.NewString(e))
+		for i, s := range x {
+			arr.SetArrayItem(i, a.NewString(s))
 		}
 		return arr, nil
+	case []any:
+		return goSliceToAnyenc(a, x, depth+1)
+	case []map[string]any:
+		return goSliceToAnyenc(a, x, depth+1)
 	case map[string]any:
+		if len(x) == 1 {
+			for k, payload := range x {
+				if isExtJSONWrapper(k, payload) {
+					return goToAnyencJSON(a, x)
+				}
+			}
+		}
+		var keyBuf [16]string // stack-resident for the common small object
+		keys := keyBuf[:0]
+		for k := range x {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
 		obj := a.NewObject()
-		for k, vv := range x {
-			ev, err := goToAnyenc(a, vv)
+		for _, k := range keys {
+			ev, err := goToAnyencDepth(a, x[k], depth+1)
 			if err != nil {
 				return nil, fmt.Errorf("%q: %w", k, err)
 			}
@@ -487,6 +895,85 @@ func goToAnyenc(a *anyenc.Arena, v any) (*anyenc.Value, error) {
 		}
 		return obj, nil
 	default:
-		return nil, fmt.Errorf("unsupported value type %T", v)
+		return goToAnyencJSON(a, v)
 	}
+}
+
+func goSliceToAnyenc[E any](a *anyenc.Arena, x []E, depth int) (*anyenc.Value, error) {
+	arr := a.NewArray()
+	for i, e := range x {
+		ev, err := goToAnyencDepth(a, e, depth)
+		if err != nil {
+			return nil, fmt.Errorf("[%d]: %w", i, err)
+		}
+		arr.SetArrayItem(i, ev)
+	}
+	return arr, nil
+}
+
+// isExtJSONWrapper reports whether a single-key map is one of the
+// wrapper shapes anyenc decodes. A payload that is itself an object or
+// a parsed value can never be well-formed, so that map is walked
+// natively and keeps nested Go types and pass-through values.
+func isExtJSONWrapper(key string, payload any) bool {
+	switch key {
+	case "$date", "$binary", "$oid", "$vector":
+	default:
+		return false
+	}
+	switch payload.(type) {
+	case map[string]any, []map[string]any, *anyenc.Value, *fastjson.Value:
+		return false
+	}
+	return true
+}
+
+func newFiniteNumber(a *anyenc.Arena, f float64) (*anyenc.Value, error) {
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("json: unsupported value: %v", f)
+	}
+	return a.NewNumberFloat64(f), nil
+}
+
+// goToAnyencJSON is the JSON route: json.Marshal, then the decoder the
+// *fastjson.Value path uses.
+func goToAnyencJSON(a *anyenc.Arena, v any) (*anyenc.Value, error) {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	p := jsonParsers.Get()
+	defer jsonParsers.Put(p)
+	jv, err := p.ParseBytes(raw)
+	if err != nil {
+		return nil, err
+	}
+	return a.NewFromFastJson(jv), nil
+}
+
+// parseCondition is query.ParseCondition over a caller-supplied
+// filter, with a Go map literal converted by goToAnyenc first: a
+// time.Time or []byte in it is typed the way the record holds it and
+// a {"$date": …} literal is an instant. JSON text, marshaled anyenc
+// bytes, parsed values and prebuilt filters reach the parser
+// untouched. An empty condition ({}, a nil map) matches everything.
+func parseCondition(filter any) (query.Filter, error) {
+	cond := filter
+	switch filter.(type) {
+	case nil, string, []byte, *fastjson.Value, *anyenc.Value, query.Filter:
+	default:
+		v, err := goToAnyenc(&anyenc.Arena{}, filter)
+		if err != nil {
+			return nil, err
+		}
+		cond = v
+	}
+	parsed, err := query.ParseCondition(cond)
+	if err != nil {
+		return nil, err
+	}
+	if parsed == nil {
+		return query.All{}, nil
+	}
+	return parsed, nil
 }

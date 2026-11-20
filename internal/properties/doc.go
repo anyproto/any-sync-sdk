@@ -7,7 +7,7 @@
 // Handlers in this package:
 //
 //   - SystemPropertiesHandler (system.go) — the "baseProperty"
-//     handler from docs/06-data-structure.md, renamed to match its
+//     handler from docs/data-structure.md, renamed to match its
 //     role: it is the single crdt.Handler registered on every user
 //     object for base-scope property writes, and it projects those
 //     writes into the space's `properties` collection while enforcing
@@ -19,5 +19,5 @@
 // object in the tech space rather than a per-object write.
 //
 // Not public — space.PropertiesAPI wraps the setters and projection.
-// See docs/06-data-structure.md § "Object Properties".
+// See docs/data-structure.md § "Object Properties".
 package properties

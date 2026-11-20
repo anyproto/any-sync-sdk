@@ -25,6 +25,7 @@ Thumbs.db
 # Local any-sync network config consumed by e2e tests.
 # Copy from your source of truth (e.g. ../test-etc/staging.yml).
 /e2e/staging.yml
+/e2e/local.yml
 
 # sverklo per-project state (memory journal, etc.)
 .sverklo/

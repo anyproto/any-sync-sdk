@@ -1,0 +1,535 @@
+package spaceimpl
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/anyproto/any-store/v2/anyenc"
+
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
+	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
+	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
+	"github.com/anyproto/any-sync-sdk/space"
+)
+
+// techSpace is the restricted handle over the tech space. It satisfies
+// space.Space by explicit delegation to an inner spaceImpl bound to the
+// tech Store, so every method is a deliberate decision: reads and
+// bundle-dataset writes delegate, lifecycle surfaces refuse with
+// space.ErrUnsupported. A new Space method fails to compile here until
+// it is classified.
+type techSpace struct {
+	inner   *spaceImpl
+	tsp     *techspace.Service
+	parent  *Service
+	objects techObjects
+	types   techTypes
+	bundles techBundles
+}
+
+// Collections: the property-definition surface reaches bundle roots
+// (through the same root fence techTypes applies); collection
+// lifecycle refuses like type lifecycle does.
+func (t *techSpace) Collections() space.CollectionsAPI { return techCollections{types: t.types} }
+
+type techCollections struct{ types techTypes }
+
+func (x techCollections) Properties(ctx context.Context, ownerId string) ([]space.PropertyDef, error) {
+	return x.types.Properties(ctx, ownerId)
+}
+func (x techCollections) AddProperty(ctx context.Context, ownerId string, draft space.PropertyDraft) (string, error) {
+	return x.types.AddProperty(ctx, ownerId, draft)
+}
+func (x techCollections) RemoveProperty(ctx context.Context, ownerId, propId string) error {
+	return x.types.RemoveProperty(ctx, ownerId, propId)
+}
+func (x techCollections) PatchProperty(ctx context.Context, ownerId, propId string, patch space.PropertyPatch) error {
+	return x.types.PatchProperty(ctx, ownerId, propId, patch)
+}
+func (x techCollections) List(ctx context.Context) ([]space.CollectionInfo, error) {
+	return x.types.t.inner.collections.List(ctx)
+}
+func (x techCollections) Get(ctx context.Context, id string) (space.CollectionInfo, error) {
+	return x.types.t.inner.collections.Get(ctx, id)
+}
+func (techCollections) Create(context.Context, space.CollectionCreateParams) (string, error) {
+	return "", errUnsupported("Collections().Create")
+}
+func (techCollections) Delete(context.Context, string) error {
+	return errUnsupported("Collections().Delete")
+}
+func (techCollections) Patch(context.Context, string, space.CollectionPatch) error {
+	return errUnsupported("Collections().Patch")
+}
+
+var _ space.Space = (*techSpace)(nil)
+
+func newTechSpace(app *anysyncx.App, tsp *techspace.Service, parent *Service) *techSpace {
+	inner := newSpace(tsp.SpaceId(), app, tsp, tsp.Store(), parent)
+	inner.techIndexId = tsp.IndexObjectId()
+	t := &techSpace{inner: inner, tsp: tsp, parent: parent}
+	t.objects = techObjects{inner: inner.objects, t: t}
+	t.types = techTypes{inner: inner.types, t: t}
+	t.bundles = techBundles{inner: inner.bundles}
+	return t
+}
+
+func (t *techSpace) Id() string { return t.inner.id }
+
+// Info is synthetic: the tech space has no registry row (it IS the
+// registry), is owner-only and derived.
+func (t *techSpace) Info() space.SpaceInfo {
+	info := space.SpaceInfo{
+		Id:        t.inner.id,
+		Type:      techspace.TechSpaceType,
+		SpaceType: techspace.TechSpaceType,
+		Status:    space.StatusActive,
+		OwnRole:   space.PermissionOwner,
+		Derived:   true,
+	}
+	if keys := t.inner.app.AccountKeys(); keys != nil {
+		info.Author = keys.SignKey.GetPublic().Account()
+	}
+	return info
+}
+
+func (t *techSpace) Objects() space.ObjectService    { return t.objects }
+func (t *techSpace) Types() space.TypesAPI           { return t.types }
+func (t *techSpace) Bundles() space.BundlesAPI       { return t.bundles }
+func (t *techSpace) Properties() space.PropertiesAPI { return unsupportedProperties{} }
+func (t *techSpace) ACL() space.ACL                  { return unsupportedACL{} }
+func (t *techSpace) Members() space.MembersAPI       { return unsupportedMembers{} }
+func (t *techSpace) Files() space.Files              { return unsupportedFiles{} }
+func (t *techSpace) History() space.HistoryAPI       { return unsupportedHistory{} }
+func (t *techSpace) Payloads() space.PayloadsView    { return unsupportedPayloads{} }
+func (t *techSpace) PubSub() space.PubSubAPI         { return unsupportedPubSub{} }
+func (t *techSpace) ReadState() space.ReadStateAPI   { return unsupportedReadState{} }
+func (t *techSpace) Changes() space.ChangeIndexAPI   { return unsupportedChanges{} }
+
+func (t *techSpace) SyncStatus() space.SyncStatusAPI { return t.inner.SyncStatus() }
+func (t *techSpace) Debug() space.DebugAPI           { return t.inner.Debug() }
+
+func (t *techSpace) Query(objectId, dataset string) space.Query {
+	// The identities rows carry the synced symKey — the profile-
+	// decryption secret the public Identities() surface deliberately
+	// withholds. The generic read path must not hand it out raw.
+	if objectId == t.tsp.IndexObjectId() && dataset == techspace.IdentitiesDataset {
+		return failQuery{err: fmt.Errorf("spaceimpl: %w: identities carry a decryption secret — read them via SDK.Identities()", space.ErrUnsupported)}
+	}
+	return t.inner.Query(objectId, dataset)
+}
+
+// failQuery is a Query whose terminal calls fail with a fixed error:
+// the builder shape lets the fence live at Query() without changing
+// the interface.
+type failQuery struct{ err error }
+
+func (q failQuery) Filter(any) space.Query                       { return q }
+func (q failQuery) Sort(...any) space.Query                      { return q }
+func (q failQuery) Limit(int) space.Query                        { return q }
+func (q failQuery) Offset(int) space.Query                       { return q }
+func (q failQuery) Projection(space.ProjectionOpts) space.Query  { return q }
+func (q failQuery) Iter(context.Context) (space.Iterator, error) { return nil, q.err }
+func (q failQuery) All(context.Context) ([]*anyenc.Value, error) { return nil, q.err }
+func (q failQuery) One(context.Context) (*anyenc.Value, error)   { return nil, q.err }
+func (q failQuery) Count(context.Context) (int, error)           { return 0, q.err }
+func (q failQuery) Snapshot(context.Context, space.QueryOpts) (*space.QueryResult, error) {
+	return nil, q.err
+}
+func (q failQuery) Subscribe(context.Context, space.QueryOpts) (*space.QueryResult, error) {
+	return nil, q.err
+}
+func (t *techSpace) QueryObjects() space.Query { return t.inner.QueryObjects() }
+func (t *techSpace) QueryDataset(dataset string) space.Query {
+	return t.inner.QueryDataset(dataset)
+}
+func (t *techSpace) AggregateDataset(dataset string, pipeline any) space.Agg {
+	return t.inner.AggregateDataset(dataset, pipeline)
+}
+func (t *techSpace) Aggregate(objectId, dataset string, pipeline any) space.Agg {
+	// Same fence as Query: the identities rows carry decryption secrets.
+	if objectId == t.tsp.IndexObjectId() && dataset == techspace.IdentitiesDataset {
+		return failAgg{err: fmt.Errorf("spaceimpl: %w: identities carry decryption secrets — read them via SDK.Identities()", space.ErrUnsupported)}
+	}
+	return t.inner.Aggregate(objectId, dataset, pipeline)
+}
+
+// failAgg is an Agg whose terminal calls fail with a fixed error.
+type failAgg struct{ err error }
+
+func (q failAgg) GroupLimit(int) space.Agg                     { return q }
+func (q failAgg) AccumArrayLimit(int) space.Agg                { return q }
+func (q failAgg) MemoryLimit(int) space.Agg                    { return q }
+func (q failAgg) Iter(context.Context) (space.Iterator, error) { return nil, q.err }
+func (q failAgg) All(context.Context) ([]*anyenc.Value, error) { return nil, q.err }
+func (q failAgg) Count(context.Context) (int, error)           { return 0, q.err }
+func (q failAgg) Explain(context.Context) (string, error)      { return "", q.err }
+func (t *techSpace) AggregateObjects(pipeline any) space.Agg {
+	return t.inner.AggregateObjects(pipeline)
+}
+func (t *techSpace) Datasets() []space.DatasetSchema { return t.inner.Datasets() }
+
+// Generic writes reach bundle datasets only — the datasets a bundle
+// root declared (catalog-owned) — and never the tech index object:
+// its tree is the account's space list, and a write fence keyed on the
+// dataset name alone would let a bundle dataset name target it. The
+// type-system built-ins (objects, properties, shortIds, datasets) and
+// the system datasets (spaces, profile, devices, …) stay
+// typed-API-only on this handle; a dataset the store has never heard
+// of passes through so the regular unknown-dataset error surfaces.
+func (t *techSpace) checkWrite(objectId, dataset string) error {
+	if objectId == t.inner.techIndexId {
+		return fmt.Errorf("spaceimpl: the tech index object accepts no generic writes: %w", space.ErrUnsupported)
+	}
+	if _, owned := t.inner.store.DatasetOwners(dataset); owned {
+		return nil
+	}
+	if _, err := t.inner.store.DataVersion(dataset); err == nil {
+		return fmt.Errorf("spaceimpl: dataset %q is not a bundle dataset: %w", dataset, space.ErrUnsupported)
+	}
+	return nil // unknown everywhere: the write path reports it as such
+}
+
+func (t *techSpace) Modify(ctx context.Context, batch space.ModifyBatch) (space.ModifyResult, error) {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+	return t.inner.Modify(ctx, batch)
+}
+
+func (t *techSpace) ModifyMany(ctx context.Context, batches []space.ModifyBatch) ([]space.ModifyResult, error) {
+	for i := range batches {
+		if err := t.checkWrite(batches[i].ObjectId, batches[i].Dataset); err != nil {
+			return nil, err
+		}
+	}
+	return t.inner.ModifyMany(ctx, batches)
+}
+
+func (t *techSpace) Delete(ctx context.Context, batch space.DeleteBatch) (space.ModifyResult, error) {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
+		return space.ModifyResult{}, err
+	}
+	return t.inner.Delete(ctx, batch)
+}
+
+func (t *techSpace) Upsert(ctx context.Context, batch space.UpsertBatch) (space.UpsertResult, error) {
+	if err := t.checkWrite(batch.ObjectId, batch.Dataset); err != nil {
+		return space.UpsertResult{}, err
+	}
+	return t.inner.Upsert(ctx, batch)
+}
+
+func (t *techSpace) SetP2PAdvertise(context.Context, bool) error {
+	return errUnsupported("SetP2PAdvertise")
+}
+
+func (t *techSpace) SetMetadata(context.Context, space.SetMetadataRequest) error {
+	return errUnsupported("SetMetadata")
+}
+
+func (t *techSpace) SpaceIndexObjectId() string { return t.inner.techIndexId }
+
+// WaitIndexSynced: the tech index object is the space list itself.
+func (t *techSpace) WaitIndexSynced(ctx context.Context) error { return t.parent.WaitListSynced(ctx) }
+
+func (t *techSpace) SyncHeads(ctx context.Context) error { return t.inner.SyncHeads(ctx) }
+func (t *techSpace) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
+	return t.inner.TreeHeads(ctx)
+}
+
+// isBundleRoot reports whether objectId is a bundle root: its row
+// carries a definition marker in `any.type` (a tech bundle root is
+// its own type or collection, and hosts its records under the
+// implicit self grant).
+func (t *techSpace) isBundleRoot(ctx context.Context, objectId string) (bool, error) {
+	members, err := t.inner.store.ObjectMembers(ctx, objectId)
+	if err != nil {
+		return false, err
+	}
+	if members.Type == typetype.MetaTypeMarker || members.Type == collectiontype.MetaMarker {
+		return true, nil
+	}
+	// No definition row. When the registry references the id as a
+	// bundle root, that is a root whose tree/row has not applied here
+	// yet — a retryable state, not the hard fence: without this, a
+	// device that received the registry row before the root tree would
+	// read a genuine bundle root as permanently unsupported. The probe
+	// reads the committed registry collection directly — no tree load.
+	if t.inner.techIndexId != "" {
+		coll, cerr := t.inner.store.OpenObjectCollection(ctx, t.inner.techIndexId, spaceindex.BundlesDataset)
+		if cerr == nil {
+			iter, ierr := coll.Find(nil).Iter(ctx)
+			if ierr != nil {
+				return false, ierr
+			}
+			defer iter.Close()
+			for iter.Next() {
+				doc, derr := iter.Doc()
+				if derr != nil {
+					return false, derr
+				}
+				v := doc.Value()
+				if v == nil {
+					continue
+				}
+				for _, r := range v.GetArray(spaceindex.FieldBundleRoots) {
+					if string(r.GetStringBytes()) == objectId {
+						return false, fmt.Errorf("spaceimpl: %w: root %q of bundle %q", space.ErrBundleRootNotSynced, objectId, string(v.GetStringBytes("id")))
+					}
+				}
+			}
+			if err := iter.Err(); err != nil {
+				return false, err
+			}
+		}
+	}
+	return false, nil
+}
+
+// techObjects keeps Get (a local row read) and refuses free lifecycle:
+// tech-space objects exist only as bundle roots. Delete is allowed for
+// exactly those — a deleted created winner reads as uninstalled, but
+// leaves its losers claimed, so the uninstall is Bundles().Uninstall;
+// a derived root stays undeletable (the object layer refuses derived
+// deletion).
+type techObjects struct {
+	inner *objectService
+	t     *techSpace
+}
+
+func (x techObjects) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
+	return x.inner.Get(ctx, objectId)
+}
+
+func (x techObjects) Delete(ctx context.Context, objectId string) error {
+	// A deleted root's row is purged while the add-only registry still
+	// lists it, which isBundleRoot reads as a root not synced yet.
+	deleted, err := x.inner.parent.store.TreeDeleted(ctx, objectId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete: deleted status: %w", err)
+	}
+	if deleted {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete %s: %w", objectId, space.ErrObjectDeleted)
+	}
+	ok, err := x.t.isBundleRoot(ctx, objectId)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: tech Objects().Delete: %w", err)
+	}
+	if !ok {
+		return errUnsupported("Objects().Delete (non-bundle-root)")
+	}
+	return x.inner.Delete(ctx, objectId)
+}
+
+func (techObjects) Create(context.Context, space.CreateObjectOpts) (string, error) {
+	return "", errUnsupported("Objects().Create")
+}
+func (techObjects) Derive(context.Context, space.DeriveObjectOpts) (string, error) {
+	return "", errUnsupported("Objects().Derive")
+}
+
+// techTypes keeps reads, and the declaration methods — parts,
+// datasets, properties — for bundle roots only (a bundle root is a
+// type; its declarations evolve through them); type lifecycle and
+// the type's own metadata refuse.
+type techTypes struct {
+	inner *typesAPI
+	t     *techSpace
+}
+
+func (x techTypes) root(ctx context.Context, typeId string) error {
+	ok, err := x.t.isBundleRoot(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("spaceimpl: type %q is not a bundle root: %w", typeId, space.ErrUnsupported)
+	}
+	return nil
+}
+
+func (x techTypes) List(ctx context.Context) ([]space.TypeInfo, error) { return x.inner.List(ctx) }
+func (x techTypes) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
+	return x.inner.Get(ctx, typeId)
+}
+func (x techTypes) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
+	return x.inner.Properties(ctx, typeId)
+}
+func (x techTypes) Datasets(ctx context.Context, typeId string) ([]space.DatasetDef, error) {
+	return x.inner.Datasets(ctx, typeId)
+}
+func (x techTypes) Parts(ctx context.Context, typeId string) ([]space.PartDef, error) {
+	return x.inner.Parts(ctx, typeId)
+}
+func (x techTypes) AddPart(ctx context.Context, typeId string, draft space.PartDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddPart(ctx, typeId, draft)
+}
+func (x techTypes) PatchPart(ctx context.Context, typeId, partId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchPart(ctx, typeId, partId, patch)
+}
+func (x techTypes) RemovePart(ctx context.Context, typeId, partId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemovePart(ctx, typeId, partId)
+}
+func (x techTypes) AddDataset(ctx context.Context, typeId, partId string, draft space.DatasetDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDataset(ctx, typeId, partId, draft)
+}
+func (x techTypes) AddDatasetField(ctx context.Context, typeId, defId string, draft space.DatasetFieldDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDatasetField(ctx, typeId, defId, draft)
+}
+func (x techTypes) RemoveDataset(ctx context.Context, typeId, defId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveDataset(ctx, typeId, defId)
+}
+func (x techTypes) RemoveDatasetField(ctx context.Context, typeId, fieldDefId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveDatasetField(ctx, typeId, fieldDefId)
+}
+func (x techTypes) AddDatasetIndex(ctx context.Context, typeId, defId string, draft space.IndexDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddDatasetIndex(ctx, typeId, defId, draft)
+}
+func (x techTypes) RemoveDatasetIndex(ctx context.Context, typeId, indexDefId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveDatasetIndex(ctx, typeId, indexDefId)
+}
+func (x techTypes) SubscribeIndexBuilds(cb func(space.IndexBuild)) (cancel func()) {
+	return x.inner.SubscribeIndexBuilds(cb)
+}
+func (x techTypes) PatchDataset(ctx context.Context, typeId, defId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchDataset(ctx, typeId, defId, patch)
+}
+func (x techTypes) PatchDatasetField(ctx context.Context, typeId, fieldDefId string, patch space.DatasetDefPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchDatasetField(ctx, typeId, fieldDefId, patch)
+}
+func (techTypes) Create(context.Context, space.TypeCreateParams) (string, error) {
+	return "", errUnsupported("Types().Create")
+}
+func (techTypes) Delete(context.Context, string) error { return errUnsupported("Types().Delete") }
+func (techTypes) Patch(context.Context, string, space.TypePatch) error {
+	return errUnsupported("Types().Patch")
+}
+
+// Property definitions evolve on bundle roots only, like parts: a
+// bundle declaring Properties is a type whose columns must stay
+// evolvable and removable here too.
+func (x techTypes) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
+	if err := x.root(ctx, typeId); err != nil {
+		return "", err
+	}
+	return x.inner.AddProperty(ctx, typeId, draft)
+}
+func (x techTypes) RemoveProperty(ctx context.Context, typeId, propId string) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.RemoveProperty(ctx, typeId, propId)
+}
+func (x techTypes) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
+	if err := x.root(ctx, typeId); err != nil {
+		return err
+	}
+	return x.inner.PatchProperty(ctx, typeId, propId, patch)
+}
+
+// techBundles: installs that declare datasets, on a derived or a
+// created root; a created one forks, resolves and uninstalls like in
+// any space.
+type techBundles struct{ inner *bundlesAPI }
+
+func (x techBundles) Get(ctx context.Context, bundleId string) (space.Bundle, error) {
+	return x.inner.Get(ctx, bundleId)
+}
+
+func (x techBundles) List(ctx context.Context) ([]space.Bundle, error) {
+	return x.inner.List(ctx)
+}
+
+func (x techBundles) DerivedRootId(ctx context.Context, bundleId string) (string, error) {
+	return x.inner.DerivedRootId(ctx, bundleId)
+}
+
+func (x techBundles) Ensure(ctx context.Context, req space.EnsureBundleRequest, opts ...space.EnsureOption) (space.Bundle, bool, error) {
+	if err := validateTechEnsureRequest(req); err != nil {
+		return space.Bundle{}, false, err
+	}
+	// A tech bundle root exists to host its bundle's records — there
+	// is no other object to carry the type — which the implicit self
+	// grant of every definition object provides; isBundleRoot keys on
+	// the marker.
+	return x.inner.Ensure(ctx, req, opts...)
+}
+
+func (x techBundles) ResolveLoser(ctx context.Context, bundleId, loserRootId string) error {
+	// Load-bearing with created roots: two devices installing while
+	// apart fork, and the losing root must be resolvable here like in
+	// any space. The delete runs on the inner object service — the
+	// public techObjects fence is about free lifecycle, not this.
+	return x.inner.ResolveLoser(ctx, bundleId, loserRootId)
+}
+
+func (x techBundles) Uninstall(ctx context.Context, bundleId string) error {
+	// Same inner service as ResolveLoser: a created tech install is
+	// deletable, and its losers go with it.
+	return x.inner.Uninstall(ctx, bundleId)
+}
+
+// validateTechEnsureRequest adds the tech-space rules on top of the
+// structural gate: Parts or Properties required (the root is its own
+// type — that declaration is the install), roots minted by Ensure only
+// (free object create is fenced, so NewRoot has nothing legal to
+// call), and no foreign types (a type from another space would stamp a
+// DataVersion the tech space can never satisfy on a device that lacks
+// that space). Both root strategies are allowed: DerivedRoot for
+// bundles that must never fork or uninstall, the SDK-minted created
+// root for ordinary app installs (deletable; concurrent offline
+// installs fork and resolve like in any space).
+func validateTechEnsureRequest(req space.EnsureBundleRequest) error {
+	if req.NewRoot != nil {
+		return fmt.Errorf("spaceimpl: %w: NewRoot is not available on the tech space — Ensure mints the root", space.ErrBundleBadRequest)
+	}
+	if !req.Declares() {
+		return fmt.Errorf("spaceimpl: %w: tech-space bundles must declare a type or collection (Parts, Properties or XKey)", space.ErrBundleBadRequest)
+	}
+	if req.RootType != "" || len(req.RootCollections) > 0 || len(req.RootProperties) > 0 {
+		return fmt.Errorf("spaceimpl: %w: RootType/RootCollections/RootProperties are not available on the tech space — a tech bundle root is its own definition", space.ErrBundleBadRequest)
+	}
+	return nil
+}
+
+var (
+	_ space.ObjectService = techObjects{}
+	_ space.TypesAPI      = techTypes{}
+	_ space.BundlesAPI    = techBundles{}
+)

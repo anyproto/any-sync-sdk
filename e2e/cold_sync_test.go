@@ -35,6 +35,7 @@ import (
 // device A to TTL its space cache or quit while device B is still
 // trying to fetch.
 func TestE2E_ColdSyncSameKey(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -101,7 +102,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 
 		for _, title := range []string{label + "-One", label + "-Two"} {
 			objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-				Types: []string{typeId},
+				Type: typeId,
 			})
 			require.NoError(t, err)
 			_, err = sp.Properties().Set(ctx, objId, typeId, map[string]any{
@@ -183,7 +184,7 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	// Step 2: per-space — types and objects must converge. Event-
 	// driven via QueryObjects().Subscribe: the per-space `objects`
 	// dataset writes fire for BOTH type creates (typesAPI.Create
-	// writes any.types=["__type__"] to objects) AND instance creates
+	// writes any.type="__type__" to objects) AND instance creates
 	// / Properties().Set. We register before re-checking and recheck on every
 	// event arrival until the local snapshot satisfies the fixture.
 	for _, fix := range wantSpaces {
@@ -276,6 +277,27 @@ func TestE2E_ColdSyncSameKey(t *testing.T) {
 	}
 }
 
+// getSpaceEventually retries Spaces().Get until the load succeeds. A
+// Get racing a concurrent load of the same space can surface a
+// transient "context canceled" verdict from a coalesced network call
+// inside NewSpace — ocache retries only loads aborted by the load ctx
+// itself, not inner cancellations (the same transient the indexer's
+// spawnWorker retries with backoff).
+func getSpaceEventually(ctx context.Context, t *testing.T, sdk *anysyncsdk.SDK, spaceId string) space.Space {
+	t.Helper()
+	var (
+		sp   space.Space
+		last error
+	)
+	if !waitFor(ctx, 30*time.Second, 500*time.Millisecond, func() bool {
+		sp, last = sdk.Spaces().Get(ctx, spaceId)
+		return last == nil
+	}) {
+		t.Fatalf("space %s never loaded: %v", spaceId, last)
+	}
+	return sp
+}
+
 // waitFor polls fn at the given interval until it returns true or the
 // per-call deadline elapses (whichever is sooner than ctx). Returns
 // true on success.
@@ -295,6 +317,16 @@ func waitFor(ctx context.Context, deadline, interval time.Duration, fn func() bo
 		}
 	}
 	return false
+}
+
+// markerTypeId creates a type that declares nothing — no parts, no
+// properties, no layout. Every object has a type, so tests needing one
+// without caring which mint it here.
+func markerTypeId(t *testing.T, ctx context.Context, sp space.Space, name string) string {
+	t.Helper()
+	id, err := sp.Types().Create(ctx, space.TypeCreateParams{Name: name})
+	require.NoError(t, err)
+	return id
 }
 
 // userTypeIds returns the ids of types on sp that are NOT marked

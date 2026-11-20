@@ -1,5 +1,21 @@
 package space
 
+import "github.com/anyproto/any-sync-sdk/internal/crdt"
+
+// SharedRecordId is the id a record of a shared dataset
+// (DatasetDraft.Shared) is stored and read under:
+// `<objectId>/<recordId>`.
+func SharedRecordId(objectId, recordId string) string {
+	return crdt.KeyedId(objectId, recordId)
+}
+
+// PlainRecordId is the record id inside id, the stored id of one of
+// objectId's records in a shared dataset: what follows the object's
+// prefix. An id without that prefix is returned as is.
+func PlainRecordId(objectId, id string) string {
+	return crdt.KeyedRecordId(objectId, id)
+}
+
 // ModifyBatch is the caller-facing write batch: one or more record
 // changes in a single dataset of a single object. Applied atomically
 // and returns one VersionId for the whole batch.
@@ -12,14 +28,81 @@ type ModifyBatch struct {
 	// travel through any-sync in a dedicated field so the whole space
 	// can be queried by trace. Empty slice means no trace.
 	TraceIds []string
+
+	// Scope selects the write route for the whole batch. A write call
+	// is single-scope — routes commit in different version domains and
+	// there is no cross-route rollback (same rule as PropertiesAPI.Set).
+	// Zero value = ScopeSynced: the object's own DAG change, synced to
+	// every member. The default, and the only route ModifyMany and
+	// Delete support.
+	//
+	// ScopeLocal is the device-local materialization route: no DAG
+	// change, never syncs, VersionId minted by the local lexid
+	// allocator; the write flows through Query/Subscribe like any
+	// apply. Every op must target a field the dataset schema declares
+	// ScopeLocal — ops on fields of any other scope are refused by the
+	// apply layer's scope enforcement and surface in
+	// ModifyResult.Rejections, like handler rejections on the synced
+	// route. Records must already exist: explicit ids, no Upsert —
+	// local fields annotate synced records, they don't create them
+	// (a strict-mode miss surfaces as an ErrStrictSkipAbsent
+	// rejection). TraceIds are rejected (they ride the any-sync
+	// change). The shared `objects` dataset is rejected too: its
+	// per-property scopes are enforced by the writer, so local
+	// property values go through PropertiesAPI.Set.
+	//
+	// ScopeAccount and ScopeDerived are rejected: derived is
+	// handler-only, and the account transport for dataset records is
+	// not wired yet — the account mirror handles objects rows only
+	// (docs/scoped-properties-proposal.md § Account transport).
+	Scope Scope
+
+	// IfUnchangedSince makes the batch conditional: it applies only if
+	// no record of (ObjectId, Dataset), tombstones included, carries an
+	// _applySeq above this value — the dataset is still as the caller
+	// read it, when the highest _applySeq it read was this value. The
+	// check and the write are one step under the object's write lock,
+	// which every local write and every synced apply takes, so nothing
+	// lands in between. A dataset that changed is ErrPreconditionFailed
+	// with nothing written.
+	//
+	// Take the value from a read that includes tombstones — a Query with
+	// ProjectionOpts{IncludeDeleted: true}, keeping _applySeq — or from
+	// the ModifyResult.ApplySeq of the caller's own previous write.
+	// Snapshot and Subscribe skip tombstones, so a value taken from them
+	// stays below a later delete's stamp and every write is refused. Any
+	// apply that stamps a record counts as a change: device-local writes
+	// (read-tracking flags) and a tree rebuild's replay included. The
+	// value holds within one process run and one store generation
+	// (Changes().Generation): the allocator re-seeds from persisted
+	// watermarks on every start, and a rebuilt store renumbers
+	// _applySeq, so after a restart re-read the dataset instead of
+	// reusing a value from before it.
+	//
+	// Synced scope only; not for ModifyMany or the objects dataset, whose
+	// row every change to the object stamps.
+	IfUnchangedSince *uint64
 }
 
 // RecordModify groups ops applied to one record id.
+//
+// A record whose only op is OpDelete is tombstoned by the same change
+// as the batch's other records, so a batch creates, updates and deletes
+// in one change; per-op handler rejections (ModifyResult.Rejections)
+// still apply to it, as to any op. A delete needs an explicit Id that no
+// other record of the batch writes, and no Upsert, Path or Value. The
+// objects dataset takes no deletes: every record there is the object's
+// one row.
 //
 // Id: when empty, the CRDT layer derives one from the change's
 // ChangeId (base58(xxh3-64(ChangeId))); subsequent empty-id records
 // in the same batch get a ":<index>" suffix. Empty id requires
 // Upsert=true.
+//
+// On a shared dataset (DatasetDraft.Shared) a record is read back as
+// `<objectId>/<recordId>`. Id takes that form for the batch's own
+// object, or the plain record id; a "/" anywhere else is
+// ErrRecordIdOfAnotherObject.
 //
 // Upsert: false (default) = strict update-if-exists — modifies on an
 // absent record are silent no-ops. true = create-or-update; the
@@ -38,9 +121,23 @@ type RecordModify struct {
 // an object whose keys are paths applied in parallel under one
 // VersionId.
 type Op struct {
-	Type  OpType
-	Path  string
-	Value any // scalar, slice, or map[string]any depending on Type
+	Type OpType
+	Path string
+	// Value is the operand — scalar, slice, or map[string]any
+	// depending on Type. A value means what its JSON form means:
+	// Extended-JSON wrappers are typed values, the same spelling a
+	// Query.Filter literal uses, and {"$date": "<RFC 3339>"} is the
+	// one with a property kind (datetime); $binary, $oid and $vector
+	// decode too but fit only undeclared fields. A Go time.Time is a
+	// datetime and []byte is binary, at any depth of map[string]any /
+	// []any. A *fastjson.Value is decoded under the same rule; a
+	// *anyenc.Value is taken verbatim. Every value written into a
+	// dataset record follows this rule: UpsertRecord.Fields,
+	// PropertiesAPI.Set, CreateObjectOpts.InitialProperties,
+	// PropertyPatch.Set, DatasetDefPatch.Set. Tech-space settings and
+	// device app bags are scalar-only (Service.SetSettings,
+	// DeviceUpsert.Apps).
+	Value any
 }
 
 // OpType is the set of supported modifiers for v1. No insert op —
@@ -54,6 +151,9 @@ const (
 	OpPull     OpType = "$pull"
 	OpInc      OpType = "$inc"
 	OpIncGated OpType = "$incGated"
+	// OpDelete tombstones the record (DeleteBatch semantics). It must
+	// be its RecordModify's only op.
+	OpDelete OpType = "delete"
 )
 
 // DeleteBatch produces sticky tombstones for the listed record ids.
@@ -81,18 +181,25 @@ type DeleteBatch struct {
 //     empty Id, the resolved value is `base58(xxh3-64(ChangeId))`
 //     (with `:<index>` suffix for the second-and-later empty ids in
 //     a batch). This is the propId / shortId convention; callers
-//     creating types or properties read it from RecordIds[0].
+//     creating types or properties read it from RecordIds[0]. On a
+//     shared dataset each id is the one the record is read back
+//     under, `<objectId>/<recordId>`; a rejection's RecordId too.
 //   - Rejections lists per-op handler rejections — ops that the
 //     change carries but the handler refused (kind mismatch,
 //     terminal status, immutable field, unknown property…). The
 //     change still committed with a fresh VersionId, but those ops
 //     did not land. HTTP layers can surface this as a partial
 //     success or a hard error per their policy.
+//   - ApplySeq is the per-space apply sequence the change stamped on
+//     the records it wrote (their _applySeq): peer-local, monotonic.
+//     Pass it as ModifyBatch.IfUnchangedSince to write conditionally
+//     against the state this write produced.
 type ModifyResult struct {
 	VersionId  VersionId
 	ChangeId   string
 	RecordIds  []string
 	Rejections []OpRejection
+	ApplySeq   uint64
 }
 
 // OpRejection describes one op the handler refused to apply. The
@@ -114,3 +221,23 @@ type OpRejection struct {
 	Reason      string
 	ReasonErr   error
 }
+
+// ErrRecordDeleted is the ReasonErr (match with errors.Is) of the
+// whole-record rejection emitted when a modify or upsert lands on a
+// tombstoned record. Record deletion is sticky (CRDT delete-wins):
+// the write is absorbed, nothing is stored, and the id can never be
+// reused — without this rejection the absorbed write would be
+// indistinguishable from a successful create. Deleting an
+// already-deleted record stays silent (idempotent).
+var ErrRecordDeleted = crdt.ErrRecordDeleted
+
+// ErrDatasetUndeletable is the refusal of a delete op on a dataset
+// declared DeleteByNone: Delete, or a delete op in Modify or ModifyMany
+// (match with errors.Is). Nothing was written: the record stays live
+// and its id stays writable.
+var ErrDatasetUndeletable = crdt.ErrDatasetUndeletable
+
+// ErrPreconditionFailed is a conditional Modify's refusal
+// (ModifyBatch.IfUnchangedSince): the dataset changed after the given
+// apply sequence. Nothing was written.
+var ErrPreconditionFailed = crdt.ErrPreconditionFailed

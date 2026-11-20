@@ -41,6 +41,7 @@ func sameAccountFreshDevice(t *testing.T, p *fixedSeedProvider) *fixedSeedProvid
 //     already online — the live mirror path (carrier events) must
 //     deliver it without a space reload.
 func TestE2E_AccountScopeSync(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -84,7 +85,7 @@ func TestE2E_AccountScopeSync(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	objA, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objA, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, objA, typeId, map[string]any{titleProp: "first"})
 	require.NoError(t, err)
@@ -165,7 +166,7 @@ func TestE2E_AccountScopeSync(t *testing.T) {
 	}, 2*time.Minute, 3*time.Second, "device B: unset never propagated")
 
 	// ---- Live path: new object + account value while B is online ----
-	objA2, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{typeId}})
+	objA2, err := spA.Objects().Create(ctx, space.CreateObjectOpts{Type: typeId})
 	require.NoError(t, err)
 	_, err = spA.Properties().Set(ctx, objA2, typeId, map[string]any{readProp: true})
 	require.NoError(t, err)

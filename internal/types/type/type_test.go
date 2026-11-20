@@ -67,6 +67,8 @@ func setMulti(arena *anyenc.Arena, fields map[string]any) crdt.Op {
 			} else {
 				obj.Set(k, arena.NewFalse())
 			}
+		case *anyenc.Value:
+			obj.Set(k, x)
 		default:
 			panic("setMulti: unsupported type")
 		}
@@ -318,6 +320,235 @@ func TestPropertyHandler_CreateRejectedOnBadScope(t *testing.T) {
 	}
 }
 
+// ----------------------------------------------------------------------------
+// x-format — creation shape; everything under it is opaque and mutable
+// ----------------------------------------------------------------------------
+
+// setMultiXFormat builds a creation $set with `kind` and a whole
+// `x-format` object.
+func setMultiXFormat(arena *anyenc.Arena, kind string, xformat map[string]*anyenc.Value) crdt.Op {
+	obj := arena.NewObject()
+	obj.Set(typetype.FieldKind, arena.NewString(kind))
+	xf := arena.NewObject()
+	for k, v := range xformat {
+		if v != nil {
+			xf.Set(k, v)
+		}
+	}
+	obj.Set(typetype.FieldXFormat, xf)
+	return crdt.Op{Type: crdt.OpSet, Payload: obj}
+}
+
+func TestPropertyHandler_CreateWithXFormat(t *testing.T) {
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-related"
+	const changeId = "ch-create-related"
+	opts := arena.NewObject()
+	lead := arena.NewObject()
+	lead.Set("name", arena.NewString("Lead"))
+	opts.Set("lead", lead)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", changeId, propId, true,
+		setMultiXFormat(arena, "array", map[string]*anyenc.Value{
+			"type":    arena.NewString("choice"),
+			"pos":     arena.NewString("a0"),
+			"options": opts,
+			"config":  arena.NewObject(),
+		}),
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "choice", rec.GetString(typetype.FieldXFormat, "type"))
+	assert.Equal(t, "Lead", rec.GetString(typetype.FieldXFormat, "options", "lead", "name"))
+
+	// The descriptor is not "important" beyond the add itself — the
+	// usual create shortId row is still minted.
+	row := ctrl.Get(context.Background(), typetype.ShortIdsDataset, crdt.DeriveRecordId(changeId))
+	require.NotNil(t, row, "create with x-format must still project a shortId")
+}
+
+func TestPropertyHandler_CreateXFormatIsOpaque(t *testing.T) {
+	// Nothing inside the bag is inspected: an unknown slug, a slug the
+	// consumer would reject for this kind, non-string leaves and vendor
+	// keys all land. The consumer is the semantics boundary.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-opaque"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-opaque", propId, true,
+		setMultiXFormat(arena, "string", map[string]*anyenc.Value{
+			"type":     arena.NewString("rainbow"),
+			"decimals": arena.NewNumberFloat64(2),
+			"acme":     arena.NewObject(),
+		}),
+	)))
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "rainbow", rec.GetString(typetype.FieldXFormat, "type"))
+	assert.Equal(t, float64(2), rec.GetFloat64(typetype.FieldXFormat, "decimals"))
+}
+
+func TestPropertyHandler_CreateXFormatRejections(t *testing.T) {
+	// The one structural rule: an object, created whole.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	nonObject := arena.NewObject()
+	nonObject.Set(typetype.FieldKind, arena.NewString("string"))
+	nonObject.Set(typetype.FieldXFormat, arena.NewString("email"))
+
+	dotted := arena.NewObject()
+	dotted.Set(typetype.FieldKind, arena.NewString("string"))
+	dotted.Set("x-format.type", arena.NewString("email"))
+
+	cases := []struct {
+		name string
+		op   crdt.Op
+	}{
+		{"non-object", crdt.Op{Type: crdt.OpSet, Payload: nonObject}},
+		{"dotted-key", crdt.Op{Type: crdt.OpSet, Payload: dotted}},
+		{"deep-path", crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("email")}},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			propId := "prop-bad-xformat-" + tc.name
+			kindOp := crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldKind}, Payload: arena.NewString("string")}
+			ops := []crdt.Op{tc.op}
+			if len(tc.op.Path) > 0 {
+				ops = []crdt.Op{kindOp, tc.op}
+			}
+			require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+				crdt.VersionId("v"+string(rune('1'+i))), "ch-"+tc.name, propId, true, ops...,
+			)))
+			rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+			if rec != nil {
+				assert.Nil(t, rec.Get(typetype.FieldKind), "record %q must not materialize", tc.name)
+			}
+		})
+	}
+}
+
+func TestPropertyHandler_XFormatEditsPass(t *testing.T) {
+	// Every path under x-format is mutable — the slug included — in
+	// every op shape, with any value type. Pinned state stays pinned.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-xformat-edit"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiXFormat(arena, "string", map[string]*anyenc.Value{
+			"type": arena.NewString("text"),
+		}),
+	)))
+
+	// Slug edit via single dotted path — passes.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-type-edit", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "type"}, Payload: arena.NewString("email")},
+	)))
+	// Nested leaves via multi-field dotted keys, non-string values — pass.
+	multi := arena.NewObject()
+	multi.Set("x-format.config.multiple", arena.NewTrue())
+	multi.Set("x-format.options.high.name", arena.NewString("High"))
+	targets := arena.NewArray()
+	targets.SetArrayItem(0, arena.NewString("companies"))
+	multi.Set("x-format.relation.targetTypes", targets)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-multi-edit", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: multi},
+	)))
+	// Whole-bag replace passes at this layer (the leaf-only rule is the
+	// consumer's); a pinned field bundled with it still drops per key.
+	bag := arena.NewObject()
+	bag.Set("type", arena.NewString("url"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", "ch-bag-replace", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: bag},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v5", "ch-kind-edit", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldKind}, Payload: arena.NewString("number")},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "string", rec.GetString(typetype.FieldKind), "kind pinned")
+	assert.Equal(t, "url", rec.GetString(typetype.FieldXFormat, "type"), "whole-bag replace landed")
+	assert.Nil(t, rec.Get(typetype.FieldXFormat, "options", "high"), "whole-bag replace dropped the old option subtree")
+}
+
+func TestPropertyHandler_XFormatOptionLeafEdits(t *testing.T) {
+	// Option leaves are ordinary per-path members: a multi-field $set
+	// adds an option, an $unset of the option path removes the subtree.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-select"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiXFormat(arena, "array", map[string]*anyenc.Value{
+			"type": arena.NewString("choice"),
+		}),
+	)))
+
+	add := arena.NewObject()
+	add.Set("x-format.options.high.name", arena.NewString("High"))
+	add.Set("x-format.options.high.color", arena.NewString("red"))
+	add.Set("x-format.options.high.pos", arena.NewString("a0"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-add-opt", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: add},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "High", rec.GetString(typetype.FieldXFormat, "options", "high", "name"))
+	assert.Equal(t, "red", rec.GetString(typetype.FieldXFormat, "options", "high", "color"))
+	assert.Equal(t, "a0", rec.GetString(typetype.FieldXFormat, "options", "high", "pos"))
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-del-opt", propId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{typetype.FieldXFormat, "options", "high"}},
+	)))
+	rec = ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typetype.FieldXFormat, "options", "high"), "option subtree removed")
+}
+
+func TestPropertyHandler_ConcurrentXFormatLeafEditsMerge(t *testing.T) {
+	// Two writers touching different x-format leaves: per-leaf `_ver`
+	// tracking must let both land regardless of arrival order.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-concurrent"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiXFormat(arena, "array", map[string]*anyenc.Value{
+			"type": arena.NewString("relation"),
+		}),
+	)))
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", "ch-icon", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "icon"}, Payload: arena.NewString("building")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", "ch-filter", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat, "relation", "filter"}, Payload: arena.NewString(`{"a":1}`)},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "building", rec.GetString(typetype.FieldXFormat, "icon"))
+	assert.Equal(t, `{"a":1}`, rec.GetString(typetype.FieldXFormat, "relation", "filter"))
+}
+
 func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 	ctrl := newTypeController(t)
 	arena := &anyenc.Arena{}
@@ -350,4 +581,51 @@ func TestPropertyHandler_ScopeEditDropped(t *testing.T) {
 	require.NotNil(t, rec)
 	assert.Equal(t, "local", rec.GetString(typetype.FieldScope), "scope is pinned after first write")
 	assert.Equal(t, "Renamed", rec.GetString(typetype.FieldName), "bundled non-pinned key still landed")
+}
+
+func TestPropertyHandler_WholeXFormatSetMustBeObject(t *testing.T) {
+	// The create-time shape holds for the record's life: a $set of the
+	// whole bag carries an object (replacing it is legal — the
+	// consumer's leaf-only rule is not this layer's); a scalar there is
+	// dropped in both op shapes.
+	ctrl := newTypeController(t)
+	arena := &anyenc.Arena{}
+
+	const propId = "prop-whole-bag"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "ch-create", propId, true,
+		setMultiXFormat(arena, "string", map[string]*anyenc.Value{"type": arena.NewString("text")}),
+	)))
+
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", "ch-scalar-path", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: arena.NewString("email")},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1, "scalar over the bag (single path) must drop")
+	multi := arena.NewObject()
+	multi.Set(typetype.FieldXFormat, arena.NewString("email"))
+	multi.Set(typetype.FieldName, arena.NewString("kept"))
+	res, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", "ch-scalar-multi", propId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: multi},
+	))
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Rejections, "scalar over the bag (multi-field key) must drop")
+
+	bag := arena.NewObject()
+	bag.Set("type", arena.NewString("email"))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", "ch-object", propId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typetype.FieldXFormat}, Payload: bag},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v5", "ch-unset", propId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{typetype.FieldXFormat}},
+	)))
+
+	rec := ctrl.Get(context.Background(), typetype.DatasetPropertyDefs, propId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "kept", rec.GetString(typetype.FieldName), "the legal key of the multi-field set landed")
+	assert.Nil(t, rec.Get(typetype.FieldXFormat), "whole-bag unset is a clear")
 }

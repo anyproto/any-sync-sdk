@@ -6,32 +6,48 @@ package subscribe
 // across every object in the space" — the property firehose. The
 // ObjectId/Dataset fields are ignored in this case.
 //
-// Shared=false means "events whose ObjectId/Dataset match exactly".
+// AllObjects=true means "every event of Dataset, whatever object it
+// was applied on" — a shared dataset read across the space. ObjectId
+// is ignored.
+//
+// Otherwise the scope is "events whose ObjectId/Dataset match exactly".
 type Scope struct {
-	Shared   bool
-	ObjectId string
-	Dataset  string
+	Shared     bool
+	AllObjects bool
+	ObjectId   string
+	Dataset    string
 }
 
 // scopeIndex groups querySubs by scope so OnApply can route an event
 // to just the relevant subs in O(1) per bucket without scanning every
-// sub. Shared-scope and per-(object, dataset) buckets are disjoint at
-// register time — a single sub lives in exactly one bucket.
+// sub. The shared-scope, per-dataset and per-(object, dataset) buckets
+// are disjoint at register time — a single sub lives in exactly one.
 type scopeIndex struct {
-	shared map[uint64]*querySub
-	perObj map[string]map[string]map[uint64]*querySub
+	shared     map[uint64]*querySub
+	perDataset map[string]map[uint64]*querySub
+	perObj     map[string]map[string]map[uint64]*querySub
 }
 
 func newScopeIndex() scopeIndex {
 	return scopeIndex{
-		shared: map[uint64]*querySub{},
-		perObj: map[string]map[string]map[uint64]*querySub{},
+		shared:     map[uint64]*querySub{},
+		perDataset: map[string]map[uint64]*querySub{},
+		perObj:     map[string]map[string]map[uint64]*querySub{},
 	}
 }
 
 func (idx *scopeIndex) add(s *querySub) {
 	if s.cfg.Scope.Shared {
 		idx.shared[s.id] = s
+		return
+	}
+	if s.cfg.Scope.AllObjects {
+		perDs, ok := idx.perDataset[s.cfg.Scope.Dataset]
+		if !ok {
+			perDs = map[uint64]*querySub{}
+			idx.perDataset[s.cfg.Scope.Dataset] = perDs
+		}
+		perDs[s.id] = s
 		return
 	}
 	perObj, ok := idx.perObj[s.cfg.Scope.ObjectId]
@@ -52,6 +68,14 @@ func (idx *scopeIndex) remove(s *querySub) {
 		delete(idx.shared, s.id)
 		return
 	}
+	if s.cfg.Scope.AllObjects {
+		perDs := idx.perDataset[s.cfg.Scope.Dataset]
+		delete(perDs, s.id)
+		if len(perDs) == 0 {
+			delete(idx.perDataset, s.cfg.Scope.Dataset)
+		}
+		return
+	}
 	perObj, ok := idx.perObj[s.cfg.Scope.ObjectId]
 	if !ok {
 		return
@@ -67,15 +91,18 @@ func (idx *scopeIndex) remove(s *querySub) {
 }
 
 // matches appends every querySub whose scope covers ev. Shared-scope
-// subs fire for every event whose dataset is ObjectsDataset; explicit
-// subs fire only on exact-object+dataset match. The two sets are
-// disjoint by construction, so callers can iterate the union without
-// dedup.
+// subs fire for every event whose dataset is ObjectsDataset; per-dataset
+// subs for every event of their dataset; explicit subs only on an exact
+// object+dataset match. The sets are disjoint by construction, so
+// callers can iterate the union without dedup.
 func (idx *scopeIndex) matches(ev Event, out []*querySub) []*querySub {
 	if ev.Dataset == ObjectsDataset {
 		for _, s := range idx.shared {
 			out = append(out, s)
 		}
+	}
+	for _, s := range idx.perDataset[ev.Dataset] {
+		out = append(out, s)
 	}
 	if perObj, ok := idx.perObj[ev.ObjectId]; ok {
 		if perDs, ok := perObj[ev.Dataset]; ok {

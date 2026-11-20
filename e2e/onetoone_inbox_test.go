@@ -14,7 +14,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_OneToOne_InboxDiscovery is the Phase-2 happy path: Alice
+// TestE2E_OneToOne_InboxDiscovery is the inbox-discovery happy path: Alice
 // initiates a 1-1, the SDK posts an inbox notification, and Bob's inbox
 // notifier surfaces the incoming request as a pending row WITHOUT any
 // out-of-band identity exchange (no RegisterIncoming call on Bob's side).
@@ -23,8 +23,9 @@ import (
 // Requires a coordinator that implements the inbox RPCs. If the
 // configured network doesn't (the notification never reaches Bob), the
 // test skips rather than fails — Layer-2 discovery is optional, and
-// Phase-1 (out-of-band) is covered separately.
+// out-of-band discovery is covered separately.
 func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -79,12 +80,22 @@ func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 	}
 	if pending == nil {
 		t.Skipf("inbox notification never reached bob — coordinator likely lacks inbox support; "+
-			"Phase-1 out-of-band path is covered by TestE2E_OneToOne_ApproveIncoming (space %s)", id)
+			"the out-of-band path is covered by TestE2E_OneToOne_ApproveIncoming (space %s)", id)
 	}
 
-	// Discovered via inbox alone. The display hint rode along.
+	// Discovered via inbox alone. The pending row surfaces Alice's account
+	// identity (as Author); her name is not in the invite (symkey-only).
 	assert.Equal(t, space.SpaceTypeOneToOne, pending.Type)
-	assert.Equal(t, "Alice", pending.Name, "invite body display hint should populate the pending row")
+	assert.Equal(t, alice.Account().Id(), pending.Author, "pending 1-1 must surface the friend identity")
+
+	// Pending-name resolution: the invite carried Alice's metadata symkey,
+	// which Bob's notifier cached; RegisterIncoming then resolves her
+	// identityRepo profile and writes the name onto the still-pending row —
+	// no accept or member watcher needed.
+	require.Eventually(t, func() bool {
+		si, ok := infoByID(t, ctx, bob, id)
+		return ok && si.Name == "Alice"
+	}, 60*time.Second, time.Second, "pending 1-1 should resolve Alice's name from identityRepo")
 
 	// Bob accepts → active.
 	bobSp, err := bob.Spaces().AcceptOneToOne(ctx, id)
@@ -93,4 +104,15 @@ func TestE2E_OneToOne_InboxDiscovery(t *testing.T) {
 	si, ok := infoByID(t, ctx, bob, id)
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
+
+	// End-to-end key distribution: the invite carried Alice's metadata
+	// symkey, which Bob's notifier cached. Starting the members watcher
+	// makes it fetch Alice's identityRepo profile and decrypt it with that
+	// key, resolving her name. Subscribe starts the profile loop.
+	cancelSub := bobSp.Members().Subscribe(func(space.MemberEvent) {})
+	defer cancelSub()
+	require.Eventually(t, func() bool {
+		m, err := bobSp.Members().Get(ctx, alice.Account().Id())
+		return err == nil && m.Name == "Alice"
+	}, 60*time.Second, time.Second, "Alice's name should resolve from identityRepo via the cached invite symkey")
 }

@@ -14,9 +14,9 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
@@ -86,9 +86,7 @@ func (s *Service) GetAccountValues(ctx context.Context, targetSpaceId, recordKey
 	if v == nil || v.Get(crdt.DeletedAtField) != nil {
 		return nil, nil
 	}
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	return cloned.Value, nil
+	return anyencx.Clone(v), nil
 }
 
 // IterAccountValues streams every live carrier record of
@@ -178,8 +176,7 @@ func (s *Service) DeleteAccountValuesForObject(ctx context.Context, targetSpaceI
 // DropAccountValues deletes the whole carrier object for
 // targetSpaceId — the space-leave/delete GC.
 //
-// KNOWN PROTOCOL VIOLATION, to be replaced (see the proposal's
-// follow-up ledger): any-sync forbids deleting DERIVED trees —
+// KNOWN PROTOCOL VIOLATION, to be replaced (docs/scoped-properties-proposal.md): any-sync forbids deleting DERIVED trees —
 // deterministic ids mean delete + re-derive = the same identity with
 // fresh history (history replacement). This must become record-level
 // GC (tombstone every carrier record, keep the empty derived tree).

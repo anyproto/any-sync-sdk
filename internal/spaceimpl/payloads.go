@@ -1,0 +1,729 @@
+package spaceimpl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/util/crypto"
+
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/payloads"
+	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/space"
+)
+
+// PayloadsAPI is the SDK-internal surface over the per-owner file
+// `payloads` objects (SYN-21). Consumed by the upload path (SYN-27);
+// a public Files API arrives with SYN-30.
+//
+// The per-owner payloads object is created LAZILY: RegisterFile
+// derives it on first use; read paths resolve the deterministic
+// derived id and treat a missing tree as "no rows" — they never
+// create it. Owners with no files never grow a child tree.
+type PayloadsAPI struct {
+	s    *spaceImpl
+	keys *aclKeyProvider
+}
+
+// PayloadsInternal returns the internal payloads surface (typed rows,
+// register/sign writes). Not part of the public space.Space interface —
+// the public read-only view is Space.Payloads (payloads_view.go).
+func (s *spaceImpl) PayloadsInternal() *PayloadsAPI {
+	return &PayloadsAPI{s: s, keys: &aclKeyProvider{s: s}}
+}
+
+// RegisterFileOpts describes one file registration.
+type RegisterFileOpts struct {
+	// RootCid is the UnixFS root of the encrypted file. Empty selects
+	// the inline tier (bytes in Enc.Inline, no S3, no sign).
+	RootCid string
+	// Size is the plaintext byte size.
+	Size int64
+	// NetworkSign optionally carries an existing durable receipt at
+	// create time (a BIND reusing already-durable content).
+	NetworkSign string
+	// Enc is the member-only plaintext this call seals.
+	Enc payloads.EncPayload
+}
+
+// payloadsDeriveOpts is the one true derivation of a payloads object —
+// every caller must agree on every field (Unencrypted included) or the
+// derived ids diverge. ownerDerived selects the shape by the owner's
+// class:
+//
+//   - signed owner  → ParentId=ownerId, seed=WellKnownDeriveSeed: the
+//     payloads object is the owner's child, cascade-deleted with it;
+//   - derived owner → ParentId="", seed=DerivedOwnerSeed(ownerId): a
+//     derived object cannot be a parent (objecttree.ErrDerivedParent),
+//     so the payloads object is unparented, with the ownerId folded into
+//     the seed for per-owner uniqueness.
+//
+// The ParentId and seed edits are COUPLED — the derived branch must clear
+// ParentId AND fold ownerId into the seed together, or every derived
+// owner would collide on one id. Signed-owner ids are byte-for-byte the
+// same as before this branch existed (nothing to migrate).
+func payloadsDeriveOpts(ownerId string, ownerDerived bool) spaceobjects.DeriveOpts {
+	opts := spaceobjects.DeriveOpts{
+		ChangeType:    payloads.ChangeType,
+		ChangePayload: []byte(payloads.WellKnownDeriveSeed),
+		ParentId:      ownerId,
+		Unencrypted:   true,
+	}
+	if ownerDerived {
+		opts.ChangePayload = []byte(payloads.DerivedOwnerSeed(ownerId))
+		opts.ParentId = ""
+	}
+	return opts
+}
+
+// ObjectId resolves the deterministic payloads-object id for an owner
+// without creating anything.
+//
+// The id depends on the owner's CLASS (signed → parented shape, derived
+// → unparented; see payloadsDeriveOpts), so it is resolvable only when
+// something local discloses that class:
+//
+//   - the owner's head entry — full tree, selective-sync stub, or a
+//     deleted owner (the entry survives deletion) — carries IsDerived;
+//   - failing that, an existing payloads tree self-identifies its shape:
+//     either shape can land before its owner (any-sync stores a child in
+//     any arrival order), so both candidate ids are probed.
+//
+// When neither is present the class is genuinely unknowable locally — a
+// signed owner that hasn't synced and a derived owner with no payloads
+// tree look identical — and ObjectId returns payloads.ErrOwnerUnknown
+// rather than guessing an id that would flip once the owner arrives.
+// Callers retry after sync delivers the owner (or its payloads tree).
+//
+// The WRITE path (RegisterFiles) resolves the class the same way and
+// refuses with the same sentinel; it never guesses a shape to create.
+func (p *PayloadsAPI) ObjectId(ctx context.Context, ownerId string) (string, error) {
+	if ownerId == "" {
+		return "", errors.New("payloads: ownerId required")
+	}
+	ownerDerived, present, err := p.s.store.TreeIsDerived(ctx, ownerId)
+	if err != nil {
+		return "", err
+	}
+	if present {
+		return p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId, ownerDerived))
+	}
+	if id, _, e, err := p.existingShape(ctx, ownerId); err != nil || e.Present {
+		return id, err
+	}
+	return "", fmt.Errorf("payloads: owner %s: %w", ownerId, payloads.ErrOwnerUnknown)
+}
+
+// RegisterFile is the single-file convenience over RegisterFiles.
+func (p *PayloadsAPI) RegisterFile(ctx context.Context, ownerId string, opts RegisterFileOpts) (fileId, payloadsObjId string, err error) {
+	fileIds, payloadsObjId, err := p.RegisterFiles(ctx, ownerId, []RegisterFileOpts{opts})
+	if err != nil {
+		return "", "", err
+	}
+	return fileIds[0], payloadsObjId, nil
+}
+
+// RegisterFiles seals each file's Enc under the current space key and
+// writes all rows into the owner's payloads object as ONE change (one
+// DAG entry, one sync hop — bulk flows like a pasted doc with hundreds
+// of images register in minimum hops), lazily deriving the object on
+// first use. Returns the fileIds in input order (derived from the
+// creating change: seed, seed:1, …) and the payloads objectId. A
+// failure before the row write is a *payloads.NotWrittenError.
+func (p *PayloadsAPI) RegisterFiles(ctx context.Context, ownerId string, files []RegisterFileOpts) (fileIds []string, payloadsObjId string, err error) {
+	obj, records, err := p.prepareRows(ctx, ownerId, files)
+	if err != nil {
+		return nil, "", &payloads.NotWrittenError{Err: err}
+	}
+	res, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     payloads.Dataset,
+		DataVersion: payloads.HandlerVersion,
+		Records:     records,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	if len(res.RecordIds) != len(files) {
+		return nil, "", fmt.Errorf("payloads: write produced %d record ids for %d files", len(res.RecordIds), len(files))
+	}
+	return res.RecordIds, obj.Id(), nil
+}
+
+// prepareRows validates and seals the rows and derives the owner's
+// payloads object: everything RegisterFiles does before the write.
+func (p *PayloadsAPI) prepareRows(ctx context.Context, ownerId string, files []RegisterFileOpts) (*object.Object, []crdt.RecordChange, error) {
+	if ownerId == "" {
+		return nil, nil, errors.New("payloads: ownerId required")
+	}
+	if len(files) == 0 {
+		return nil, nil, errors.New("payloads: no files")
+	}
+	for i, opts := range files {
+		if opts.Size < 0 {
+			return nil, nil, fmt.Errorf("payloads: file %d: negative size", i)
+		}
+		// Inline XOR — enforced here because only the pre-seal caller
+		// can see the plaintext: inline bytes ⇔ no rootCid, exact
+		// size, under the cutoff, never signed; a rootCid row carries
+		// no inline bytes.
+		if opts.RootCid == "" {
+			if int64(len(opts.Enc.Inline)) != opts.Size {
+				return nil, nil, fmt.Errorf("payloads: file %d: inline row size %d != len(inline) %d", i, opts.Size, len(opts.Enc.Inline))
+			}
+			if opts.Size >= payloads.InlineMaxSize {
+				return nil, nil, fmt.Errorf("payloads: file %d: inline row must be < %d bytes, got %d (upload it and register with a rootCid)", i, payloads.InlineMaxSize, opts.Size)
+			}
+			if opts.NetworkSign != "" {
+				return nil, nil, fmt.Errorf("payloads: file %d: inline rows are never signed", i)
+			}
+		} else if len(opts.Enc.Inline) > 0 {
+			return nil, nil, fmt.Errorf("payloads: file %d: a rootCid row must not carry inline bytes", i)
+		}
+	}
+
+	kid, key, err := p.keys.CurrentKey(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Resolve the owner's class so the payloads object is derived with
+	// the right shape (a derived owner can't be a parent). With the
+	// owner absent, a payloads tree already here names the shape (see
+	// ObjectId); with neither, guessing "signed" would mint a tree the
+	// owner's true class never resolves to.
+	owner, err := p.s.store.TreeEntry(ctx, ownerId)
+	if err != nil {
+		return nil, nil, err
+	}
+	// The owner may have been deleted while the caller spooled the
+	// upload. A derived owner's payloads object is unparented, so no
+	// derive gate would refuse it.
+	if owner.Deleted {
+		return nil, nil, fmt.Errorf("payloads: owner %s: %w", ownerId, space.ErrObjectDeleted)
+	}
+	ownerDerived, present := owner.Derived, owner.Present
+	if !present {
+		var shape spaceobjects.TreeEntry
+		_, ownerDerived, shape, err = p.existingShape(ctx, ownerId)
+		if err != nil {
+			return nil, nil, err
+		}
+		if shape.Deleted {
+			return nil, nil, fmt.Errorf("payloads: owner %s: %w", ownerId, space.ErrObjectDeleted)
+		}
+		present = shape.Present
+	}
+	if !present {
+		return nil, nil, fmt.Errorf("payloads: owner %s: %w", ownerId, payloads.ErrOwnerUnknown)
+	}
+	// Lazy ensure: Derive is idempotent (deterministic id, per-id
+	// load lock), so first-use creation and reuse are the same call.
+	deriveOpts := payloadsDeriveOpts(ownerId, ownerDerived)
+	obj, err := p.s.store.Derive(ctx, deriveOpts)
+	if err != nil {
+		// The owner's deletion can mark its payloads child before the
+		// owner itself; the gate then refuses the child as not found.
+		if id, idErr := p.s.store.DeriveId(ctx, deriveOpts); idErr == nil {
+			if child, eErr := p.s.store.TreeEntry(ctx, id); eErr == nil && child.Deleted {
+				return nil, nil, fmt.Errorf("payloads: owner %s: %w", ownerId, space.ErrObjectDeleted)
+			}
+		}
+		return nil, nil, fmt.Errorf("payloads: derive payloads object: %w", err)
+	}
+
+	arena := &anyenc.Arena{}
+	records := make([]crdt.RecordChange, 0, len(files))
+	for _, opts := range files {
+		ct, sealErr := payloads.SealEnc(key, opts.Enc)
+		if sealErr != nil {
+			return nil, nil, sealErr
+		}
+		row := arena.NewObject()
+		if opts.RootCid != "" {
+			row.Set(payloads.FieldRootCid, arena.NewString(opts.RootCid))
+		}
+		row.Set(payloads.FieldSize, arena.NewNumberFloat64(float64(opts.Size)))
+		row.Set(payloads.FieldObjectId, arena.NewString(ownerId))
+		if opts.NetworkSign != "" {
+			row.Set(payloads.FieldNetworkSign, arena.NewString(opts.NetworkSign))
+		}
+		enc := arena.NewObject()
+		enc.Set(payloads.EncKeyId, arena.NewString(kid))
+		enc.Set(payloads.EncKeyCiphertext, arena.NewBinary(ct))
+		row.Set(payloads.FieldEnc, enc)
+		// Empty id: the fileId derives from the creating changeId —
+		// deterministic, content-addressed, never reused.
+		records = append(records, crdt.RecordChange{
+			Upsert: true,
+			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: row}},
+		})
+	}
+	return obj, records, nil
+}
+
+// SetNetworkSign is the single-file convenience over SetNetworkSigns.
+func (p *PayloadsAPI) SetNetworkSign(ctx context.Context, ownerId, fileId, networkSign string) error {
+	return p.SetNetworkSigns(ctx, ownerId, map[string]string{fileId: networkSign})
+}
+
+// SetNetworkSigns records the node's durable receipts on existing rows
+// as ONE change (fileId → networkSign) — the sign phase of a bulk
+// upload lands in one hop. The payloads object must already exist; a
+// sign for a file that was never registered is a caller bug.
+func (p *PayloadsAPI) SetNetworkSigns(ctx context.Context, ownerId string, signs map[string]string) error {
+	if len(signs) == 0 {
+		return errors.New("payloads: no signs")
+	}
+	for fileId, sign := range signs {
+		if fileId == "" || sign == "" {
+			return errors.New("payloads: fileId and networkSign required")
+		}
+	}
+	obj, ok, err := p.existingObject(ctx, ownerId)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("payloads: owner %s has no payloads object", ownerId)
+	}
+	arena := &anyenc.Arena{}
+	records := make([]crdt.RecordChange, 0, len(signs))
+	for fileId, sign := range signs {
+		records = append(records, crdt.RecordChange{
+			Id: fileId,
+			Ops: []crdt.Op{{
+				Type:    crdt.OpSet,
+				Path:    []string{payloads.FieldNetworkSign},
+				Payload: arena.NewString(sign),
+			}},
+		})
+	}
+	_, err = obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     payloads.Dataset,
+		DataVersion: payloads.HandlerVersion,
+		Records:     records,
+	})
+	return err
+}
+
+// DeleteRows removes rows from the owner's payloads object as ONE
+// change (the delete write shape — payloads.Handler tombstones each
+// record; the deletion syncs like any other change). The rows must
+// exist as far as the caller knows — a delete of an already-deleted
+// row is absorbed by the CRDT, not an error here.
+func (p *PayloadsAPI) DeleteRows(ctx context.Context, ownerId string, fileIds []string) error {
+	if len(fileIds) == 0 {
+		return errors.New("payloads: no fileIds")
+	}
+	obj, ok, err := p.existingObject(ctx, ownerId)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("payloads: owner %s has no payloads object", ownerId)
+	}
+	records := make([]crdt.RecordChange, 0, len(fileIds))
+	for _, fileId := range fileIds {
+		if fileId == "" {
+			return errors.New("payloads: fileId required")
+		}
+		records = append(records, crdt.RecordChange{
+			Id:  fileId,
+			Ops: []crdt.Op{{Type: crdt.OpDelete}},
+		})
+	}
+	_, err = obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     payloads.Dataset,
+		DataVersion: payloads.HandlerVersion,
+		Records:     records,
+	})
+	return err
+}
+
+// GetRow returns one typed row, unsealed when the caller holds the
+// space key (Sealed stays true otherwise). space.ErrNotFound when the
+// owner is deleted or has no live payloads object, no such row, or a
+// tombstoned row.
+func (p *PayloadsAPI) GetRow(ctx context.Context, ownerId, fileId string) (payloads.Row, error) {
+	gone, err := p.ownerDeleted(ctx, ownerId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if gone {
+		return payloads.Row{}, space.ErrNotFound
+	}
+	objId, ok, err := p.existingObjectId(ctx, ownerId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if !ok {
+		return payloads.Row{}, space.ErrNotFound
+	}
+	return p.getRowIn(ctx, objId, fileId)
+}
+
+// getRowIn reads one row directly from a live payloads object (already
+// resolved — the bare-fileId lookup path scans objects without knowing
+// the owner). space.ErrNotFound for a missing or tombstoned row.
+func (p *PayloadsAPI) getRowIn(ctx context.Context, payloadsObjId, fileId string) (payloads.Row, error) {
+	coll, _, err := resolveCollection(ctx, p.s.store, payloadsObjId, payloads.Dataset)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if coll == nil {
+		return payloads.Row{}, space.ErrNotFound
+	}
+	doc, err := coll.FindId(ctx, fileId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return payloads.Row{}, space.ErrNotFound
+		}
+		return payloads.Row{}, err
+	}
+	v := doc.Value()
+	if v.Get(crdt.DeletedAtField) != nil {
+		return payloads.Row{}, space.ErrNotFound
+	}
+	return p.rowFromValue(ctx, v)
+}
+
+// fileIndexKey is the local-only fileId → payloads-object mapping in
+// the files-store KV (the network keeps no such index; locally every row
+// is seen). Written on Attach, backfilled on scan hits, removed with the
+// file, its payloads object, its owner and its space.
+func fileIndexKey(spaceId, fileId string) string {
+	return filestore.FileIndexKey(spaceId, fileId)
+}
+
+// IndexedPayloadsObject reads the file index entry of fileId: the
+// payloads object it points at, and whether there is one. Test seam
+// for the entry's lifecycle; reads resolve through FindRow.
+func (p *PayloadsAPI) IndexedPayloadsObject(ctx context.Context, fileId string) (string, bool, error) {
+	kv := p.s.parent.filesStore()
+	if kv == nil {
+		return "", false, nil
+	}
+	return kv.GetKV(ctx, fileIndexKey(p.s.id, fileId))
+}
+
+// FindRow resolves a bare fileId to its row: the local index first
+// (one KV read + one row read), falling back to a scan of the space's
+// payloads objects for rows that arrived via sync, and backfilling the
+// index on the hit. space.ErrNotFound for a row whose owner or payloads
+// object is deleted. An index entry lives as long as its row: it goes
+// when the payloads object is purged (a hit on its deleted tree drops
+// it, the purge clears the rest) or the row is gone, and stays for a
+// deleted owner's row still held by a live payloads object (a derived
+// owner's outlives it), so that file resolves in one lookup, not a
+// scan, and the entry goes with the row when it is retired.
+func (p *PayloadsAPI) FindRow(ctx context.Context, fileId string) (payloads.Row, error) {
+	row, err := p.findRow(ctx, fileId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	gone, err := p.ownerDeleted(ctx, row.ObjectId)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if gone {
+		return payloads.Row{}, space.ErrNotFound
+	}
+	return row, nil
+}
+
+// findRow is FindRow without the owner gate: the row whatever its
+// owner's state, for the upload dedup lookup that reuses a deleted
+// owner's receipt (payloadsRegistrar.FindRow).
+
+func (p *PayloadsAPI) findRow(ctx context.Context, fileId string) (payloads.Row, error) {
+	if fileId == "" {
+		return payloads.Row{}, errors.New("payloads: fileId required")
+	}
+	kv := p.s.parent.filesStore()
+	if kv != nil {
+		if objId, ok, err := kv.GetKV(ctx, fileIndexKey(p.s.id, fileId)); err == nil && ok {
+			// A fileId lives in one payloads object, and deletion is
+			// final: the entry has no further use, and the scan is
+			// skipped.
+			e, err := p.s.store.TreeEntry(ctx, objId)
+			if err != nil {
+				return payloads.Row{}, err
+			}
+			if e.Deleted {
+				_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
+				return payloads.Row{}, space.ErrNotFound
+			}
+			row, err := p.getRowIn(ctx, objId, fileId)
+			if err == nil {
+				return row, nil
+			}
+			if !errors.Is(err, space.ErrNotFound) {
+				return payloads.Row{}, err
+			}
+			// Stale index entry (row moved/deleted — a remote delete
+			// never cleans this KV): drop it and fall through to the
+			// scan, which re-backfills on a hit.
+			_ = kv.DeleteKV(ctx, fileIndexKey(p.s.id, fileId))
+		}
+	}
+	objIds, err := p.s.store.TreeIdsByChangeType(ctx, payloads.ChangeType)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	for _, objId := range objIds {
+		row, err := p.getRowIn(ctx, objId, fileId)
+		if err == nil {
+			if kv != nil {
+				_ = kv.SetKV(ctx, fileIndexKey(p.s.id, fileId), objId)
+			}
+			return row, nil
+		}
+		if !errors.Is(err, space.ErrNotFound) {
+			return payloads.Row{}, err
+		}
+	}
+	return payloads.Row{}, space.ErrNotFound
+}
+
+// ListRows returns every live row of the owner's payloads object,
+// unsealed when possible. Empty (nil) when the owner is deleted or the
+// object doesn't exist or is deleted.
+func (p *PayloadsAPI) ListRows(ctx context.Context, ownerId string) ([]payloads.Row, error) {
+	gone, err := p.ownerDeleted(ctx, ownerId)
+	if err != nil || gone {
+		return nil, err
+	}
+	objId, ok, err := p.existingObjectId(ctx, ownerId)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, nil
+	}
+	return p.readRowsIn(ctx, objId, nil)
+}
+
+// listRowsIn reads every live row of one payloads object by its id
+// (the flat-listing path walks objects without knowing their owners),
+// skipping rows whose owner is deleted.
+func (p *PayloadsAPI) listRowsIn(ctx context.Context, payloadsObjId string) ([]payloads.Row, error) {
+	return p.readRowsIn(ctx, payloadsObjId, &deletedOwners{store: p.s.store})
+}
+
+// readRowsIn reads one payloads object's live rows; a non-nil owners
+// drops rows whose owner is deleted.
+func (p *PayloadsAPI) readRowsIn(ctx context.Context, payloadsObjId string, owners *deletedOwners) ([]payloads.Row, error) {
+	vals, err := newQuery(p.s.store, payloadsObjId, payloads.Dataset).All(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]payloads.Row, 0, len(vals))
+	for _, v := range vals {
+		row, err := payloads.RowFromValue(v)
+		if err != nil {
+			return nil, err
+		}
+		if owners != nil {
+			gone, err := owners.deleted(ctx, row.ObjectId)
+			if err != nil {
+				return nil, err
+			}
+			if gone {
+				continue
+			}
+		}
+		if err := row.Unseal(ctx, p.keys); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// rowFromValue decodes and best-effort-unseals one row. An ErrNoKey
+// unseal keeps the row sealed (the keyless-reader view); a corrupt
+// blob propagates.
+func (p *PayloadsAPI) rowFromValue(ctx context.Context, v *anyenc.Value) (payloads.Row, error) {
+	row, err := payloads.RowFromValue(v)
+	if err != nil {
+		return payloads.Row{}, err
+	}
+	if err := row.Unseal(ctx, p.keys); err != nil {
+		return payloads.Row{}, err
+	}
+	return row, nil
+}
+
+// ownerDeleted reports whether a file owner is deleted here. Its files
+// are gone with it: a signed owner's payloads object is cascade-deleted,
+// while a derived owner's is unparented and outlives it, so reads check
+// the owner.
+func (p *PayloadsAPI) ownerDeleted(ctx context.Context, ownerId string) (bool, error) {
+	if ownerId == "" {
+		return false, nil
+	}
+	return p.s.store.TreeDeleted(ctx, ownerId)
+}
+
+// deletedOwners memoizes owner deletion over one listing.
+type deletedOwners struct {
+	store *spaceobjects.Store
+	seen  map[string]bool
+}
+
+func (d *deletedOwners) deleted(ctx context.Context, ownerId string) (bool, error) {
+	if gone, ok := d.seen[ownerId]; ok || ownerId == "" {
+		return gone, nil
+	}
+	gone, err := d.store.TreeDeleted(ctx, ownerId)
+	if err != nil {
+		return false, err
+	}
+	if d.seen == nil {
+		d.seen = map[string]bool{}
+	}
+	d.seen[ownerId] = gone
+	return gone, nil
+}
+
+// existingObjectId resolves the owner's payloads object id and whether its
+// tree exists locally — read paths never create it. The owner is never
+// consulted: both shapes have deterministic ids, so two existence probes
+// decide. At most one shape can exist for an owner (RegisterFiles derives
+// with the owner's true, immutable class); the signed/parented shape is
+// probed first as the common case. Either shape can be present without
+// its owner (any-sync stores a child in any arrival order), so a peer
+// holding the payloads tree but not yet the owner still finds its rows.
+// An owner with no payloads tree of either shape — no files yet, class
+// irrelevant — reads as no-rows, and so does a deleted payloads tree.
+func (p *PayloadsAPI) existingObjectId(ctx context.Context, ownerId string) (string, bool, error) {
+	id, _, e, err := p.existingShape(ctx, ownerId)
+	return id, e.Present && !e.Deleted, err
+}
+
+// existingShape finds the owner's payloads tree of either shape: its
+// id, the owner class its shape discloses (unparented → derived owner)
+// and its head entry, deleted or not. A zero entry when neither shape
+// is here.
+func (p *PayloadsAPI) existingShape(ctx context.Context, ownerId string) (objId string, ownerDerived bool, e spaceobjects.TreeEntry, err error) {
+	if ownerId == "" {
+		return "", false, spaceobjects.TreeEntry{}, errors.New("payloads: ownerId required")
+	}
+	for _, ownerDerived := range []bool{false, true} {
+		objId, err := p.s.store.DeriveId(ctx, payloadsDeriveOpts(ownerId, ownerDerived))
+		if err != nil {
+			return "", false, spaceobjects.TreeEntry{}, err
+		}
+		e, err := p.s.store.TreeEntry(ctx, objId)
+		if err != nil {
+			return "", false, spaceobjects.TreeEntry{}, err
+		}
+		if e.Present {
+			return objId, ownerDerived, e, nil
+		}
+	}
+	return "", false, spaceobjects.TreeEntry{}, nil
+}
+
+// existingObject loads the owner's payloads object if its tree exists
+// locally; (nil, false, nil) when it doesn't.
+func (p *PayloadsAPI) existingObject(ctx context.Context, ownerId string) (*object.Object, bool, error) {
+	objId, ok, err := p.existingObjectId(ctx, ownerId)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	obj, err := p.s.store.Get(ctx, objId)
+	if err != nil {
+		return nil, false, err
+	}
+	return obj, true, nil
+}
+
+// aclKeyProvider is the ACL-backed payloads.KeyProvider: kid = the
+// ACL key-record id of the read key, key = the payloads enc key
+// derived from it (cached per kid — derivation is deterministic).
+// Returns payloads.ErrNoKey when the local identity has no read
+// access (the keyless-reader view), so typed reads degrade to
+// cleartext-only rows instead of failing.
+type aclKeyProvider struct {
+	s *spaceImpl
+
+	mu    sync.Mutex
+	cache map[string]crypto.SymKey
+}
+
+func (p *aclKeyProvider) CurrentKey(ctx context.Context) (string, crypto.SymKey, error) {
+	acl, err := p.aclList(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	acl.RLock()
+	state := acl.AclState()
+	kid := state.CurrentReadKeyId()
+	readKey, err := state.CurrentReadKey()
+	acl.RUnlock()
+	if err != nil || readKey == nil {
+		return "", nil, payloads.ErrNoKey
+	}
+	key, err := p.derived(kid, readKey)
+	if err != nil {
+		return "", nil, err
+	}
+	return kid, key, nil
+}
+
+func (p *aclKeyProvider) KeyById(ctx context.Context, kid string) (crypto.SymKey, error) {
+	p.mu.Lock()
+	if key, ok := p.cache[kid]; ok {
+		p.mu.Unlock()
+		return key, nil
+	}
+	p.mu.Unlock()
+	acl, err := p.aclList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	acl.RLock()
+	keys, ok := acl.AclState().Keys()[kid]
+	acl.RUnlock()
+	if !ok || keys.ReadKey == nil {
+		return nil, payloads.ErrNoKey
+	}
+	return p.derived(kid, keys.ReadKey)
+}
+
+func (p *aclKeyProvider) aclList(ctx context.Context) (list.AclList, error) {
+	handle, err := p.s.app.GetSpace(ctx, p.s.id)
+	if err != nil {
+		return nil, fmt.Errorf("payloads: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return nil, payloads.ErrNoKey
+	}
+	return acl, nil
+}
+
+func (p *aclKeyProvider) derived(kid string, readKey crypto.SymKey) (crypto.SymKey, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if key, ok := p.cache[kid]; ok {
+		return key, nil
+	}
+	key, err := payloads.DeriveEncKey(readKey)
+	if err != nil {
+		return nil, err
+	}
+	if p.cache == nil {
+		p.cache = make(map[string]crypto.SymKey)
+	}
+	p.cache[kid] = key
+	return key, nil
+}

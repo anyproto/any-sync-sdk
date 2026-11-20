@@ -7,11 +7,12 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -19,10 +20,12 @@ import (
 
 // queryImpl implements space.Query backed by an any-store collection.
 //
-// Tombstones are filtered with an AND-of(<caller-filter>, _deletedAt
-// missing) so callers writing free-form filters never see deleted
-// rows by accident. Variants/meta projection is a no-op in MVP — the
-// raw record comes back as-is.
+// Every terminal reads AND-of(<caller-filter>, _deletedAt missing), so
+// callers writing free-form filters never see deleted rows by accident
+// and a limit/offset window is cut over live rows; only the find path
+// asked for tombstones (ProjectionOpts.IncludeDeleted) drops the
+// clause. Variants/meta projection is a no-op in MVP — the raw record
+// comes back as-is.
 //
 // The chained setters mutate the underlying receiver and return it;
 // the public contract is immutable-looking, but a concrete *queryImpl
@@ -32,6 +35,14 @@ type queryImpl struct {
 	store    *spaceobjects.Store
 	objectId string
 	dataset  string
+	// allObjects reads a shared dataset across every object that holds
+	// it (Space.QueryDataset); objectId is unused.
+	allObjects bool
+	// rows bounds a per-object read to the object's key range. Set when
+	// the collection is resolved, from the controller that supplies it:
+	// the catalog may no longer call the dataset shared while a resident
+	// controller still reads the per-space collection.
+	rows query.Filter
 
 	// filter / sort hold the parsed query.Filter / query.Sort. Parse
 	// errors are stashed in parseErr and surfaced on the first
@@ -49,6 +60,187 @@ func newQuery(store *spaceobjects.Store, objectId, dataset string) *queryImpl {
 	return &queryImpl{store: store, objectId: objectId, dataset: dataset}
 }
 
+// scoped is the filter a read runs: the caller's, narrowed to the
+// object's rows when the collection holds every object's (q.rows).
+func (q *queryImpl) scoped() query.Filter {
+	return scopedFilter(q.rows, q.filter)
+}
+
+// scopedFilter is filter narrowed to rows; either may be nil.
+func scopedFilter(rows, filter query.Filter) query.Filter {
+	switch {
+	case rows == nil:
+		return filter
+	case filter == nil:
+		return rows
+	}
+	return query.And{rows, filter}
+}
+
+// objectRows narrows a collection to one object's rows: the owner's
+// range of a keyed dataset, the object's own row of a shared dataset,
+// nothing for a collection of the object's own.
+func objectRows(ctrl *crdt.Controller, objectId, dataset string) query.Filter {
+	switch {
+	case ctrl.IsKeyed(dataset):
+		return crdt.KeyedRows(objectId)
+	case ctrl.IsShared(dataset):
+		return rowIs(objectId)
+	}
+	return nil
+}
+
+// rowIs matches the row stored under id.
+func rowIs(id string) query.Filter {
+	return query.Key{Path: []string{crdt.IdField}, Filter: query.NewComp(query.CompOpEq, id)}
+}
+
+// refillTarget is what one refill reads: the collection, the window's
+// filter, the filter of every row stored in the window's scope (for a
+// lookup by id), and final, false for a row whose object is rebuilding.
+type refillTarget struct {
+	coll   anystore.Collection
+	filter query.Filter
+	stored query.Filter
+	final  func(id string) bool
+}
+
+// refillSource resolves a refill's target from the apply's Event.Source.
+type refillSource func(source any) (refillTarget, error)
+
+// errRefillRebuilding defers a refill or lookup of rows an object is
+// rebuilding.
+var errRefillRebuilding = fmt.Errorf("%w: the object is rebuilding its rows", subscribe.ErrRefillDeferred)
+
+// sharedSource reads the shared collection; a lookup of a rebuilding
+// object's row is deferred.
+func sharedSource(store *spaceobjects.Store, coll anystore.Collection, filter query.Filter) refillSource {
+	return func(any) (refillTarget, error) {
+		return refillTarget{
+			coll:   coll,
+			filter: filter,
+			stored: tombstoneSkip,
+			final:  func(id string) bool { return !store.Rebuilding(id) },
+		}, nil
+	}
+}
+
+// objectSource reads a per-object window through the object the apply
+// ran on (source) or the loaded instance, without loading, waiting or
+// keeping either. No instance, or one without the dataset: the refill
+// fails. A rebuilding object: the refill is deferred.
+func objectSource(ctx context.Context, store *spaceobjects.Store, objectId, dataset string, filter query.Filter) refillSource {
+	return func(source any) (refillTarget, error) {
+		if store.Rebuilding(objectId) {
+			return refillTarget{}, errRefillRebuilding
+		}
+		obj, _ := source.(*object.Object)
+		if obj == nil || obj.Controller() == nil || obj.Controller().ObjectId() != objectId {
+			obj = store.PeekLoaded(objectId)
+		}
+		if obj == nil {
+			return refillTarget{}, errRefillNoObject
+		}
+		ctrl := obj.Controller()
+		if !ctrl.HasDataset(dataset) {
+			return refillTarget{}, errRefillNoObject
+		}
+		coll, err := ctrl.PeekCollection(ctx, dataset)
+		if err != nil {
+			return refillTarget{}, err
+		}
+		rows := objectRows(ctrl, objectId, dataset)
+		return refillTarget{
+			coll:   coll,
+			filter: withoutTombstones(scopedFilter(rows, filter)),
+			stored: withoutTombstones(rows),
+		}, nil
+	}
+}
+
+// newRefill returns a window's refill: one read transaction per call
+// over the body captured here.
+func newRefill(ctx context.Context, source refillSource, sort query.Sort, limit, offset uint) subscribe.RefillFn {
+	return func(src any) (subscribe.RefillRead, error) {
+		t, err := source(src)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		if t.coll == nil {
+			// Nothing materialised: no rows, and no held row is stored.
+			return subscribe.RefillRead{
+				Rows:   func(func(id string, doc *anyenc.Value)) error { return nil },
+				Lookup: func(string) (*anyenc.Value, error) { return nil, nil },
+				Close:  func() {},
+			}, nil
+		}
+		tx, err := t.coll.ReadTx(ctx)
+		if err != nil {
+			return subscribe.RefillRead{}, err
+		}
+		return subscribe.RefillRead{
+			Rows: func(yield func(id string, doc *anyenc.Value)) error {
+				return readWindow(tx.Context(), t.coll, t.filter, sort, limit, offset, yield)
+			},
+			Lookup: func(id string) (*anyenc.Value, error) {
+				if t.final != nil && !t.final(id) {
+					return nil, errRefillRebuilding
+				}
+				return lookupStored(tx.Context(), t.coll, t.stored, id)
+			},
+			Close: func() { _ = tx.Commit() },
+		}, nil
+	}
+}
+
+// ObjectRefill is the refill of an unbounded, unfiltered subscription
+// to one object's dataset, for watchers that read engine events alone.
+func ObjectRefill(store *spaceobjects.Store, objectId, dataset string) subscribe.RefillFn {
+	ctx := context.Background()
+	return newRefill(ctx, objectSource(ctx, store, objectId, dataset, nil), nil, 0, 0)
+}
+
+// lookupStored reads one row by id: nil when absent or outside stored.
+func lookupStored(ctx context.Context, coll anystore.Collection, stored query.Filter, id string) (*anyenc.Value, error) {
+	it, err := coll.Find(query.And{rowIs(id), stored}).Limit(1).Iter(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	var v *anyenc.Value
+	if it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return nil, err
+		}
+		v = anyencx.Clone(doc.Value())
+	}
+	return v, it.Err()
+}
+
+// errRefillNoObject: no object instance to read the rows through.
+var errRefillNoObject = errors.New("query: refill: no loaded object to read through")
+
+// newDatasetQuery builds a queryImpl over the per-space collection of a
+// shared dataset — every object's records, no object named.
+func newDatasetQuery(store *spaceobjects.Store, dataset string) *queryImpl {
+	return &queryImpl{store: store, dataset: dataset, allObjects: true}
+}
+
+// resolveDatasetCollection resolves the per-space collection of a
+// shared dataset. No object is loaded: the read sees the space's
+// materialized state, as a QueryObjects read does.
+func resolveDatasetCollection(ctx context.Context, store *spaceobjects.Store, dataset string) (anystore.Collection, error) {
+	coll, ok, err := store.KeyedCollection(ctx, dataset)
+	if err != nil {
+		return nil, fmt.Errorf("query: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("query: %w: %q", space.ErrDatasetNotShared, dataset)
+	}
+	return coll, nil
+}
+
 // sharedObjectsDataset is the sentinel dataset name that makes the
 // query/aggregation builders resolve to the per-space `objects`
 // collection instead of a per-object dataset.
@@ -61,15 +253,15 @@ func newSharedQuery(store *spaceobjects.Store) *queryImpl {
 }
 
 // Filter parses the caller-supplied condition eagerly via
-// query.ParseCondition (which itself accepts an already-built
-// query.Filter, a JSON string, or a map literal). Multiple Filter
-// calls AND together. Parse errors are stashed and surfaced on the
-// first terminal call.
+// parseCondition (an already-built query.Filter, a JSON string, or a
+// map literal converted like a record value). Multiple Filter calls
+// AND together. Parse errors are stashed and surfaced on the first
+// terminal call.
 func (q *queryImpl) Filter(filter any) space.Query {
 	if q.parseErr != nil {
 		return q
 	}
-	parsed, err := query.ParseCondition(filter)
+	parsed, err := parseCondition(filter)
 	if err != nil {
 		q.parseErr = fmt.Errorf("query: filter: %w", err)
 		return q
@@ -119,9 +311,8 @@ func (q *queryImpl) Offset(n int) space.Query {
 
 // Projection records the requested options. Variant collapse and
 // meta-stripping are still no-ops (tracked tasks; every record returns
-// raw for those). IncludeDeleted is honored by the find path —
-// Iter / All / One gate the post-iteration tombstone skip on it, and
-// Count gates the pushed-down skip filter consistently.
+// raw for those). IncludeDeleted is honored by the find path: Iter /
+// All / One / Count run without the tombstone-skip clause.
 func (q *queryImpl) Projection(opts space.ProjectionOpts) space.Query {
 	q.opts = opts
 	return q
@@ -142,11 +333,7 @@ func (q *queryImpl) All(ctx context.Context) ([]*anyenc.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc))
 	}
 	return out, it.Err()
 }
@@ -170,19 +357,7 @@ func (q *queryImpl) One(ctx context.Context) (*anyenc.Value, error) {
 	if err != nil {
 		return nil, err
 	}
-	return cloneAnyenc(doc)
-}
-
-// cloneAnyenc copies a value off the iterator's reused buffer onto a
-// fresh parser arena via anyencutil.Value.FillCopy. Returns nil for
-// a nil input.
-func cloneAnyenc(v *anyenc.Value) (*anyenc.Value, error) {
-	if v == nil {
-		return nil, nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value, nil
+	return anyencx.Clone(doc), nil
 }
 
 // Snapshot returns a point-in-time view plus, when opts.IncludeTotal is
@@ -207,10 +382,7 @@ func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.
 		return &space.QueryResult{Initial: nil, Total: total}, nil
 	}
 
-	combined, err := combineWithTombstoneSkip(q.filter)
-	if err != nil {
-		return nil, err
-	}
+	combined := withoutTombstones(q.scoped())
 
 	tx, err := coll.ReadTx(ctx)
 	if err != nil {
@@ -226,7 +398,7 @@ func (q *queryImpl) Snapshot(ctx context.Context, opts space.QueryOpts) (*space.
 	total := -1
 	hasNext := false
 	if opts.IncludeTotal {
-		total, err = q.totalWithin(tx.Context(), coll, combined, len(initial))
+		total, err = q.totalWithin(tx.Context(), coll, combined, int(q.limit), len(initial))
 		if err != nil {
 			return nil, err
 		}
@@ -261,24 +433,21 @@ func (q *queryImpl) page(ctx context.Context, coll anystore.Collection, combined
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc.Value())
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc.Value()))
 	}
 	return out, it.Err()
 }
 
 // totalWithin returns the count of `combined` matches ignoring
-// limit/offset, reading within the supplied context. When the page
-// already reached the end of the result set the total is offset+pageLen
-// and no count query runs: that holds for an unbounded query (limit 0)
-// or a page shorter than the limit, with the pageLen>0 || offset==0
-// guard ruling out an offset past the end of the result set.
-func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, combined query.Filter, pageLen int) (int, error) {
-	if (q.limit == 0 || pageLen < int(q.limit)) && (pageLen > 0 || q.offset == 0) {
-		return int(q.offset) + pageLen, nil
+// limit/offset, reading within the supplied context. asked is the row
+// cap the page read used (0 for none) and got the rows it returned.
+// When the page already reached the end of the result set the total
+// is offset+got and no count query runs: that holds for an uncapped
+// read or one shorter than its cap, with the got>0 || offset==0 guard
+// ruling out an offset past the end of the result set.
+func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, combined query.Filter, asked, got int) (int, error) {
+	if (asked == 0 || got < asked) && (got > 0 || q.offset == 0) {
+		return int(q.offset) + got, nil
 	}
 	return coll.Find(combined).Count(ctx)
 }
@@ -286,10 +455,28 @@ func (q *queryImpl) totalWithin(ctx context.Context, coll anystore.Collection, c
 // Subscribe is the live-query terminal. Builds a windowed sub via the
 // per-space engine; the snapshot read runs under engine.mu so apply
 // events are fenced between the snapshot and the sub's registration.
+// The snapshot's read transaction outlives the fence: IncludeTotal
+// counts in it once the lock is released, so Total describes exactly
+// the rows the snapshot read while applies run on.
+//
+// The object is resolved BEFORE the engine lock. Store.Get can load
+// the object, and a load replays stored changes through Engine.OnApply,
+// which takes the same lock: a load started (or joined) from inside the
+// snapshot callback deadlocks the engine, and with it every apply in
+// the space. Under the fence only the collection lookup, the snapshot
+// read and the registration run — and the lookup peeks
+// (Controller.PeekCollection): the first open of a dataset collection
+// ensures its indexes in a write transaction, and that transaction
+// waiting on any-store's writer under the fence would stall every
+// apply in the space for as long as the writer is busy. The warm-up
+// before the lock takes the open outside the fence; the peek covers a
+// collection that appears in between.
 //
 // Initial in the returned QueryResult is the user-visible window
-// (limit rows excluding the sentinel; or all rows when limit == 0).
-// Subsequent live updates flow through QueryResult.Sub.
+// (limit rows excluding the sentinel; or all rows when limit == 0),
+// the caller's to drop once rendered: the subscription keeps no
+// reference to it. Subsequent live updates flow through
+// QueryResult.Sub.
 func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space.QueryResult, error) {
 	if q.parseErr != nil {
 		return nil, q.parseErr
@@ -300,162 +487,249 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 
 	// Resolve scope from the original builder shape.
 	var scope subscribe.Scope
-	if q.dataset == sharedObjectsDataset {
+	switch {
+	case q.dataset == sharedObjectsDataset:
 		scope = subscribe.Scope{Shared: true}
-	} else {
+	case q.allObjects:
+		scope = subscribe.Scope{AllObjects: true, Dataset: q.dataset}
+	default:
 		scope = subscribe.Scope{Shared: false, ObjectId: q.objectId, Dataset: q.dataset}
 	}
 
-	// Combine user filter with the tombstone-skip clause so the engine
-	// matches what the snapshot path returns (queryIterator.Next drops
-	// _deletedAt rows post-iteration; we push it into the filter for
-	// the live path).
-	combined, err := combineWithTombstoneSkip(q.filter)
-	if err != nil {
-		return nil, err
+	var (
+		sharedColl anystore.Collection
+		obj        *object.Object
+		err        error
+	)
+	if scope.Shared {
+		if sharedColl, err = q.store.SharedObjects(ctx); err != nil {
+			return nil, err
+		}
+	} else if scope.AllObjects {
+		if sharedColl, err = resolveDatasetCollection(ctx, q.store, q.dataset); err != nil {
+			return nil, err
+		}
+	} else {
+		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
+		// A missing object is an empty initial. The engine still
+		// registers the sub; if the object lands later, its events flow
+		// in — same as a not-yet-materialised dataset.
+		obj, err = q.store.Get(ctx, q.objectId)
+		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
+			return nil, fmt.Errorf("query: %w", err)
+		}
+		if obj != nil {
+			// Warm the controller's handle outside the fence: the first
+			// open of a dataset collection ensures its indexes in a
+			// write tx. Under the fence the lookup is then a map hit; a
+			// collection that appears in between is peeked without
+			// that write.
+			obj.Controller().Collection(ctx, q.dataset)
+			q.rows = objectRows(obj.Controller(), q.objectId, q.dataset)
+		}
+	}
+	// The tombstone-skip clause is part of the filter, so the engine's
+	// live-path evaluation rejects tombstoned post-states the same way
+	// the snapshot read does.
+	combined := withoutTombstones(q.scoped())
+	// collection resolves the dataset's collection from the already
+	// resident owner; nil means nothing materialised yet. peek selects
+	// Controller.PeekCollection for the read under engine.mu, where
+	// every apply in the space waits: a collection that appeared since
+	// the warm-up is opened without the write transaction that ensures
+	// its indexes. No object load and no DAG apply there either.
+	collection := func(ctx context.Context, peek bool) (anystore.Collection, error) {
+		if scope.Shared || scope.AllObjects {
+			return sharedColl, nil
+		}
+		if obj == nil {
+			return nil, nil
+		}
+		if peek {
+			return obj.Controller().PeekCollection(ctx, q.dataset)
+		}
+		return obj.Controller().Collection(ctx, q.dataset), nil
 	}
 
-	// Hold the snapshot rows for both the engine's initial population
-	// AND the user-visible Initial slice. Same iteration, two outputs.
-	var snapshotRows []*anyenc.Value
-	var snapshotIds []string
-	totalCount := -1
+	// One iteration feeds both the engine's initial population and the
+	// user-visible Initial slice. It runs in snapshotTx, a read
+	// transaction left open past the fence for the count.
+	var (
+		snapshotRows []*anyenc.Value
+		snapshotColl anystore.Collection
+		snapshotTx   anystore.ReadTx
+		yielded      int
+	)
+	defer func() {
+		if snapshotTx != nil {
+			_ = snapshotTx.Commit()
+		}
+	}()
 
+	// A refill is the snapshot's read again, in a read transaction of
+	// its own, with the builder's state as it is now: a call chained on
+	// later must not reach the live window.
+	refillCtx := context.WithoutCancel(ctx)
+	var source refillSource
+	if scope.Shared || scope.AllObjects {
+		source = sharedSource(q.store, sharedColl, combined)
+	} else {
+		source = objectSource(refillCtx, q.store, q.objectId, q.dataset, q.filter)
+	}
 	cfg := subscribe.SubConfig{
 		Scope:       scope,
 		Filter:      combined,
 		Sort:        q.sort,
 		Limit:       int(q.limit),
+		Offset:      int(q.offset),
 		MailboxCap:  opts.MailboxCapacity,
 		DriftBudget: opts.DriftBudgetPercent,
+		Refill:      newRefill(refillCtx, source, q.sort, q.limit, q.offset),
 	}
 
 	sub, err := q.store.SubEngine().Subscribe(cfg, func(yield func(id string, doc *anyenc.Value)) error {
-		coll, err := q.collection(ctx)
+		coll, err := collection(ctx, true)
 		if err != nil {
-			// Object doesn't exist yet — treat as empty initial. The
-			// engine still registers; if the object lands later, events
-			// flow into this sub. Mirrors how a not-yet-materialised
-			// dataset gets a nil collection and an empty snapshot.
-			if errors.Is(err, treestorage.ErrUnknownTreeId) {
-				return nil
-			}
 			return err
 		}
 		if coll == nil {
 			return nil // dataset has no materialised collection yet → empty
 		}
-		aq := coll.Find(combined)
-		if q.sort != nil {
-			aq = aq.Sort(q.sort)
-		}
-		// Snapshot pulls limit+1 to seed the sentinel; the user sees only the
-		// first `limit` rows in Initial.
-		if q.limit > 0 {
-			aq = aq.Limit(q.limit + 1)
-		}
-		if q.offset > 0 {
-			aq = aq.Offset(q.offset)
-		}
-		it, err := aq.Iter(ctx)
+		tx, err := coll.ReadTx(ctx)
 		if err != nil {
 			return err
 		}
-		defer it.Close()
-		for it.Next() {
-			doc, err := it.Doc()
-			if err != nil {
-				return err
+		snapshotColl, snapshotTx = coll, tx
+		return readWindow(tx.Context(), coll, combined, q.sort, q.limit, q.offset, func(id string, v *anyenc.Value) {
+			// Every row the read returned counts toward the cap,
+			// including one skipped below.
+			yielded++
+			// Initial's copy of the visible rows, cloned off the
+			// iterator's reused buffer. The sentinel is the engine's
+			// alone, and an unbounded sub keeps no copy of its own.
+			if id != "" && (q.limit == 0 || len(snapshotRows) < int(q.limit)) {
+				snapshotRows = append(snapshotRows, anyencx.Clone(v))
 			}
-			v := doc.Value()
-			if v == nil {
-				continue
-			}
-			id := string(v.GetStringBytes("id"))
-			if id == "" {
-				continue
-			}
-			// Capture for Initial — clone now so the slice survives past
-			// the iterator (which reuses its buffer).
-			cloned, cerr := cloneAnyenc(v)
-			if cerr != nil {
-				return cerr
-			}
-			snapshotRows = append(snapshotRows, cloned)
-			snapshotIds = append(snapshotIds, id)
 			yield(id, v)
-		}
-		return it.Err()
+		})
 	})
 	if err != nil {
 		return nil, err
 	}
 
+	totalCount := -1
+	var countErr error
 	if opts.IncludeTotal {
-		// Run a separate Count(filter) outside the snapshot fence (engine.mu
-		// already released). Slightly stale relative to events that fired
-		// after we released, but documented as snapshot-only semantics.
-		n, cerr := q.countWithFilter(ctx, combined)
-		if cerr != nil {
-			_ = sub.Close()
-			return nil, cerr
+		totalCount = 0
+		if snapshotTx != nil {
+			// Counted in the snapshot's read after the fence: the total
+			// describes exactly the rows the snapshot saw, and applies
+			// run on meanwhile. The snapshot asked for limit+1 rows.
+			asked := 0
+			if q.limit > 0 {
+				asked = int(q.limit) + 1
+			}
+			totalCount, countErr = q.totalWithin(snapshotTx.Context(), snapshotColl, combined, asked, yielded)
 		}
-		totalCount = n
 	}
-
-	// Initial = first limit rows (excluding the sentinel). When limit==0
-	// (unbounded), all rows are visible.
-	var initial []*anyenc.Value
-	if q.limit > 0 && len(snapshotRows) > int(q.limit) {
-		initial = snapshotRows[:q.limit]
-	} else {
-		initial = snapshotRows
+	if snapshotTx != nil {
+		// The count was the transaction's last use. It is released
+		// before anything below takes engine.mu: sub.Close with the
+		// reader slot still held would order slot → lock, the reverse
+		// of an apply's lock → slot in its post-value read.
+		_ = snapshotTx.Commit()
+		snapshotTx = nil
 	}
-	_ = snapshotIds // currently unused, but kept for symmetry / future debugging hooks
+	if !scope.Shared && !scope.AllObjects {
+		// The object was resolved before the registration; a purge in
+		// between closed the object's subscriptions before this one
+		// existed, so it would stay open for good. An id not yet local
+		// can be deleted before it lands the same way. One head-storage
+		// read, after the fence. A count that failed on the purged
+		// collection reports the deletion too.
+		deleted, derr := q.store.TreeDeleted(ctx, q.objectId)
+		if derr != nil {
+			_ = sub.Close()
+			return nil, derr
+		}
+		if deleted {
+			_ = sub.Close()
+			return nil, fmt.Errorf("query: %s: %w", q.objectId, space.ErrObjectNotFound)
+		}
+	}
+	if countErr != nil {
+		_ = sub.Close()
+		return nil, countErr
+	}
 
 	hasNext := false
 	if opts.IncludeTotal {
-		hasNext = int(q.offset)+len(initial) < totalCount
+		hasNext = int(q.offset)+len(snapshotRows) < totalCount
 	}
-	return &space.QueryResult{Initial: initial, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
+	return &space.QueryResult{Initial: snapshotRows, Total: totalCount, HasNext: hasNext, Sub: sub}, nil
 }
 
-// combineWithTombstoneSkip returns the user filter ANDed with a
-// `_deletedAt missing` clause. The engine's live-path filter eval
-// must reject tombstoned post-states the same way the snapshot-time
-// filter does — pushing the skip into the filter keeps the two paths
-// in lock-step.
-func combineWithTombstoneSkip(userFilter query.Filter) (query.Filter, error) {
-	skip, err := query.ParseCondition(map[string]any{
-		crdt.DeletedAtField: map[string]any{"$exists": false},
-	})
-	if err != nil {
-		return nil, fmt.Errorf("subscribe: build tombstone-skip filter: %w", err)
+// readWindow runs the window's read — limit+1 rows past the offset in
+// sort order, so the engine seeds a sentinel beyond the limit rows the
+// user sees — and hands every row it returns to row. The value is the
+// iterator's and lasts until the next row.
+func readWindow(ctx context.Context, coll anystore.Collection, filter query.Filter, sort query.Sort, limit, offset uint, row func(id string, v *anyenc.Value)) error {
+	aq := coll.Find(filter)
+	if sort != nil {
+		aq = aq.Sort(sort)
 	}
+	if limit > 0 {
+		aq = aq.Limit(limit + 1)
+	}
+	if offset > 0 {
+		aq = aq.Offset(offset)
+	}
+	it, err := aq.Iter(ctx)
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for it.Next() {
+		doc, err := it.Doc()
+		if err != nil {
+			return err
+		}
+		v := doc.Value()
+		var id string
+		if v != nil {
+			id = string(v.GetStringBytes("id"))
+		}
+		row(id, v)
+	}
+	return it.Err()
+}
+
+// tombstoneSkip matches live rows only: a tombstone keeps _deletedAt
+// and no user field. Pushed into every read's filter so the
+// limit/offset window, the count and the live-path evaluation see one
+// row set — a tombstone would otherwise sort first under a user-field
+// sort and take a slot of the window.
+var tombstoneSkip = query.Key{Path: []string{crdt.DeletedAtField}, Filter: query.Not{Filter: query.Exists{}}}
+
+// withoutTombstones returns userFilter ANDed with tombstoneSkip.
+func withoutTombstones(userFilter query.Filter) query.Filter {
 	if userFilter == nil {
-		return skip, nil
+		return tombstoneSkip
 	}
-	return query.And{userFilter, skip}, nil
+	return query.And{userFilter, tombstoneSkip}
 }
 
-// countWithFilter runs Count against the resolved collection using the
-// given parsed filter. Used by Snapshot/Subscribe to populate
-// QueryResult.Total when QueryOpts.IncludeTotal is set.
-func (q *queryImpl) countWithFilter(ctx context.Context, f query.Filter) (int, error) {
-	coll, err := q.collection(ctx)
-	if err != nil {
-		return 0, err
+// findFilter is the filter the find terminals (Iter / All / One /
+// Count) run: the scoped filter, tombstones excluded unless
+// ProjectionOpts.IncludeDeleted asks for them.
+func (q *queryImpl) findFilter() query.Filter {
+	if q.opts.IncludeDeleted {
+		return q.scoped()
 	}
-	if coll == nil {
-		return 0, nil
-	}
-	return coll.Find(f).Count(ctx)
+	return withoutTombstones(q.scoped())
 }
 
-// Count returns the match count. The find path gates tombstones on
-// ProjectionOpts.IncludeDeleted the same way Iter does: by default the
-// _deletedAt-missing clause is pushed into the filter so deleted rows
-// don't count; with IncludeDeleted set, tombstones are counted too.
+// Count returns the match count over the find filter.
 func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if q.parseErr != nil {
 		return 0, q.parseErr
@@ -467,14 +741,7 @@ func (q *queryImpl) Count(ctx context.Context) (int, error) {
 	if coll == nil {
 		return 0, nil
 	}
-	filter := q.filter
-	if !q.opts.IncludeDeleted {
-		filter, err = combineWithTombstoneSkip(filter)
-		if err != nil {
-			return 0, err
-		}
-	}
-	return coll.Find(filter).Count(ctx)
+	return coll.Find(q.findFilter()).Count(ctx)
 }
 
 // Iter opens a streaming iterator over the matching records.
@@ -494,7 +761,7 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &queryIterator{inner: asIter, includeDeleted: q.opts.IncludeDeleted}, nil
+	return &queryIterator{inner: asIter}, nil
 }
 
 // collection resolves the dataset's any-store collection. Returns
@@ -506,7 +773,15 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // accessor and isn't worth it — querying a typo dataset name already
 // silently returns empty in any-store too.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
-	return resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	if q.allObjects {
+		return resolveDatasetCollection(ctx, q.store, q.dataset)
+	}
+	coll, ctrl, err := resolveCollection(ctx, q.store, q.objectId, q.dataset)
+	q.rows = nil
+	if ctrl != nil {
+		q.rows = objectRows(ctrl, q.objectId, q.dataset)
+	}
+	return coll, err
 }
 
 // resolveCollection is the dataset → any-store collection lookup
@@ -514,15 +789,22 @@ func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error)
 // "<shared:objects>" selects the per-space objects collection;
 // anything else goes through the object's controller. See
 // queryImpl.collection for the (nil, nil) empty-dataset contract.
-func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (anystore.Collection, error) {
+func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId, dataset string) (coll anystore.Collection, ctrl *crdt.Controller, err error) {
 	if dataset == sharedObjectsDataset {
-		return store.SharedObjects(ctx)
+		coll, err = store.SharedObjects(ctx)
+		return coll, nil, err
 	}
+	// A resident controller built before a runtime dataset was defined
+	// doesn't know its collection; reload it so a just-defined dataset
+	// reads back real rows instead of silently empty results.
+	store.EnsureDatasetRegistered(ctx, objectId, dataset)
 	obj, err := store.Get(ctx, objectId)
 	if err != nil {
-		return nil, fmt.Errorf("query: %w", err)
+		return nil, nil, fmt.Errorf("query: %w", err)
 	}
-	return obj.Controller().Collection(ctx, dataset), nil
+	// The controller that supplies the collection says how the object's
+	// rows are scoped in it (objectRows).
+	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
 }
 
 // emptyIterator is the Iter() result when the dataset has no
@@ -535,21 +817,14 @@ func (emptyIterator) Doc() (*anyenc.Value, error) { return nil, nil }
 func (emptyIterator) Err() error                  { return nil }
 func (emptyIterator) Close() error                { return nil }
 
-// build folds the parsed filter / sort / limit / offset into an
-// any-store Query. Filter and Sort are already typed query.Filter /
-// query.Sort values (parsed by Filter() / Sort() at chain time);
-// any-store accepts both directly. Tombstones are filtered post-
-// iteration in queryIterator.Next.
+// build folds the find filter / sort / limit / offset into an
+// any-store Query. The tombstone skip is part of the filter, so the
+// limit/offset window is cut over live rows.
 func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 	if q.parseErr != nil {
 		return nil, q.parseErr
 	}
-	var out anystore.Query
-	if q.filter != nil {
-		out = coll.Find(q.filter)
-	} else {
-		out = coll.Find(nil)
-	}
+	out := coll.Find(q.findFilter())
 	if q.sort != nil {
 		out = out.Sort(q.sort)
 	}
@@ -562,53 +837,16 @@ func (q *queryImpl) build(coll anystore.Collection) (anystore.Query, error) {
 	return out, nil
 }
 
-// queryIterator adapts any-store's Iterator to space.Iterator. The
-// underlying any-store iter holds buffers we don't want exposed —
-// Doc() copies the value out via FastJson roundtrip-free path:
-// the value is already on the iterator's arena, valid until the
-// next Next() call. Caller-side races with Next() between Doc() and
-// use are the caller's problem (same contract as any-store).
+// queryIterator adapts any-store's Iterator to space.Iterator. Doc
+// returns the value on the iterator's arena, valid until the next Next
+// call; callers clone what they retain (All and One do).
 type queryIterator struct {
-	inner          anystore.Iterator
-	includeDeleted bool
-	cur            *anyenc.Value
-	lastErr        error
+	inner anystore.Iterator
 }
 
-// Next advances past tombstones automatically — checks each doc and
-// skips ones with `_deletedAt` set. Any-store iterators don't expose
-// peek, so we have to consume to filter; that's fine, the cost is
-// proportional to deleted-row density. When includeDeleted is set
-// (ProjectionOpts.IncludeDeleted) the skip is disabled and tombstone
-// rows surface to the caller — used by consumer-side indexers to stream
-// deletions.
-func (i *queryIterator) Next() bool {
-	if i.inner == nil {
-		return false
-	}
-	for i.inner.Next() {
-		doc, err := i.inner.Doc()
-		if err != nil {
-			i.lastErr = err
-			return true
-		}
-		v := doc.Value()
-		if !i.includeDeleted && v != nil && v.Get(crdt.DeletedAtField) != nil {
-			continue // tombstone
-		}
-		i.cur = v
-		return true
-	}
-	return false
-}
+func (i *queryIterator) Next() bool { return i.inner.Next() }
 
 func (i *queryIterator) Doc() (*anyenc.Value, error) {
-	if i.lastErr != nil {
-		return nil, i.lastErr
-	}
-	if i.cur != nil {
-		return i.cur, nil
-	}
 	doc, err := i.inner.Doc()
 	if err != nil {
 		return nil, err
@@ -616,19 +854,9 @@ func (i *queryIterator) Doc() (*anyenc.Value, error) {
 	return doc.Value(), nil
 }
 
-func (i *queryIterator) Err() error {
-	if i.inner == nil {
-		return nil
-	}
-	return i.inner.Err()
-}
+func (i *queryIterator) Err() error { return i.inner.Err() }
 
-func (i *queryIterator) Close() error {
-	if i.inner == nil {
-		return nil
-	}
-	return i.inner.Close()
-}
+func (i *queryIterator) Close() error { return i.inner.Close() }
 
 // Compile-time interface check.
 var _ space.Query = (*queryImpl)(nil)

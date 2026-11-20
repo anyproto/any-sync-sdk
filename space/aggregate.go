@@ -41,9 +41,10 @@ var (
 //
 // Tombstoned rows are always excluded (a `_deletedAt missing` $match
 // is prepended to the pipeline, so it stays in the pushdown prefix);
-// there is no IncludeDeleted escape hatch — incremental indexers keep
-// using Query with ProjectionOpts.IncludeDeleted. IndexHint is not
-// exposed either; both are additive later if needed.
+// there is no IncludeDeleted escape hatch. Deleted objects are purged
+// rather than tombstoned, so they never appear here regardless; observe
+// object deletions via QueryObjects().Subscribe (see ChangeIndexAPI).
+// IndexHint is not exposed either; both are additive later if needed.
 type Agg interface {
 	// GroupLimit overrides the maximum number of unique $group keys
 	// (any-store default 50 000; negative = unlimited).

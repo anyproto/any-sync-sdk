@@ -1,10 +1,21 @@
 package space
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrUnsupported is returned by every surface the tech-space handle
+// (Service.Get(techSpaceId)) does not offer: object and type
+// lifecycle, members and ACL, files, history, read state, pub/sub,
+// change feed, metadata, and generic writes to anything but a bundle
+// dataset. Classify with errors.Is. Subscribe-style methods whose
+// signature carries no error (Members / Files / ReadState / Changes)
+// are inert there: a no-op cancel, a callback that never fires.
+var ErrUnsupported = errors.New("space: unsupported on this space")
 
 // SetMetadataRequest is the input to Space.SetMetadata. Pointer
 // semantics: nil = leave-unchanged; non-nil empty string = set-empty.
-// Mirrors PropertyMetaUpdate's per-field patching shape.
 type SetMetadataRequest struct {
 	Name        *string
 	Description *string
@@ -35,8 +46,13 @@ type Space interface {
 	// Members returns the members-collection view.
 	Members() MembersAPI
 
-	// Types manages type objects and property definitions.
+	// Types manages type objects (and, through PropertyDefsAPI, the
+	// property definitions of types and collections alike).
 	Types() TypesAPI
+
+	// Collections manages collection objects — definitions with
+	// properties only, which objects are filed under.
+	Collections() CollectionsAPI
 
 	// Properties reads computed property values and performs
 	// base/account/device scope writes.
@@ -51,6 +67,32 @@ type Space interface {
 	// search). See ChangeIndexAPI.
 	Changes() ChangeIndexAPI
 
+	// History exposes version history: list an object's changes (who
+	// changed what, when), view objects/records at past versions, and
+	// diff versions. See HistoryAPI and
+	// docs/version-history-proposal.md.
+	History() HistoryAPI
+
+	// Payloads is the read-only view over the space's file payloads
+	// index — the cleartext row fields only, readable without any
+	// space key. See PayloadsView.
+	Payloads() PayloadsView
+
+	// Files is the file surface: attach content to objects, with the
+	// storage tiers (inline / content-addressed + node backup) hidden.
+	// See Files.
+	Files() Files
+
+	// PubSub is ephemeral space-scoped pub/sub — fire-and-forget,
+	// at-most-once messages between the space's online members, never
+	// persisted. See PubSubAPI.
+	PubSub() PubSubAPI
+
+	// ReadState tracks read/unread changes for datasets registered
+	// with handler.Dataset.ReadTracking. Methods return
+	// ErrReadTrackingDisabled when nothing in the space opted in.
+	ReadState() ReadStateAPI
+
 	// Debug returns the diagnostic surface for this space. See
 	// DebugAPI — not a stable interface, intended for tooling and
 	// inspection.
@@ -58,8 +100,19 @@ type Space interface {
 
 	// Query builds a read query against (objectId, dataset). Used for
 	// per-object datasets that exist on the object's own controller —
-	// e.g. a type object's `properties` (definitions) dataset.
+	// e.g. a type object's `properties` (definitions) dataset. On a
+	// shared dataset it reads that object's records, each with the id
+	// `<objectId>/<recordId>` and the object in `_objectId`.
 	Query(objectId, dataset string) Query
+
+	// QueryDataset builds a read query over a shared dataset
+	// (DatasetDraft.Shared) across every object that holds it: one
+	// collection per space, each record with the id
+	// `<objectId>/<recordId>` and its object in `_objectId`. Reads the
+	// space's materialized state without loading any object, like
+	// QueryObjects. A dataset that is not shared fails the terminal
+	// call with ErrDatasetNotShared.
+	QueryDataset(dataset string) Query
 
 	// QueryObjects builds a read query against the per-space `objects`
 	// collection — one row per regular object in the space, holding
@@ -71,9 +124,16 @@ type Space interface {
 	// (objectId, dataset) — the aggregation sibling of Query. The
 	// pipeline is accepted in the same forms Query.Filter takes a
 	// condition: a JSON string, *fastjson.Value, *anyenc.Value,
-	// marshaled-anyenc []byte, or any JSON-marshalable Go value.
-	// Snapshot-only. See Agg.
+	// marshaled-anyenc []byte, or a Go value converted like a record
+	// value (see Op.Value). A Go map has no key order, so a stage whose
+	// key order matters ($sort over several keys) is given as JSON
+	// text or *fastjson.Value. Snapshot-only. See Agg.
 	Aggregate(objectId, dataset string, pipeline any) Agg
+
+	// AggregateDataset builds an aggregation pipeline over a shared
+	// dataset across every object that holds it — the Aggregate of
+	// QueryDataset. See Agg.
+	AggregateDataset(dataset string, pipeline any) Agg
 
 	// AggregateObjects builds an aggregation pipeline against the
 	// per-space `objects` collection — the aggregation sibling of
@@ -115,8 +175,17 @@ type Space interface {
 	ModifyMany(ctx context.Context, batches []ModifyBatch) ([]ModifyResult, error)
 
 	// Delete produces sticky tombstones for the listed record ids.
-	// Returned RecordIds mirror the input order.
+	// Returned RecordIds mirror the input order. A dataset declared
+	// DeleteByNone refuses the call with ErrDatasetUndeletable before
+	// anything is written.
 	Delete(ctx context.Context, batch DeleteBatch) (ModifyResult, error)
+
+	// Upsert is the generic schema-driven batch ingest: upsert by
+	// record id, diff only declared-mutable fields against stored
+	// values, skip identical records, one change per page. Requires an
+	// id:user dataset (the caller id is the idempotency key). See
+	// UpsertBatch for per-record semantics.
+	Upsert(ctx context.Context, batch UpsertBatch) (UpsertResult, error)
 
 	// SetMetadata mutates this space's display metadata (name,
 	// description, icon) by writing to the per-space `spaceIndex`
@@ -136,12 +205,38 @@ type Space interface {
 	// downstream by the ACL at apply time on peers.
 	SetMetadata(ctx context.Context, req SetMetadataRequest) error
 
+	// SetP2PAdvertise switches per-space p2p advertising
+	// (SpaceInfo.P2PAdvertise). On republishes this device's global p2p
+	// record into the space right away; off stops the heartbeat — the
+	// account's other devices follow within a day, and rows already
+	// written age out on the other members' devices over 30 days. Synced
+	// account-wide; a read-only member can flip it, but readers never
+	// write rows, so for them it changes nothing.
+	SetP2PAdvertise(ctx context.Context, on bool) error
+
 	// SpaceIndexObjectId returns the deterministic id of the in-space
 	// `spaceIndex` derived object. Stable across peers and across
 	// SDK reboots — same id on every member's device. Useful for
 	// wrappers that want to attach a Query.Subscribe stream on the
 	// spaceIndex's `objects` dataset for live UI updates.
 	SpaceIndexObjectId() string
+
+	// Bundles is the typed surface over the per-space installed-bundles
+	// registry on the spaceIndex object. See BundlesAPI.
+	Bundles() BundlesAPI
+
+	// WaitIndexSynced blocks until the local view of the space's index
+	// is trustworthy — the gate the restore path takes before reading
+	// the bundles registry ("wait for the space index, then see what is
+	// set up"). Two exits: the seeded metadata row is already projected
+	// locally (immediate, no network — offline-first), or a clean
+	// head-sync round completes with the sync-status rollup at Synced,
+	// which also covers spaces that never seed metadata (1-1 / nameless
+	// derived spaces) — there an absent index after convergence is the
+	// valid answer "nothing set up yet", not a wait-forever. While
+	// waiting it forces head-sync rounds; bounded only by ctx (an
+	// offline device with no local index keeps waiting).
+	WaitIndexSynced(ctx context.Context) error
 
 	// SyncHeads forces an immediate head-sync (diff) round on this
 	// space against its responsible nodes, instead of waiting for the
@@ -150,4 +245,23 @@ type Space interface {
 	// operation does not need it — periodic and reactive sync keep the
 	// space up to date on their own.
 	SyncHeads(ctx context.Context) error
+
+	// TreeHeads returns the space's current sync frontier: the head
+	// change ids of every live (non-deleted) tree known locally — one
+	// entry per tree, materialized trees and heads-only stubs alike
+	// (under selective sync every tree head-syncs even when its
+	// content is not pulled), including system trees such as settings.
+	// A causal-attestation primitive for embedders: a peer holding
+	// every head of another peer's entry has seen at least that peer's
+	// change set for the tree. Used by the filenode-v2 broker's GC
+	// gate (CheckRefs).
+	TreeHeads(ctx context.Context) ([]TreeHeads, error)
+}
+
+// TreeHeads is one tree's current heads as reported by
+// Space.TreeHeads: the frontier element for that tree. Heads are
+// change ids.
+type TreeHeads struct {
+	TreeId string
+	Heads  []string
 }

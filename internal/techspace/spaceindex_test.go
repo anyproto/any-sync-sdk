@@ -12,6 +12,7 @@ import (
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
 )
 
 const (
@@ -109,7 +110,10 @@ func TestSpaceIndexHandler_LegacyCreateWithLocalStatusStillLands(t *testing.T) {
 	assert.Empty(t, rec.GetString(techspace.FieldLocalStatus), "the Local-class field never landed via the synced route")
 }
 
-func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
+// Type-less creates land: join/track register rows before the space's
+// header is readable, so `type` is unknown until the first load
+// backfills it.
+func TestSpaceIndexHandler_CreateWithoutTypeLands(t *testing.T) {
 	ctrl := newSpaceIndexController(t)
 	arena := &anyenc.Arena{}
 
@@ -119,8 +123,43 @@ func TestSpaceIndexHandler_CreateRejectedWithoutType(t *testing.T) {
 		setMulti(arena, map[string]string{techspace.FieldName: "no type"}),
 	)))
 
-	assert.Nil(t, ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId),
-		"create without type should be dropped")
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec, "create without type lands as an unknown-type row")
+	assert.Empty(t, rec.GetString(techspace.FieldType))
+	assert.Equal(t, "no type", rec.GetString(techspace.FieldName))
+}
+
+// `type` is set-once: an unknown-type row accepts exactly one fill (the
+// header backfill) and pins from then on.
+func TestSpaceIndexHandler_TypeSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-backfill"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldName: "joined"}),
+	)))
+	// Backfill fills the empty type.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldType}, Payload: arena.NewString("any.space")},
+	)))
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "any.space", rec.GetString(techspace.FieldType))
+
+	// A second write is an overwrite of a non-empty value — dropped.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldType}, Payload: arena.NewString("anytype.space")},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+	rec = ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, "any.space", rec.GetString(techspace.FieldType), "type pinned after the fill")
 }
 
 // ----------------------------------------------------------------------------
@@ -379,4 +418,324 @@ func TestSpaceIndexHandler_DeleteOpRejected(t *testing.T) {
 	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
 	require.NotNil(t, rec, "record must survive a rejected delete op")
 	assert.Equal(t, "Survivor", rec.GetString(techspace.FieldName))
+}
+
+// ----------------------------------------------------------------------------
+// Direct-add invite statuses (SYN-46) — non-terminal, decodable.
+// ----------------------------------------------------------------------------
+
+// The invitePending → active and inviteDeclined → active transitions must
+// pass the handler: only StatusDeleted is terminal, and Accept flips
+// either invite state back to active.
+func TestSpaceIndexHandler_InviteStatusesNonTerminal(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-invited"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{
+			techspace.FieldType:         "private",
+			techspace.FieldRemoteStatus: techspace.InvitePendingRemoteStatus,
+		}),
+	)))
+	// Decline...
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.InviteDeclinedRemoteStatus)},
+	)))
+	rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, techspace.InviteDeclinedRemoteStatus, rec.GetString(techspace.FieldRemoteStatus))
+
+	// ...then accept-from-declined (non-terminal) lands.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusActive)},
+	)))
+	rec = ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+	require.NotNil(t, rec)
+	assert.Equal(t, techspace.StatusActive, rec.GetString(techspace.FieldRemoteStatus))
+}
+
+// The synced join lifecycle is non-terminal in every direction the SDK
+// writes it — joining → joinEnded (decline / cancel) → joining (re-request)
+// → active (accepted and loaded) — and joinEnded → invitePending (a
+// direct add over an ended join). Only StatusDeleted is terminal, and it
+// stays so after joining. The handler deliberately adds no before-state
+// rules for these values: it sees the local pre-op state at arrival, so
+// an order-dependent rule would diverge across devices.
+func TestSpaceIndexHandler_JoinStatusesNonTerminal(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+	const spaceId = "space-joined"
+	status := func() string {
+		rec := ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId)
+		require.NotNil(t, rec)
+		return rec.GetString(techspace.FieldRemoteStatus)
+	}
+	set := func(ver crdt.VersionId, value string) {
+		require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+			ver, spaceId, false,
+			crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(value)},
+		)))
+	}
+
+	// Join registers the row joining (no type yet — the header is
+	// unreadable until the space loads).
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldRemoteStatus: techspace.JoiningRemoteStatus}),
+	)))
+	assert.Equal(t, techspace.JoiningRemoteStatus, status())
+
+	set("v2", techspace.JoinEndedRemoteStatus)
+	assert.Equal(t, techspace.JoinEndedRemoteStatus, status(), "decline / cancel lands")
+	set("v3", techspace.JoiningRemoteStatus)
+	assert.Equal(t, techspace.JoiningRemoteStatus, status(), "re-request revives")
+	set("v4", techspace.StatusActive)
+	assert.Equal(t, techspace.StatusActive, status(), "accepted and loaded")
+
+	// A second lifecycle ends in a direct add over the ended join.
+	set("v5", techspace.JoiningRemoteStatus)
+	set("v6", techspace.JoinEndedRemoteStatus)
+	set("v7", techspace.InvitePendingRemoteStatus)
+	assert.Equal(t, techspace.InvitePendingRemoteStatus, status(), "direct add registers over an ended join")
+
+	// Deleted stays terminal after a join.
+	set("v8", techspace.JoiningRemoteStatus)
+	set("v9", techspace.StatusDeleted)
+	set("v10", techspace.JoiningRemoteStatus)
+	assert.Equal(t, techspace.StatusDeleted, status(), "a re-request cannot revive a tombstone")
+}
+
+// DecodeSpaceIndexRecord reads the device-local direct-add notify outbox
+// (InviteNotifyPending array) off a stored value.
+func TestSpaceIndexRecord_DecodeInviteNotifyPending(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	pending := arena.NewArray()
+	pending.SetArrayItem(0, arena.NewString("bob"))
+	pending.SetArrayItem(1, arena.NewString("carol"))
+	v.Set(techspace.FieldInviteNotifyPending, pending)
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, "s1", rec.Id)
+	assert.ElementsMatch(t, []string{"bob", "carol"}, rec.InviteNotifyPending)
+}
+
+func TestSpaceIndexRecord_DecodeOwnRole(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	v.Set(techspace.FieldOwnRole, arena.NewString("owner"))
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, space.PermissionOwner, rec.OwnRole)
+
+	// Absent field — the never-mirrored row — decodes to None.
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Equal(t, space.PermissionNone, techspace.DecodeSpaceIndexRecord(bare).OwnRole)
+
+	// An unknown label (future vocabulary) degrades to None rather
+	// than failing the decode.
+	v.Set(techspace.FieldOwnRole, arena.NewString("superadmin"))
+	assert.Equal(t, space.PermissionNone, techspace.DecodeSpaceIndexRecord(v).OwnRole)
+}
+
+// DecodeSpaceIndexRecord reads the issued-key custody object into the
+// per-kind map; non-string subvalues are skipped, absence decodes nil.
+func TestSpaceIndexRecord_DecodeIssuedInviteKeys(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldType, arena.NewString("private"))
+	keys := arena.NewObject()
+	keys.Set(techspace.IssuedKeyMember, arena.NewString("enc-member"))
+	keys.Set(techspace.IssuedKeyGuest, arena.NewString("enc-guest"))
+	v.Set(techspace.FieldIssuedInviteKeys, keys)
+
+	rec := techspace.DecodeSpaceIndexRecord(v)
+	assert.Equal(t, "enc-member", rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+
+	// Absent field — nil map, lookups return "".
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Empty(t, techspace.DecodeSpaceIndexRecord(bare).IssuedInviteKey(techspace.IssuedKeyMember))
+}
+
+// Per-kind custody subkeys write and clear independently through the
+// controller: setting member never disturbs guest, unset removes just
+// its kind.
+func TestSpaceIndexHandler_IssuedInviteKeysPerKind(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-A"
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		setMulti(arena, map[string]string{techspace.FieldType: "private"}),
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyMember}, Payload: arena.NewString("enc-member")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyGuest}, Payload: arena.NewString("enc-guest")},
+	)))
+
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Equal(t, "enc-member", rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", spaceId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{techspace.FieldIssuedInviteKeys, techspace.IssuedKeyMember}},
+	)))
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Empty(t, rec.IssuedInviteKey(techspace.IssuedKeyMember))
+	assert.Equal(t, "enc-guest", rec.IssuedInviteKey(techspace.IssuedKeyGuest))
+}
+
+// ----------------------------------------------------------------------------
+// `derived` — stamped at create, pinned once true
+// ----------------------------------------------------------------------------
+
+func TestSpaceIndexHandler_DerivedSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	require.True(t, rec.Derived, "create must land the flag")
+
+	// Clearing the flag is dropped — pinned once true.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldDerived}, Payload: arena.NewFalse()},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived, "flag pinned after create")
+
+	// Unset is dropped too.
+	res, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpUnset, Path: []string{techspace.FieldDerived}},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived, "flag survives unset attempt")
+}
+
+func TestSpaceIndexRecord_DerivedEncodeDecode(t *testing.T) {
+	arena := &anyenc.Arena{}
+	// EncodeCreate includes the flag only when set.
+	withFlag := techspace.SpaceIndexRecord{Id: "s1", Type: "any.space", Derived: true}.EncodeCreate(arena)
+	assert.True(t, withFlag.GetBool(techspace.FieldDerived))
+	withoutFlag := techspace.SpaceIndexRecord{Id: "s2", Type: "any.space"}.EncodeCreate(arena)
+	assert.Nil(t, withoutFlag.Get(techspace.FieldDerived), "unset flag must be omitted, not false")
+
+	// A non-derived row decodes false.
+	ctrl := newSpaceIndexController(t)
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", "space-plain", true,
+		setMulti(arena, map[string]string{techspace.FieldType: "any.space"}),
+	)))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, "space-plain"))
+	assert.False(t, rec.Derived)
+}
+
+// A replayed derive-create bundle (concurrent Derive on two devices:
+// the second device's create replays as an upsert-modify) sheds only
+// the pinned `derived` key; siblings still apply.
+func TestSpaceIndexHandler_DerivedBundleSalvagesSiblings(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived-replay"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+
+	replay := arena.NewObject()
+	replay.Set(techspace.FieldDerived, arena.NewTrue())
+	replay.Set(techspace.FieldName, arena.NewString("from-peer"))
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: replay},
+	))
+	require.NoError(t, err)
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.True(t, rec.Derived)
+	assert.Equal(t, "from-peer", rec.Name, "siblings of the pinned key must survive: %v", res.Rejections)
+}
+
+// Derived rows refuse remoteStatus=deleted from any writer — the
+// apply-side gate the synced flag exists for. Single-path and
+// multi-field forms; non-derived rows keep the normal delete edit
+// (TestSpaceIndexHandler_StatusActiveToDeletedPasses).
+func TestSpaceIndexHandler_DerivedRefusesDeletedStatus(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+
+	const spaceId = "space-derived-tomb"
+	create := arena.NewObject()
+	create.Set(techspace.FieldType, arena.NewString("any.space"))
+	create.Set(techspace.FieldDerived, arena.NewTrue())
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v1", spaceId, true,
+		crdt.Op{Type: crdt.OpSet, Payload: create},
+	)))
+
+	// Single-path tombstone write dropped.
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v2", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusDeleted)},
+	))
+	require.NoError(t, err)
+	require.Len(t, res.Rejections, 1)
+	assert.ErrorIs(t, res.Rejections[0].Err, crdt.ErrValidation)
+
+	// Multi-field bundle: tombstone shed, sibling applies.
+	bundle := arena.NewObject()
+	bundle.Set(techspace.FieldRemoteStatus, arena.NewString(techspace.StatusDeleted))
+	bundle.Set(techspace.FieldName, arena.NewString("still-here"))
+	_, err = ctrl.ApplyChangeWithResult(context.Background(), makeChange(
+		"v3", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Payload: bundle},
+	))
+	require.NoError(t, err)
+
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.NotEqual(t, techspace.StatusDeleted, rec.RemoteStatus, "derived row must not be tombstoned")
+	assert.Equal(t, "still-here", rec.Name)
+
+	// Other status values still writable (e.g. archived).
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChange(
+		"v4", spaceId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldRemoteStatus}, Payload: arena.NewString(techspace.StatusArchived)},
+	)))
+	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
+	assert.Equal(t, techspace.StatusArchived, rec.RemoteStatus)
 }

@@ -25,6 +25,8 @@ func TestClassifyValidation_PerReason(t *testing.T) {
 		{properties.ReasonTypeUnknown, handler.ReasonTypeUnknown, handler.ErrValidationTypeUnknown},
 		{properties.ReasonUnknownProperty, handler.ReasonUnknownProperty, handler.ErrValidationUnknownProperty},
 		{properties.ReasonKindMismatch, handler.ReasonKindMismatch, handler.ErrValidationKindMismatch},
+		{properties.ReasonReservedCarrier, handler.ReasonReservedCarrier, handler.ErrValidationReservedCarrier},
+		{properties.ReasonMetaType, handler.ReasonMetaType, handler.ErrValidationMetaType},
 	}
 	for _, tc := range cases {
 		t.Run(string(tc.want), func(t *testing.T) {
@@ -43,6 +45,18 @@ func TestClassifyValidation_PerReason(t *testing.T) {
 			assert.True(t, ok2)
 			assert.Equal(t, tc.want, r2)
 		})
+	}
+}
+
+// A reason with no exported constant still classifies: the
+// discriminant passes through as its stable string.
+func TestClassifyValidation_UnexportedReasons(t *testing.T) {
+	for _, reason := range []string{properties.ReasonWrongSlot, properties.ReasonScopeMismatch} {
+		var err error = &properties.ValidationError{Reason: reason}
+		r, ok := handler.ClassifyValidation(err)
+		assert.True(t, ok, reason)
+		assert.Equal(t, handler.ValidationReason(reason), r)
+		assert.True(t, errors.Is(err, handler.ErrValidation), reason)
 	}
 }
 

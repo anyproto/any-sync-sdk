@@ -39,6 +39,7 @@ func TestTracker_HeadsChangeThenApply(t *testing.T) {
 	// Constant total = 1 so Synced math is well-defined when the
 	// tree converges.
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	tr := svc.For("space-1")
 
@@ -96,6 +97,7 @@ func TestSubscribeStatus_FanOut(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	var fired atomic.Int64
 	cancel := svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
@@ -129,6 +131,7 @@ func TestSubscribeStatus_Dedupe(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	var fired atomic.Int64
 	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
@@ -182,18 +185,23 @@ func TestTracker_NonResponsibleSenderIgnored(t *testing.T) {
 //
 //  1. Tree the tracker has a row for, currently Syncing → flips to
 //     Synced; pending heads dropped; subscribers fire.
-//  2. Tree the tracker has never seen (cold-restored, no hooks
+//  2. Stored tree the tracker has never seen (cold-restored, no hooks
 //     yet) → Object()/Detail() report Synced via lastAllSyncedAt.
+//     An id with no local tree stays Unknown.
 //  3. Non-responsible peer → no-op (state unchanged).
 func TestTracker_BulkSyncedFromPeer(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetNodeIdsFn(func(string) []string { return []string{"node-1"} })
 
-	tr := svc.For("space-1")
-
 	const trackedTree = "obj-tracked"
 	const unknownTree = "obj-untouched"
+	const absentId = "obj-not-stored"
+	svc.SetHasTreeFn(func(spaceId, treeId string) bool {
+		return spaceId == "space-1" && (treeId == trackedTree || treeId == unknownTree)
+	})
+
+	tr := svc.For("space-1")
 
 	var seen []space.ObjectSyncStatus
 	var mu sync.Mutex
@@ -235,6 +243,15 @@ func TestTracker_BulkSyncedFromPeer(t *testing.T) {
 	}
 	if got := tr.Object(unknownTree); got.State != space.SyncStateSynced {
 		t.Fatalf("unknown tree state = %v, want Synced (via lastAllSyncedAt)", got.State)
+	}
+	if st, _, at, known := tr.Detail(unknownTree); st != space.SyncStateSynced || at.IsZero() || known {
+		t.Fatalf("unknown tree Detail = %v, %v, known=%v; want Synced, anchored, known=false", st, at, known)
+	}
+	if got := tr.Object(absentId); got.State != space.SyncStateUnknown || !got.LastSyncAt.IsZero() {
+		t.Fatalf("absent id = %+v, want Unknown", got)
+	}
+	if st, _, at, known := tr.Detail(absentId); st != space.SyncStateUnknown || !at.IsZero() || known {
+		t.Fatalf("absent id Detail = %v, %v, known=%v; want Unknown, zero, known=false", st, at, known)
 	}
 
 	// Subscriber fires only on flips: setup (Syncing) + sweep (Synced).
@@ -312,6 +329,7 @@ func TestService_RunStartsTicker(t *testing.T) {
 	svc := NewService()
 	defer svc.Close()
 	svc.SetTotalFn(func(string) int { return 1 })
+	svc.SetPeerCountsFn(connectedNode)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -319,6 +337,9 @@ func TestService_RunStartsTicker(t *testing.T) {
 
 	done := make(chan struct{}, 1)
 	svc.SubscribeStatus(func(ev space.SpaceSyncStatus) {
+		if ev.State != space.SyncStateSyncing {
+			return
+		}
 		select {
 		case done <- struct{}{}:
 		default:
@@ -334,3 +355,7 @@ func TestService_RunStartsTicker(t *testing.T) {
 		t.Fatalf("ticker did not dispatch within 3s")
 	}
 }
+
+// connectedNode is the presence of a space with one responsible node
+// connected and no direct peer.
+func connectedNode(string) (networkPeers, localPeers, globalPeers int) { return 1, 0, 0 }

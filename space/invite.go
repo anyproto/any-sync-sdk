@@ -25,12 +25,32 @@ import (
 type Invite struct {
 	SpaceId   string
 	InviteKey crypto.PrivKey
+	// Kind distinguishes a member invite (RequestToJoin proof key) from
+	// a guest invite (the shared read-only guest identity itself). Zero
+	// value is member — pre-Kind invites decode as members.
+	Kind InviteKind
 }
 
-// inviteFormatVersion is the magic byte stamped at the start of every
-// encoded invite. Bump if the encoding ever changes; DecodeInvite
-// rejects unknown versions outright.
-const inviteFormatVersion byte = 1
+// InviteKind is the invite flavor carried by an encoded invite token.
+type InviteKind byte
+
+const (
+	// InviteKindMember is a RequestToJoin invite: InviteKey proves the
+	// holder may request to join; membership lands via owner approval.
+	InviteKindMember InviteKind = iota
+	// InviteKindGuest is a public-access invite: InviteKey IS the
+	// shared guest identity's private key. Holders open the space
+	// read-only via Service.JoinGuest — no ACL write, no approval.
+	InviteKindGuest
+)
+
+// Format version bytes stamped at the start of every encoded invite.
+// The version doubles as the kind marker: 1 = member, 2 = guest.
+// DecodeInvite rejects unknown versions outright.
+const (
+	inviteFormatVersion      byte = 1
+	guestInviteFormatVersion byte = 2
+)
 
 var (
 	// ErrInvalidInvite is returned by DecodeInvite when the input is
@@ -60,8 +80,16 @@ func EncodeInvite(i Invite) (string, error) {
 	}
 	spaceId := []byte(i.SpaceId)
 
+	version := inviteFormatVersion
+	switch i.Kind {
+	case InviteKindMember:
+	case InviteKindGuest:
+		version = guestInviteFormatVersion
+	default:
+		return "", fmt.Errorf("anysyncsdk: EncodeInvite: unknown kind %d", i.Kind)
+	}
 	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(spaceId)+len(keyBytes))
-	buf = append(buf, inviteFormatVersion)
+	buf = append(buf, version)
 	buf = binary.AppendUvarint(buf, uint64(len(spaceId)))
 	buf = append(buf, spaceId...)
 	buf = append(buf, keyBytes...)
@@ -82,7 +110,13 @@ func DecodeInvite(s string) (Invite, error) {
 	if len(raw) < 1 {
 		return Invite{}, fmt.Errorf("%w: too short", ErrInvalidInvite)
 	}
-	if raw[0] != inviteFormatVersion {
+	var kind InviteKind
+	switch raw[0] {
+	case inviteFormatVersion:
+		kind = InviteKindMember
+	case guestInviteFormatVersion:
+		kind = InviteKindGuest
+	default:
 		return Invite{}, fmt.Errorf("%w: unknown version %d", ErrInvalidInvite, raw[0])
 	}
 	rest := raw[1:]
@@ -100,5 +134,5 @@ func DecodeInvite(s string) (Invite, error) {
 	if err != nil {
 		return Invite{}, fmt.Errorf("%w: invite key: %w", ErrInvalidInvite, err)
 	}
-	return Invite{SpaceId: spaceId, InviteKey: priv}, nil
+	return Invite{SpaceId: spaceId, InviteKey: priv, Kind: kind}, nil
 }

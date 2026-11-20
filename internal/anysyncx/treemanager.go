@@ -3,11 +3,14 @@ package anysyncx
 import (
 	"context"
 	"errors"
+	"slices"
 
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/object/treemanager"
+	"github.com/anyproto/any-sync/net/peer"
 )
 
 // ErrSpaceRegistryUnset is returned when GetTree fires before the
@@ -25,6 +28,9 @@ type SpaceRegistry interface {
 	// from any-sync directly.
 	GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error)
 
+	// HasTree reports whether the tree already exists in local storage.
+	HasTree(ctx context.Context, spaceId, treeId string) (bool, error)
+
 	// PutTree stores a remote-built tree payload — used by sync when a
 	// node delivers a tree we don't have yet.
 	PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error
@@ -36,6 +42,37 @@ type SpaceRegistry interface {
 
 	// DeleteTree removes a tree's local state.
 	DeleteTree(ctx context.Context, spaceId, treeId string) error
+
+	// ShouldPullTree decides whether a locally-missing tree announced by
+	// a head update should be fetched (selective sync by tree type —
+	// SYN-18). root is the tree's raw root change carried by the update;
+	// heads are the sender's current heads. Implementations returning
+	// false are expected to record the heads so the sync diff converges
+	// without the tree's change bodies. Full-sync deployments always
+	// return true.
+	ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool
+
+	// PullFirst lists the trees of spaceId that a sync round handles
+	// before its other trees, when the round has them to fetch, sync
+	// or retry. nil when none. A round asks twice: what handling the
+	// first answer brought in can add to the second. Called from sync
+	// rounds, which can race a space's teardown: implementations read
+	// what is local and stay free of side effects — no store built, no
+	// tree fetched (ctx carries no peer).
+	PullFirst(ctx context.Context, spaceId string) []string
+
+	// PullFirstTypes lists the root changeTypes whose trees the space's
+	// sync job materializes ahead of the other trees it fetched: types
+	// and collections. nil = the space is synced one tree at a time,
+	// within the round that found the trees, in diff order (the tech
+	// space, selective sync).
+	PullFirstTypes(spaceId string) []string
+
+	// ReleaseTree closes the cached object of a tree the sync job
+	// fetched and materialized once it has gone a second unused,
+	// instead of at the cache's TTL: a backlog loads objects faster than
+	// the TTL evicts them. A later GetTree loads it again.
+	ReleaseTree(spaceId, treeId string)
 }
 
 // treeManagerAdapter implements treemanager.TreeManager by routing
@@ -43,13 +80,18 @@ type SpaceRegistry interface {
 // space-package implementation owns ocache wiring and lifecycle.
 type treeManagerAdapter struct {
 	registry SpaceRegistry
+	// onFetched reports a tree that did not exist locally and was built
+	// from the peer named by the request context: a head update for an
+	// unknown tree makes any-sync pull it whole from the sender through
+	// GetTree, and that pull is the tree's sync with the sender. nil-safe.
+	onFetched func(spaceId, peerId, treeId string, heads []string)
 }
 
 func newTreeManager() *treeManagerAdapter { return &treeManagerAdapter{} }
 
-func (t *treeManagerAdapter) Init(_ *app.App) error { return nil }
-func (t *treeManagerAdapter) Name() string          { return treemanager.CName }
-func (t *treeManagerAdapter) Run(_ context.Context) error  { return nil }
+func (t *treeManagerAdapter) Init(_ *app.App) error         { return nil }
+func (t *treeManagerAdapter) Name() string                  { return treemanager.CName }
+func (t *treeManagerAdapter) Run(_ context.Context) error   { return nil }
 func (t *treeManagerAdapter) Close(_ context.Context) error { return nil }
 
 // SetRegistry wires in the SpaceRegistry. Must be called once before
@@ -60,7 +102,21 @@ func (t *treeManagerAdapter) GetTree(ctx context.Context, spaceId, treeId string
 	if t.registry == nil {
 		return nil, ErrSpaceRegistryUnset
 	}
-	return t.registry.GetTree(ctx, spaceId, treeId)
+	peerId, _ := peer.CtxPeerId(ctx)
+	report := peerId != "" && t.onFetched != nil
+	if report {
+		existed, err := t.registry.HasTree(ctx, spaceId, treeId)
+		report = err == nil && !existed
+	}
+	tree, err := t.registry.GetTree(ctx, spaceId, treeId)
+	if err != nil || !report || tree == nil {
+		return tree, err
+	}
+	tree.Lock()
+	heads := slices.Clone(tree.Heads())
+	tree.Unlock()
+	t.onFetched(spaceId, peerId, treeId, heads)
+	return tree, nil
 }
 
 func (t *treeManagerAdapter) ValidateAndPutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {

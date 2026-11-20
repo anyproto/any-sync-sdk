@@ -62,7 +62,7 @@ type cacheObserver struct {
 // OnHashChange satisfies statestorage.Observer. Fires from inside
 // any-sync's SpaceStorage on a successful SetHash — same write tx
 // the head update committed under, so the cache moves in lockstep
-// with persistence. We ignore oldHash; only the V3 newHash matters.
-func (o *cacheObserver) OnHashChange(_, newHash string) {
+// with persistence.
+func (o *cacheObserver) OnHashChange(newHash string) {
 	o.cache.Set(o.spaceId, newHash)
 }

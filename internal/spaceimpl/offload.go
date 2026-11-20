@@ -7,8 +7,11 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/app/ocache"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 )
 
@@ -21,53 +24,166 @@ var offloadLog = logger.NewNamed("sdk.spaceoffload")
 // the durable delete tombstone the reconciler scans, and callers
 // (Delete / inbound detection) set its status before offloading.
 //
-// Idempotent and best-effort: each step tolerates already-gone state so
+// Idempotent and retryable: each step tolerates already-gone state so
 // a re-run after a crash mid-offload, or an offload of a space that was
-// never fully loaded, completes without error. Errors from individual
-// disk steps are logged, not propagated — a half-offloaded space is
-// reclaimed on the next attempt and never resurrected (the row stays
-// deleted).
+// never fully loaded, completes without error. Steps are best-effort
+// ONLY for the not-found/already-gone class: a failed collection sweep
+// (meta purge / drop / chunk commit / enumeration error) skips the
+// any-sync storage removal — with the file in place `SpaceExists` stays
+// true, so the deleted-row boot gate and the next Delete re-offload the
+// remainder (committed chunks are durable). The later per-space
+// cleanups (file store, file jobs, account values, identities) are
+// independent of the sweep and always run — notably the file-job
+// removal, since an orphaned job would retry against the deleted space
+// forever.
 func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
-	// 1. Stop this space's watchers (members poller, spaceIndex watcher,
-	// account mirror) so nothing writes to the store or carrier while we
-	// tear them down.
-	s.watchers.stopForSpace(spaceId)
+	// 0. Claim the any-sync store before the space closes: a load racing
+	// the teardown (inbound sync, a follower pass) would otherwise reopen
+	// it between the eviction and the removal. A failed claim means the
+	// store is already being deleted, or the SDK is closing.
+	claim, claimErr := s.app.ClaimSpaceStorage(ctx, spaceId)
+	if claimErr != nil {
+		offloadLog.Warn("claim storage", zap.String("spaceId", spaceId), zap.Error(claimErr))
+	}
 
-	// 2. Close + forget the per-space Store and its allocator/wiring.
-	s.mu.Lock()
-	store := s.stores[spaceId]
-	delete(s.stores, spaceId)
-	delete(s.allocs, spaceId)
-	delete(s.spaceIndexIds, spaceId)
-	delete(s.spaceIndexWatchers, spaceId)
-	delete(s.accountMirrors, spaceId)
-	delete(s.memberWatchers, spaceId)
-	s.mu.Unlock()
+	// 1–3. Stop watchers, close + forget the Store, evict the any-sync
+	// space — the shared close-without-delete teardown Evict also uses.
+	s.closeSpaceRuntime(ctx, spaceId)
+	s.dropGapSet(spaceId)
+	// The space's sync status stops being polled and emitted.
+	if ss := s.app.SyncStatus(); ss != nil {
+		ss.Forget(spaceId)
+	}
+
+	// 4. Drop every SDK CRDT collection for the space from the shared DB
+	// (meta watermarks purged first — see dropSpaceCollections).
+	sweepErr := s.dropSpaceCollections(ctx, spaceId)
+	if sweepErr != nil {
+		offloadLog.Warn("drop collections; storage kept for retry", zap.String("spaceId", spaceId), zap.Error(sweepErr))
+	}
+
+	// 5. Remove the any-sync per-space DB file (the bulk of the
+	// footprint) — only when the sweep fully committed: the file is the
+	// retry gate, and removing it over a partial sweep would leak the
+	// remaining collections permanently. Past this point there is no
+	// retry gate, and a write on a context that has ended writes
+	// nothing: the removal and the cleanups below run on a context the
+	// caller cannot end. With the file kept, the caller's context stays
+	// in force and the next boot redoes what it cuts short.
+	if claim != nil {
+		if sweepErr == nil {
+			ctx = context.WithoutCancel(ctx)
+			if err := claim.Delete(ctx); err != nil {
+				offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
+			}
+		} else {
+			claim.Release()
+		}
+	}
+
+	// 6. Drop the space's file CARs + metadata wholesale (the per-space
+	// store layout exists for exactly this one recursive remove), and
+	// its pending file jobs — an orphaned job would retry against the
+	// deleted space forever.
+	if s.fstore != nil {
+		if err := s.fstore.DeleteSpace(ctx, spaceId); err != nil {
+			offloadLog.Warn("delete file store", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+	if s.fqueue != nil {
+		if err := s.fqueue.RemoveSpace(ctx, spaceId); err != nil {
+			offloadLog.Warn("drop file jobs", zap.String("spaceId", spaceId), zap.Error(err))
+		}
+	}
+
+	// 7. Drop the account-values carrier tree in tech space.
+	if err := s.tsp.DropAccountValues(ctx, spaceId); err != nil {
+		offloadLog.Debug("drop account values", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+
+	// 8. Prune this space from the identities directory so spaceIds keeps
+	// reflecting live memberships.
+	if err := s.tsp.RemoveSpaceFromIdentities(ctx, spaceId); err != nil {
+		offloadLog.Debug("prune identities", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+}
+
+// Evict closes a space without deleting anything: watchers stop, the
+// Store and the any-sync commonspace handle are released. Disk state —
+// the any-sync per-space DB and every SDK CRDT collection — stays, so a
+// later Get reopens the space from local storage (and any-sync resumes
+// syncing it). Idempotent: evicting a space that isn't open is a no-op.
+//
+// The tech space is refused — it is the registry Get itself depends on.
+func (s *Service) Evict(ctx context.Context, spaceId string) error {
+	if spaceId == "" {
+		return errors.New("spaceimpl: Evict: spaceId required")
+	}
+	if spaceId == s.tsp.SpaceId() {
+		return errors.New("spaceimpl: Evict: cannot evict the tech space")
+	}
+	s.closeSpaceRuntime(ctx, spaceId)
+	return nil
+}
+
+// closeSpaceRuntime tears down the in-memory side of one space — the
+// shared steps of Evict (which stops here) and OffloadSpace (which goes
+// on to reclaim disk):
+//
+//  1. stop this space's watchers (members poller, spaceIndex watcher,
+//     account mirror) so nothing writes to the store while it closes;
+//  2. close + forget the per-space Store and its allocator/wiring;
+//  3. evict the any-sync commonspace handle (closes its storage too).
+//
+// Idempotent and best-effort: every step tolerates already-gone state,
+// so re-running on a closed (or never-opened) space is a no-op. Errors
+// are logged, not propagated.
+func (s *Service) closeSpaceRuntime(ctx context.Context, spaceId string) {
+	s.watchers.stopForSpace(spaceId)
+	// The sync job stops before the store it replays into closes.
+	s.app.CloseSyncJob(spaceId)
+
+	// Drop pubsub subscriptions + remote interest before the space
+	// evicts. Deliberately here — the deliberate teardown funnel — and
+	// not in the cache eviction path, so a background eviction can
+	// never kill live subscriptions.
+	s.app.PubSubCloseSpace(spaceId)
+
+	store := s.takeSpaceRuntime(spaceId)
 	if store != nil {
 		if err := store.Close(); err != nil {
 			offloadLog.Warn("close store", zap.String("spaceId", spaceId), zap.Error(err))
 		}
 	}
 
-	// 3. Evict the any-sync commonspace handle (closes its storage too).
-	if err := s.app.EvictSpace(ctx, spaceId); err != nil {
+	if err := s.app.EvictSpace(ctx, spaceId); err != nil && !errors.Is(err, ocache.ErrNotExists) {
 		offloadLog.Warn("evict space", zap.String("spaceId", spaceId), zap.Error(err))
 	}
+}
 
-	// 4. Drop every SDK CRDT collection for the space from the shared DB.
-	if err := s.dropSpaceCollections(ctx, spaceId); err != nil {
-		offloadLog.Warn("drop collections", zap.String("spaceId", spaceId), zap.Error(err))
-	}
-
-	// 5. Remove the any-sync per-space DB file (the bulk of the footprint).
-	if err := s.app.DeleteSpaceStorage(ctx, spaceId); err != nil {
-		offloadLog.Warn("delete storage", zap.String("spaceId", spaceId), zap.Error(err))
-	}
-
-	// 6. Drop the account-values carrier tree in tech space.
-	if err := s.tsp.DropAccountValues(ctx, spaceId); err != nil {
-		offloadLog.Debug("drop account values", zap.String("spaceId", spaceId), zap.Error(err))
-	}
+// takeSpaceRuntime forgets spaceId's Store and per-space wiring and
+// returns the store for the caller to close. One critical section, so
+// a concurrent load sees either everything or nothing. A store build
+// in flight is waited out first: it would publish after this section
+// otherwise, then start its workers on the collections the offload
+// drops.
+func (s *Service) takeSpaceRuntime(spaceId string) *spaceobjects.Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.awaitBuildLocked(spaceId)
+	store := s.stores[spaceId]
+	delete(s.stores, spaceId)
+	delete(s.allocs, spaceId)
+	delete(s.spaceIndexIds, spaceId)
+	delete(s.spaceIndexWatchers, spaceId)
+	delete(s.oneToOneKeyWatchers, spaceId)
+	delete(s.accountMirrors, spaceId)
+	delete(s.memberWatchers, spaceId)
+	delete(s.aclMirrorWatchers, spaceId)
+	// The mux only holds the stopped watchers above; drop it so a
+	// reload starts from an empty subscriber list (rewiring re-adds).
+	delete(s.aclMuxes, spaceId)
+	return store
 }
 
 // dropSpaceCollections deletes every any-store collection belonging to
@@ -78,12 +194,28 @@ func (s *Service) OffloadSpace(ctx context.Context, spaceId string) {
 //     it is dropped) — this also catches type-owned `<typeId>_shortIds`
 //     / `<typeId>_properties`, since types are objects in the space.
 //
-// The global `_meta` watermark collection is shared across spaces and
-// intentionally left alone; stale rows for offloaded objects are inert.
+// The shared `_meta` collection is purged per-row (PurgeSpaceMeta), not
+// dropped: it holds other spaces' rows too. Purging is required, not
+// hygiene — a space CAN re-materialize (guest rejoin), and a stale
+// MaxAddSeq watermark would make the rebuilt controllers skip the whole
+// cold-restore replay: synced trees, zero rows. Dropping the space's
+// `space:<id>` row also rotates the change-feed generation, so
+// consumers full-reindex instead of trusting a renumbered applySeq axis.
+// The shared read-state collections are purged per-row for the same
+// reason (readstate.PurgeSpace): a surviving row keeps its seeded flag
+// and frontier, so a re-materialized space would skip first-sight
+// seeding for every object that still has one.
+//
+// The sweep commits in CHUNKS of offloadDropChunk drops, each its own
+// WriteTx, in a fixed order: meta purge FIRST (own chunk), the
+// read-state purge (own chunks), then the per-object drops, then
+// `<spaceId>_objects` last. It returns the first chunk error (meta or
+// read-state purge, failed drop or commit, enumeration), leaving the
+// rest of the sweep for the next attempt.
 func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) error {
-	objectIds, err := s.spaceObjectIds(ctx, spaceId)
-	if err != nil {
-		offloadLog.Debug("enumerate space objects", zap.String("spaceId", spaceId), zap.Error(err))
+	objectIds, enumErr := s.spaceObjectIds(ctx, spaceId)
+	if enumErr != nil {
+		offloadLog.Warn("enumerate space objects", zap.String("spaceId", spaceId), zap.Error(enumErr))
 	}
 
 	names, err := s.db.GetCollectionNames(ctx)
@@ -91,11 +223,145 @@ func (s *Service) dropSpaceCollections(ctx context.Context, spaceId string) erro
 		return err
 	}
 
+	objectsColl := spaceId + "_" + spaceobjects.SpaceObjectsCollection
 	spacePrefix := spaceId + "_"
+	toDrop := make([]string, 0, len(names))
 	for _, name := range names {
-		if strings.HasPrefix(name, spacePrefix) || ownedByObject(name, objectIds) {
-			s.dropCollection(ctx, name)
+		if name == objectsColl {
+			continue
 		}
+		if strings.HasPrefix(name, spacePrefix) || ownedByObject(name, objectIds) {
+			toDrop = append(toDrop, name)
+		}
+	}
+
+	// Meta dies BEFORE collections, always — same invariant as the
+	// startup GC sweep (gc.go): a stale MaxAddSeq watermark outliving
+	// its dropped collections makes a re-materialized space skip the
+	// cold-restore replay — synced trees, zero rows — while the reverse
+	// leak (meta purged, collections still present, then failure)
+	// re-flags the owner on the next attempt and converges. Own chunk,
+	// so its progress persists independently of later failures.
+	if pErr := s.purgeMetaChunk(ctx, spaceId, objectIds); pErr != nil {
+		return pErr
+	}
+	if pErr := s.purgeReadStateChunk(ctx, spaceId); pErr != nil {
+		return pErr
+	}
+
+	// Chunked commits (see offloadDropChunk). On a ctx that already
+	// carries a caller tx, each chunk's WriteTx savepoint-joins it —
+	// chunking degrades to savepoints inside that tx and the caller
+	// keeps commit/rollback authority. A chunk failure returns
+	// immediately: prior chunks are durable, the remaining collections
+	// are left for the next attempt.
+	for start := 0; start < len(toDrop); start += offloadDropChunk {
+		if cErr := s.dropChunk(ctx, toDrop[start:min(start+offloadDropChunk, len(toDrop))]); cErr != nil {
+			return cErr
+		}
+	}
+
+	// `<spaceId>_objects` is the enumeration source for the per-object
+	// sweep, so it goes LAST — only when enumeration succeeded AND every
+	// prior chunk committed. A failure anywhere above (returned, so
+	// OffloadSpace keeps the retry gate armed) leaves the next attempt
+	// (re-offload or the startup orphan GC) able to re-enumerate instead
+	// of leaking the per-object collections permanently.
+	if enumErr != nil {
+		return enumErr
+	}
+	return s.dropChunk(ctx, []string{objectsColl})
+}
+
+// offloadDropChunk bounds how many collection drops share one WriteTx.
+// Trade-off: any-store has a single global writer, so one tx for the
+// whole sweep stalls every local write for the sweep's duration (worst
+// caller: the background deletion reconciler offloading a large
+// remote-deleted space), while per-drop commits make offload wall-clock
+// O(objects). Chunking keeps commits O(objects/N), bounds the
+// writer-lock stall to one chunk, persists progress incrementally (a
+// failed chunk leaves prior chunks committed for the retry), and caps
+// the life of any savepoint orphaned by a failed inner drop to its
+// chunk.
+const offloadDropChunk = 256
+
+// sweepChunkCommitted, when set, observes every committed sweep chunk
+// (n = ops in the chunk); the read-state purge reports once with its
+// row total. Test seam.
+var sweepChunkCommitted func(n int)
+
+// dropChunk drops one chunk of collections under a single WriteTx.
+// A not-found drop is ignored (already gone); any other drop error
+// aborts the chunk — the tx rolls back (killing any savepoint the
+// failed drop orphaned) and the error propagates, same as a commit
+// failure: none of the chunk's drops persisted, the retry redoes them.
+func (s *Service) dropChunk(ctx context.Context, names []string) error {
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	// No-op after Commit; on an error or panic mid-chunk it rolls the
+	// chunk back and releases the write lock.
+	defer func() { _ = tx.Rollback() }()
+	txCtx := tx.Context()
+	for _, name := range names {
+		if dErr := s.dropCollection(txCtx, name); dErr != nil {
+			return dErr
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if sweepChunkCommitted != nil {
+		sweepChunkCommitted(len(names))
+	}
+	return nil
+}
+
+// purgeMetaChunk runs PurgeSpaceMeta in its own chunk tx. A missing
+// _meta collection is the already-gone case (nothing ever watermarked);
+// any other error is returned — leaving a stale watermark behind is
+// exactly the state offload must not commit to.
+func (s *Service) purgeMetaChunk(ctx context.Context, spaceId string, objectIds map[string]struct{}) error {
+	metaColl, err := s.db.OpenCollection(ctx, crdt.MetaCollectionName)
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return nil
+		}
+		return err
+	}
+	tx, err := s.db.WriteTx(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	ids := make([]string, 0, len(objectIds))
+	for id := range objectIds {
+		ids = append(ids, id)
+	}
+	if pErr := crdt.PurgeSpaceMeta(tx.Context(), metaColl, spaceId, ids); pErr != nil {
+		return pErr
+	}
+	if cErr := tx.Commit(); cErr != nil {
+		return cErr
+	}
+	if sweepChunkCommitted != nil {
+		sweepChunkCommitted(len(ids) + 1)
+	}
+	return nil
+}
+
+// purgeReadStateChunk removes the space's read-state rows in their own
+// bounded transactions (see readstate.PurgeSpace). Any error is
+// returned: a stale frontier is state offload must not commit to.
+// Reported to the seam once, with the row total, when anything went.
+func (s *Service) purgeReadStateChunk(ctx context.Context, spaceId string) error {
+	n, err := readstate.PurgeSpace(ctx, s.db, spaceId)
+	if err != nil {
+		return err
+	}
+	if n > 0 && sweepChunkCommitted != nil {
+		sweepChunkCommitted(n)
 	}
 	return nil
 }
@@ -141,18 +407,23 @@ func ownedByObject(name string, objectIds map[string]struct{}) bool {
 	return ok
 }
 
-// dropCollection opens and drops one collection, ignoring a
-// not-found (already gone). Errors are logged, not returned — offload
-// is best-effort.
-func (s *Service) dropCollection(ctx context.Context, name string) {
+// dropCollection opens and drops one collection. A not-found is the
+// already-gone case: ignored, nil. Any other error is logged and
+// returned — best-effort stops at the not-found class; a real failed
+// drop swallowed here would leak the collection while the caller
+// reports success (see dropChunk / OffloadSpace).
+func (s *Service) dropCollection(ctx context.Context, name string) error {
 	coll, err := s.db.OpenCollection(ctx, name)
 	if err != nil {
-		if !errors.Is(err, anystore.ErrCollectionNotFound) {
-			offloadLog.Warn("open collection for drop", zap.String("coll", name), zap.Error(err))
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return nil
 		}
-		return
+		offloadLog.Warn("open collection for drop", zap.String("coll", name), zap.Error(err))
+		return err
 	}
 	if err := coll.Drop(ctx); err != nil {
 		offloadLog.Warn("drop collection", zap.String("coll", name), zap.Error(err))
+		return err
 	}
+	return nil
 }

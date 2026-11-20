@@ -15,6 +15,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 )
 
 const (
@@ -280,22 +281,31 @@ func TestSystemPropertiesHandler_NilRegistryPasses(t *testing.T) {
 const propUserT = "userT" // a non-universal user type for membership tests
 
 func preflightRegistry() *types.StubRegistry {
-	r := defaultRegistry()                    // any: p-name(string), p-rating(number), p-tags(array)
-	r.Set(typeAny, "types", schema.KindArray) // any.types is a real built-in prop
+	r := defaultRegistry() // any: p-name(string), p-rating(number), p-tags(array)
+	// The membership fields are real built-in props: one type in a
+	// scalar slot, many collections in an array.
+	r.Set(typeAny, anytype.FieldType, schema.KindString)
+	r.Set(typeAny, anytype.FieldCollections, schema.KindArray)
 	r.Set(propUserT, "p1", schema.KindString)
 	return r
 }
 
-// beforeWithTypes builds a record pre-state carrying any.types.
-func beforeWithTypes(arena *anyenc.Arena, typeIds ...string) *anyenc.Value {
+// beforeWithMembers builds a record pre-state carrying any.type (an
+// empty typeId leaves the slot unset) and any.collections.
+func beforeWithMembers(arena *anyenc.Arena, typeId string, collections ...string) *anyenc.Value {
 	rec := arena.NewObject()
 	anyNs := arena.NewObject()
-	arr := arena.NewArray()
-	for i, t := range typeIds {
-		arr.SetArrayItem(i, arena.NewString(t))
+	if typeId != "" {
+		anyNs.Set(anytype.FieldType, arena.NewString(typeId))
 	}
-	anyNs.Set("types", arr)
-	rec.Set("any", anyNs)
+	if len(collections) > 0 {
+		arr := arena.NewArray()
+		for i, c := range collections {
+			arr.SetArrayItem(i, arena.NewString(c))
+		}
+		anyNs.Set(anytype.FieldCollections, arr)
+	}
+	rec.Set(typeAny, anyNs)
 	return rec
 }
 
@@ -325,10 +335,15 @@ func TestPreValidate_GoodWrites(t *testing.T) {
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{typeAny, propName}, a.NewString("x")), nil))
 
-	// User type present in any.types, valid prop + kind.
+	// User type in the object's any.type slot, valid prop + kind.
 	require.NoError(t, h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")),
-		beforeWithTypes(a, propUserT)))
+		beforeWithMembers(a, propUserT)))
+
+	// Same namespace reached through any.collections instead.
+	require.NoError(t, h.PreValidate(
+		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")),
+		beforeWithMembers(a, "", propUserT)))
 }
 
 func TestPreValidate_UnknownProperty(t *testing.T) {
@@ -359,7 +374,8 @@ func TestPreValidate_KindMismatch(t *testing.T) {
 func TestPreValidate_TypeNotImplemented(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// userT is known to the registry but NOT in the object's any.types.
+	// userT is known to the registry but is neither the object's
+	// any.type nor one of its any.collections.
 	err := h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{propUserT, "p1"}, a.NewString("v")), nil)
 	require.ErrorIs(t, err, crdt.ErrValidation)
@@ -371,10 +387,10 @@ func TestPreValidate_TypeNotImplemented(t *testing.T) {
 func TestPreValidate_TypeUnknown(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// ghostT is in any.types (member) but not in the registry.
+	// ghostT is the object's type (a member) but not in the registry.
 	err := h.PreValidate(
 		singlePathChange(crdt.OpSet, []string{"ghostT", "x"}, a.NewString("v")),
-		beforeWithTypes(a, "ghostT"))
+		beforeWithMembers(a, "ghostT"))
 	require.ErrorIs(t, err, crdt.ErrValidation)
 	var ve *properties.ValidationError
 	require.True(t, errors.As(err, &ve))
@@ -384,13 +400,18 @@ func TestPreValidate_TypeUnknown(t *testing.T) {
 func TestPreValidate_AttachAndWriteInSameChange(t *testing.T) {
 	h := properties.New(preflightRegistry())
 	a := &anyenc.Arena{}
-	// Multi-field $set that both adds userT to any.types and writes its prop.
+	// Multi-field $set that both sets userT as any.type and writes its prop.
 	payload := a.NewObject()
-	arr := a.NewArray()
-	arr.SetArrayItem(0, a.NewString(propUserT))
-	payload.Set("any.types", arr)
+	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(propUserT))
 	payload.Set(propUserT+".p1", a.NewString("v"))
 	require.NoError(t, h.PreValidate(multiFieldChange(payload), nil))
+
+	// Same, with userT arriving as a collection via $addToSet.
+	attach := singlePathChange(crdt.OpAddToSet,
+		[]string{typeAny, anytype.FieldCollections}, a.NewString(propUserT))
+	attach.Records[0].Ops = append(attach.Records[0].Ops,
+		crdt.Op{Type: crdt.OpSet, Path: []string{propUserT, "p1"}, Payload: a.NewString("v")})
+	require.NoError(t, h.PreValidate(attach, nil))
 }
 
 func TestPreValidate_InvalidPath(t *testing.T) {
@@ -433,4 +454,359 @@ func TestPreValidate_ScopeMismatch(t *testing.T) {
 	assert.Equal(t, properties.ReasonScopeMismatch, ve.Reason)
 	assert.Equal(t, schema.ScopeAccount, ve.DeclaredScope)
 	assert.Equal(t, schema.ScopeSynced, ve.WriteRoute)
+}
+
+// ----------------------------------------------------------------------------
+// modifiedAt / modifiedBy — derived per-change stamps (create seeds
+// them, modify bumps them, always from the same change)
+// ----------------------------------------------------------------------------
+
+const (
+	creatorAlice = "acct-alice"
+	creatorBob   = "acct-bob"
+	creatorCarol = "acct-carol"
+)
+
+// makeChangeAt is makeChange plus the per-change envelope Timestamp the
+// modifiedAt stamp derives from.
+func makeChangeAt(versionId crdt.VersionId, ts int64, recId string, upsert bool, ops ...crdt.Op) crdt.Change {
+	ch := makeChange(versionId, recId, upsert, ops...)
+	ch.Timestamp = ts
+	return ch
+}
+
+// makeChangeBy is makeChangeAt plus the per-change signer the
+// modifiedBy stamp derives from.
+func makeChangeBy(versionId crdt.VersionId, ts int64, creator, recId string, upsert bool, ops ...crdt.Op) crdt.Change {
+	ch := makeChangeAt(versionId, ts, recId, upsert, ops...)
+	ch.Creator = creator
+	return ch
+}
+
+func TestSystemPropertiesHandler_ModifiedAtSeededOnCreate(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "create seeds modifiedAt from the change Timestamp")
+	assert.Equal(t, creatorAlice, rec.GetString("modifiedBy"), "create seeds modifiedBy from the change Creator")
+}
+
+func TestSystemPropertiesHandler_ModifiedAtBumpsOnModify(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v2", 200, creatorBob, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"), "valid modify bumps modifiedAt")
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "valid modify moves modifiedBy to the change's signer")
+}
+
+// Out-of-order delivery: an older change (lower VersionId) arriving after
+// a newer one must NOT regress the stamps — they are LWW-gated on the
+// change's VersionId like any other field write, and both resolve to
+// the same change.
+func TestSystemPropertiesHandler_ModifiedAtOutOfOrderConverges(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v3", 300, creatorBob, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v2", 200, creatorCarol, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("later-but-older")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"), "older change must not regress modifiedAt")
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "older change must not regress modifiedBy")
+	assert.Equal(t, crdt.VersionId("v3"), crdt.GetRecordVersion(rec, "modifiedAt"))
+	assert.Equal(t, crdt.VersionId("v3"), crdt.GetRecordVersion(rec, "modifiedBy"))
+}
+
+// A change whose every op fails validation stamps nothing: the stamps
+// run after the per-op validation gate.
+func TestSystemPropertiesHandler_ModifiedAtNotBumpedWhenAllOpsRejected(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v2", 200, creatorBob, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewString("not-a-number")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "fully-rejected change must not bump modifiedAt")
+	assert.Equal(t, creatorAlice, rec.GetString("modifiedBy"), "fully-rejected change must not move modifiedBy")
+}
+
+// A multi-op RecordChange stamps each field exactly once (DeriveOnce),
+// so the wire projection carries one derived op per stamp, not one
+// per user op.
+func TestSystemPropertiesHandler_ModifiedAtSingleStampPerRecord(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), makeChangeBy(
+		"v2", 200, creatorBob, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("bye")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	))
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, countStampOps(res.DerivedOps, "modifiedAt"), "multi-op record must carry exactly one modifiedAt derived op")
+	assert.Equal(t, 1, countStampOps(res.DerivedOps, "modifiedBy"), "multi-op record must carry exactly one modifiedBy derived op")
+}
+
+// countStampOps counts the row-root derived ops on field across every
+// record of an apply result.
+func countStampOps(derived [][]crdt.Op, field string) int {
+	n := 0
+	for _, recOps := range derived {
+		for _, op := range recOps {
+			if len(op.Path) == 1 && op.Path[0] == field {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// Client writes addressing any.modifiedAt / any.modifiedBy are dropped
+// by the scope gate, same as the other derived built-ins.
+func TestSystemPropertiesHandler_ModifiedAtClientWriteDropped(t *testing.T) {
+	r := defaultRegistry()
+	r.SetScoped(typeAny, "modifiedAt", schema.KindNumber, schema.ScopeDerived)
+	r.SetScoped(typeAny, "modifiedBy", schema.KindString, schema.ScopeDerived)
+	ctrl := newPropsController(t, r)
+	arena := &anyenc.Arena{}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "modifiedAt"}, Payload: arena.NewNumberFloat64(9999)},
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, "modifiedBy"}, Payload: arena.NewString("acct-mallory")},
+	)))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.Nil(t, rec.Get(typeAny, "modifiedAt"), "derived-scoped client op dropped")
+	assert.Nil(t, rec.Get(typeAny, "modifiedBy"), "derived-scoped client op dropped")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"), "handler stamp still lands at row root")
+	assert.Equal(t, creatorAlice, rec.GetString("modifiedBy"), "handler stamp still lands at row root")
+}
+
+// The pair always moves together: a change with no Creator (hand-
+// built, no tree) moves modifiedAt and unsets modifiedBy at the same
+// version, so the row never pairs a newer time with an older signer;
+// a change with no Timestamp stamps nothing.
+func TestSystemPropertiesHandler_ModifiedByUnsetWhenSignerUnknown(t *testing.T) {
+	ctrl := newPropsController(t, defaultRegistry())
+	arena := &anyenc.Arena{}
+	get := func() *anyenc.Value {
+		rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+		require.NotNil(t, rec)
+		return rec
+	}
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v1", 100, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")},
+	)))
+	rec := get()
+	assert.EqualValues(t, 100, stampSecs(t, rec, "modifiedAt"))
+	assert.Nil(t, rec.Get("modifiedBy"), "no Creator: modifiedBy absent")
+	assert.Equal(t, crdt.VersionId("v1"), crdt.GetRecordVersion(rec, "modifiedBy"), "but versioned with modifiedAt")
+
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v3", 300, creatorBob, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(5)},
+	)))
+	rec = get()
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"))
+
+	// An older unsigned change arriving late loses both gates.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v2", 200, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("late")},
+	)))
+	rec = get()
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "older change must not split the pair")
+
+	// A newer unsigned change moves both: the signer becomes unknown.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeAt(
+		"v4", 400, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("bye")},
+	)))
+	rec = get()
+	assert.EqualValues(t, 400, stampSecs(t, rec, "modifiedAt"))
+	assert.Nil(t, rec.Get("modifiedBy"), "unsigned change unsets modifiedBy")
+	assert.Equal(t, crdt.VersionId("v4"), crdt.GetRecordVersion(rec, "modifiedBy"))
+
+	// No Timestamp: nothing moves, signer or not.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), makeChangeBy(
+		"v5", 0, creatorCarol, testObjectId, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propRating}, Payload: arena.NewNumberFloat64(7)},
+	)))
+	rec = get()
+	assert.EqualValues(t, 400, stampSecs(t, rec, "modifiedAt"))
+	assert.Nil(t, rec.Get("modifiedBy"))
+}
+
+// stampPaths lists the paths of ops, for order-insensitive assertions.
+func stampPaths(ops []crdt.Op) [][]string {
+	paths := make([][]string, 0, len(ops))
+	for _, op := range ops {
+		paths = append(paths, op.Path)
+	}
+	return paths
+}
+
+// stampSecs reads a derived timestamp leaf as unix seconds, asserting it
+// really is a datetime instant — a stamp that regressed to a plain
+// number would otherwise read as a silent zero.
+func stampSecs(t *testing.T, rec *anyenc.Value, field string) int64 {
+	t.Helper()
+	leaf := rec.Get(field)
+	require.NotNil(t, leaf, "stamp %q present", field)
+	ms, err := leaf.DateTimeMillis()
+	require.NoError(t, err, "stamp %q is a datetime", field)
+	return ms / 1000
+}
+
+// A synced write to any other dataset of the object bumps the row's
+// modifiedAt / modifiedBy (crdt.ObjectStamper) — the row is the
+// object's recency mark, not just the property store's, and the
+// signer of that write is who it names.
+func TestSystemPropertiesHandler_ModifiedAtBumpsOnDatasetWrite(t *testing.T) {
+	const notes = "notes"
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	db, err := anystore.Open(context.Background(), dbPath, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	shared, err := db.Collection(context.Background(), "space_objects")
+	require.NoError(t, err)
+	ctrl, err := crdt.NewControllerWithShared(context.Background(), testObjectId, db,
+		crdt.SharedCollections{properties.Dataset: shared},
+		crdt.HandlerReg{Name: properties.Dataset, Handler: properties.New(defaultRegistry()), Schema: schema.Dataset{Dynamic: true}},
+		crdt.HandlerReg{Name: notes, Handler: crdt.DefaultHandler{}, Schema: schema.Dataset{Dynamic: true}},
+	)
+	require.NoError(t, err)
+	arena := &anyenc.Arena{}
+
+	create := makeChangeBy("v1", 100, creatorAlice, testObjectId, true,
+		crdt.Op{Type: crdt.OpSet, Path: []string{typeAny, propName}, Payload: arena.NewString("hi")})
+	create.ObjectCreatedAt = 100
+	create.ObjectAuthor = creatorAlice
+	require.NoError(t, ctrl.ApplyChange(context.Background(), create))
+	notesWrite := func(ver crdt.VersionId, ts int64, creator string) crdt.Change {
+		return crdt.Change{
+			ObjectId: testObjectId, Dataset: notes, ChangeId: "ch-" + string(ver),
+			VersionId: ver, Timestamp: ts, Creator: creator, DataVersion: "notes-v1",
+			Records: []crdt.RecordChange{{Id: "r1", Upsert: true, Ops: []crdt.Op{
+				{Type: crdt.OpSet, Path: []string{"text"}, Payload: arena.NewString("body")},
+			}}},
+		}
+	}
+	res, err := ctrl.ApplyChangeWithResult(context.Background(), notesWrite("v2", 200, creatorBob))
+	require.NoError(t, err)
+	require.Len(t, res.ObjectStamps, 1)
+	assert.ElementsMatch(t, [][]string{{"modifiedAt"}, {"modifiedBy"}}, stampPaths(res.ObjectStamps[0].Ops))
+
+	rec := ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	require.NotNil(t, rec)
+	assert.EqualValues(t, 200, stampSecs(t, rec, "modifiedAt"), "dataset write bumps the object's modifiedAt")
+	assert.Equal(t, creatorBob, rec.GetString("modifiedBy"), "dataset write names its signer")
+	assert.EqualValues(t, 100, stampSecs(t, rec, "createdAt"), "creation stamps untouched")
+	assert.Equal(t, creatorAlice, rec.GetString("author"), "creation stamps untouched")
+	assert.Equal(t, anyenc.TypeDateTime, rec.Get("modifiedAt").Type())
+
+	// A second dataset write keeps both moving.
+	require.NoError(t, ctrl.ApplyChange(context.Background(), notesWrite("v3", 300, creatorCarol)))
+	rec = ctrl.Get(context.Background(), properties.Dataset, testObjectId)
+	assert.EqualValues(t, 300, stampSecs(t, rec, "modifiedAt"))
+	assert.Equal(t, creatorCarol, rec.GetString("modifiedBy"))
+}
+
+// TestPreValidate_ReservedCarrier pins the carrier rule: a user type
+// declaring a reserved module is the type of its own root only. Any
+// other row is refused however the type arrives (a single-path any.type
+// $set, the multi-field form); a row that already has it keeps writing;
+// nothing is checked without a resolver.
+func TestPreValidate_ReservedCarrier(t *testing.T) {
+	const reservedT = "reservedT"
+	h := properties.New(preflightRegistry())
+	h.ReservedCarrier = func(typeId string) bool { return typeId == reservedT }
+	a := &anyenc.Arena{}
+	setType := func(id string) *crdt.Change {
+		return singlePathChange(crdt.OpSet, []string{typeAny, anytype.FieldType}, a.NewString(id))
+	}
+
+	err := h.PreValidate(setType(reservedT), nil)
+	require.ErrorIs(t, err, properties.ErrReservedCarrier)
+	var ve *properties.ValidationError
+	require.True(t, errors.As(err, &ve))
+	assert.Equal(t, properties.ReasonReservedCarrier, ve.Reason)
+	assert.Equal(t, reservedT, ve.TypeId)
+	assert.Equal(t, testObjectId, ve.ObjectId)
+
+	payload := a.NewObject()
+	payload.Set(typeAny+"."+anytype.FieldType, a.NewString(reservedT))
+	require.ErrorIs(t, h.PreValidate(multiFieldChange(payload), nil), properties.ErrReservedCarrier)
+
+	// The type's own root passes — identified by the change's ObjectId
+	// (what the controller stamps for the shared objects row), in the
+	// empty-id upsert form too. A record id naming the root on another
+	// object's change is not the row and does not pass; an unstamped
+	// change fails closed.
+	own := setType(reservedT)
+	own.ObjectId, own.Records[0].Id = reservedT, ""
+	require.NoError(t, h.PreValidate(own, nil))
+	spoof := setType(reservedT)
+	spoof.Records[0].Id = reservedT
+	require.ErrorIs(t, h.PreValidate(spoof, nil), properties.ErrReservedCarrier)
+	unstamped := setType(reservedT)
+	unstamped.ObjectId, unstamped.Records[0].Id = "", ""
+	require.ErrorIs(t, h.PreValidate(unstamped, nil), properties.ErrReservedCarrier)
+	// A row already carrying it passes.
+	require.NoError(t, h.PreValidate(setType(reservedT), beforeWithMembers(a, reservedT)))
+	// Another type stays settable.
+	require.NoError(t, h.PreValidate(setType(propUserT), nil))
+
+	bare := properties.New(preflightRegistry())
+	require.NoError(t, bare.PreValidate(setType(reservedT), nil))
 }

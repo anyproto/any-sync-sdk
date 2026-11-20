@@ -2,7 +2,11 @@ package spaceimpl
 
 import (
 	"context"
+	"fmt"
+	"github.com/anyproto/any-store/v2/query"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	anystore "github.com/anyproto/any-store/v2"
@@ -11,9 +15,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 )
 
-func seedDoc(t *testing.T, ctx context.Context, coll anystore.Collection, id string) {
+func seedDoc(t testing.TB, ctx context.Context, coll anystore.Collection, id string) {
 	t.Helper()
 	a := &anyenc.Arena{}
 	doc := a.NewObject()
@@ -21,7 +27,7 @@ func seedDoc(t *testing.T, ctx context.Context, coll anystore.Collection, id str
 	require.NoError(t, coll.UpsertOne(ctx, doc))
 }
 
-func mustColl(t *testing.T, ctx context.Context, db anystore.DB, name string) anystore.Collection {
+func mustColl(t testing.TB, ctx context.Context, db anystore.DB, name string) anystore.Collection {
 	t.Helper()
 	coll, err := db.Collection(ctx, name)
 	require.NoError(t, err)
@@ -79,17 +85,217 @@ func TestDropSpaceCollections(t *testing.T) {
 	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
 }
 
+// TestDropSpaceCollectionsChunkedCommits pins the sweep's chunked-tx
+// shape on a BARE ctx: commits are one per chunk of offloadDropChunk
+// drops plus one meta chunk plus one final objects chunk — never one
+// per drop and never one for the whole sweep. Seeds offloadDropChunk+2
+// droppable collections so the chunk boundary itself is exercised.
+func TestDropSpaceCollectionsChunkedCommits(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "sdk.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	const spaceId = "spaceA.1"
+	mustColl(t, ctx, db, spaceId+"_objects") // empty: no per-object colls
+	// Realistic name shape: `<spaceId>_<objectId-like>_<dataset>`.
+	drops := offloadDropChunk + 2
+	for i := 0; i < drops; i++ {
+		mustColl(t, ctx, db, fmt.Sprintf("%s_obj%04dabcdef_blocks", spaceId, i))
+	}
+	meta := mustColl(t, ctx, db, "_meta")
+	seedDoc(t, ctx, meta, "w1") // survives: not this space's row
+
+	var chunks []int
+	sweepChunkCommitted = func(n int) { chunks = append(chunks, n) }
+	defer func() { sweepChunkCommitted = nil }()
+
+	s := &Service{db: db}
+	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
+
+	// 1 meta chunk FIRST + ceil(drops/chunk)=2 drop chunks + 1 objects chunk.
+	assert.Equal(t, []int{1, offloadDropChunk, 2, 1}, chunks)
+
+	names, err := db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	for _, n := range names {
+		assert.False(t, strings.HasPrefix(n, spaceId+"_"), "expected %s dropped", n)
+	}
+}
+
+// TestDropSpaceCollectionsCallerTxJoin pins the caller-tx degradation:
+// with a caller tx on ctx every chunk savepoint-joins it instead of
+// committing, so the caller keeps rollback authority — rolling its tx
+// back restores every collection — and a later committed bare-ctx run
+// still drops them all (the rollback un-closed the handles cleanly).
+func TestDropSpaceCollectionsCallerTxJoin(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "sdk.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	const spaceId = "spaceA.1"
+	objs := mustColl(t, ctx, db, spaceId+"_objects")
+	seedDoc(t, ctx, objs, "objX")
+	seedDoc(t, ctx, mustColl(t, ctx, db, "objX_blocks"), "rec1")
+	seedDoc(t, ctx, mustColl(t, ctx, db, spaceId+"__detached"), "chg1")
+
+	s := &Service{db: db}
+	swept := []string{spaceId + "_objects", spaceId + "__detached", "objX_blocks"}
+
+	tx, err := db.WriteTx(ctx)
+	require.NoError(t, err)
+	require.NoError(t, s.dropSpaceCollections(tx.Context(), spaceId))
+	require.NoError(t, tx.Rollback())
+
+	names, err := db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	got := map[string]bool{}
+	for _, n := range names {
+		got[n] = true
+	}
+	for _, n := range swept {
+		assert.True(t, got[n], "expected %s restored by caller-tx rollback", n)
+	}
+
+	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
+	names, err = db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	for _, n := range names {
+		for _, dropped := range swept {
+			assert.NotEqual(t, dropped, n, "expected %s dropped after committed sweep", n)
+		}
+	}
+}
+
+// seedFailureSpace seeds one space (objects roster, a per-object
+// dataset, the detached collection) plus its _meta watermark row.
+func seedFailureSpace(t *testing.T, ctx context.Context, db anystore.DB, spaceId string) {
+	t.Helper()
+	objs := mustColl(t, ctx, db, spaceId+"_objects")
+	seedDoc(t, ctx, objs, "objX")
+	seedDoc(t, ctx, mustColl(t, ctx, db, "objX_blocks"), "rec1")
+	seedDoc(t, ctx, mustColl(t, ctx, db, spaceId+"__detached"), "chg1")
+	meta := mustColl(t, ctx, db, "_meta")
+	a := &anyenc.Arena{}
+	doc := a.NewObject()
+	doc.Set("id", a.NewString("objX"))
+	doc.Set("sp", a.NewString(spaceId))
+	require.NoError(t, meta.UpsertOne(ctx, doc))
+}
+
+// TestDropSpaceCollectionsMetaPurgeFirst pins the meta-dies-first
+// invariant: with the DB closed after the FIRST committed chunk, the
+// first drop chunk fails — and on disk the meta purge has already
+// committed (watermark row gone) while every collection remains. The
+// converging direction: a re-materialized space finds no stale
+// watermark, so cold-restore replays; the leaked collections go to the
+// retry / startup GC.
+func TestDropSpaceCollectionsMetaPurgeFirst(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sdk.db")
+	db, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	const spaceId = "spaceA.1"
+	seedFailureSpace(t, ctx, db, spaceId)
+
+	sweepChunkCommitted = func(int) { _ = db.Close() }
+	defer func() { sweepChunkCommitted = nil }()
+
+	s := &Service{db: db}
+	require.Error(t, s.dropSpaceCollections(ctx, spaceId))
+	sweepChunkCommitted = nil
+
+	db, err = anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	names, err := db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	got := map[string]bool{}
+	for _, n := range names {
+		got[n] = true
+	}
+	for _, n := range []string{spaceId + "_objects", spaceId + "__detached", "objX_blocks"} {
+		assert.True(t, got[n], "expected %s still present (no drop chunk committed)", n)
+	}
+	meta := mustColl(t, ctx, db, "_meta")
+	_, err = meta.FindId(ctx, "objX")
+	assert.ErrorIs(t, err, anystore.ErrDocNotFound, "expected watermark purged before any drop")
+}
+
+// TestDropSpaceCollectionsChunkFailure pins incremental progress plus
+// the objects-last invariant: with the DB closed after the SECOND
+// committed chunk (meta purge, then the drop chunk), the final objects
+// chunk fails — the error propagates while the committed chunks stay
+// durable, and `<spaceId>_objects` survives so the retry can
+// re-enumerate. A clean re-run finishes the sweep.
+func TestDropSpaceCollectionsChunkFailure(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sdk.db")
+	db, err := anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+
+	const spaceId = "spaceA.1"
+	seedFailureSpace(t, ctx, db, spaceId)
+
+	commits := 0
+	sweepChunkCommitted = func(int) {
+		commits++
+		if commits == 2 {
+			_ = db.Close()
+		}
+	}
+	defer func() { sweepChunkCommitted = nil }()
+
+	s := &Service{db: db}
+	require.Error(t, s.dropSpaceCollections(ctx, spaceId))
+	sweepChunkCommitted = nil
+	require.Equal(t, 2, commits)
+
+	// Reopen: meta purge + drop chunk persisted; objects kept for retry.
+	db, err = anystore.Open(ctx, path, nil)
+	require.NoError(t, err)
+	defer db.Close()
+	names, err := db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	got := map[string]bool{}
+	for _, n := range names {
+		got[n] = true
+	}
+	assert.False(t, got["objX_blocks"], "expected drop chunk committed")
+	assert.False(t, got[spaceId+"__detached"], "expected drop chunk committed")
+	assert.True(t, got[spaceId+"_objects"], "expected objects kept for re-enumeration")
+	meta := mustColl(t, ctx, db, "_meta")
+	_, err = meta.FindId(ctx, "objX")
+	assert.ErrorIs(t, err, anystore.ErrDocNotFound, "expected watermark purged first")
+
+	// Retry completes the sweep.
+	s = &Service{db: db}
+	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
+	names, err = db.GetCollectionNames(ctx)
+	require.NoError(t, err)
+	for _, n := range names {
+		assert.NotEqual(t, spaceId+"_objects", n)
+	}
+}
+
 func TestRemotelyGone(t *testing.T) {
 	gone := []coordinatorproto.SpaceStatus{
 		coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
 		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
 		coordinatorproto.SpaceStatus_SpaceStatusDeleted,
-		coordinatorproto.SpaceStatus_SpaceStatusNotExists,
 	}
 	for _, st := range gone {
 		assert.True(t, remotelyGone(st), "status %v should be gone", st)
 	}
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusCreated))
+	// Not registered on the coordinator yet (first push pending), not deleted.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusNotExists))
+	// Unknown future statuses must never offload.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus(99)))
 }
 
 // TestDecideReconcile exhaustively covers the reconcile decision: who
@@ -104,6 +310,7 @@ func TestDecideReconcile(t *testing.T) {
 	}
 	C := coordinatorproto.SpaceStatus_SpaceStatusCreated
 	P := coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+	S := coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted
 	D := coordinatorproto.SpaceStatus_SpaceStatusDeleted
 	NX := coordinatorproto.SpaceStatus_SpaceStatusNotExists
 
@@ -119,8 +326,11 @@ func TestDecideReconcile(t *testing.T) {
 		{"member deleted locally, active -> none (cannot delete)", true, st(C, reader), actionNone},
 		{"active not-deleted owner -> none", false, st(C, owner), actionNone},
 		{"inbound pending, not deleted -> offload", false, st(P, owner), actionOffload},
+		{"inbound deletion started, not deleted -> offload", false, st(S, reader), actionOffload},
 		{"inbound deleted, not deleted -> offload", false, st(D, reader), actionOffload},
-		{"inbound not-exists, not deleted -> offload", false, st(NX, owner), actionOffload},
+		{"unknown status, not deleted -> none", false, st(coordinatorproto.SpaceStatus(99), owner), actionNone},
+		{"not-exists (unpushed), not deleted -> none", false, st(NX, owner), actionNone},
+		{"not-exists (unpushed), deleted locally -> none (nothing to drive)", true, st(NX, owner), actionNone},
 		{"nil status -> none", true, nil, actionNone},
 	}
 	for _, c := range cases {
@@ -137,4 +347,84 @@ func TestOwnedByObject(t *testing.T) {
 	assert.False(t, ownedByObject("objY_blocks", ids))
 	assert.False(t, ownedByObject("noUnderscore", ids))
 	assert.False(t, ownedByObject("_meta", ids))
+}
+
+// TestShouldPruneReadState pins the prune gate on SYNCED removal
+// markers: a device-local declined-join tombstone (LocalStatus) must
+// never drive the account-wide destructive watermark.
+func TestShouldPruneReadState(t *testing.T) {
+	prune := []techspace.SpaceIndexRecord{
+		{Id: "deleted", RemoteStatus: techspace.StatusDeleted},
+		{Id: "one-to-one", RemoteStatus: techspace.OneToOneDeletedStatus},
+		{Id: "guest", RemoteStatus: techspace.GuestDeletedRemoteStatus},
+	}
+	keep := []techspace.SpaceIndexRecord{
+		{Id: "active"},
+		{Id: "declined-join", LocalStatus: techspace.StatusDeleted},
+		{Id: "pending", RemoteStatus: techspace.InvitePendingRemoteStatus},
+	}
+	for _, r := range prune {
+		require.True(t, shouldPruneReadState(r), r.Id)
+	}
+	for _, r := range keep {
+		require.False(t, shouldPruneReadState(r), r.Id)
+	}
+}
+
+// seedReadState writes one read-state row (and one unread row) for
+// objectId under spaceId, the shape the readstate engine persists.
+func seedReadState(t *testing.T, ctx context.Context, db anystore.DB, spaceId, objectId string) {
+	t.Helper()
+	eng := readstate.New(db, spaceId, func(context.Context) (uint64, error) { return 1, nil }, nil, nil)
+	require.NoError(t, eng.Open(ctx))
+	require.NoError(t, eng.TrackChange(ctx, readstate.Track{
+		ObjectId: objectId, ChangeId: objectId + "-c1", VersionId: "v1", AddSeq: 1, ApplySeq: 1,
+		RecordIds: []string{"r1"}, Tags: []string{"msg"}, Tracked: true,
+	}))
+}
+
+func readStateRows(t *testing.T, ctx context.Context, db anystore.DB, spaceId string) (state, unread int) {
+	t.Helper()
+	count := func(name, field string) int {
+		coll, err := db.OpenCollection(ctx, name)
+		require.NoError(t, err)
+		n, err := coll.Find(query.Key{Path: []string{field}, Filter: query.NewComp(query.CompOpEq, spaceId)}).Count(ctx)
+		require.NoError(t, err)
+		return n
+	}
+	return count(readstate.StateCollectionName, "sp"), count(readstate.UnreadCollectionName, "sp")
+}
+
+// The offload sweep purges the space's read-state rows — state and
+// unread — and leaves a sibling space's rows alone; the purge is its
+// own committed chunk, reported after the meta chunk.
+func TestDropSpaceCollectionsPurgesReadState(t *testing.T) {
+	ctx := context.Background()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "sdk.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	const spaceId = "spaceA.1"
+	const otherSpace = "spaceB.2"
+	mustColl(t, ctx, db, spaceId+"_objects")
+	mustColl(t, ctx, db, "_meta")
+	seedReadState(t, ctx, db, spaceId, "objX")
+	seedReadState(t, ctx, db, spaceId, "objY")
+	seedReadState(t, ctx, db, otherSpace, "objZ")
+
+	var chunks []int
+	sweepChunkCommitted = func(n int) { chunks = append(chunks, n) }
+	defer func() { sweepChunkCommitted = nil }()
+
+	s := &Service{db: db}
+	require.NoError(t, s.dropSpaceCollections(ctx, spaceId))
+
+	// meta chunk, read-state chunk (2 objects), objects chunk.
+	assert.Equal(t, []int{1, 2, 1}, chunks)
+	state, unread := readStateRows(t, ctx, db, spaceId)
+	assert.Zero(t, state)
+	assert.Zero(t, unread)
+	state, unread = readStateRows(t, ctx, db, otherSpace)
+	assert.Equal(t, 1, state)
+	assert.Equal(t, 1, unread)
 }

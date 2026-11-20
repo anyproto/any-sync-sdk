@@ -7,11 +7,15 @@ import "time"
 //
 // Rollup priority (highest match wins, see Service.Status):
 //
-//   1. Error   — incompatible network / needs update
-//   2. Offline — no responsible node reachable
-//   3. Syncing — at least one tracked tree has pending heads
-//   4. Synced  — every tracked tree converged with a responsible node
-//   5. Unknown — bootstrap; no hooks fired yet, no peers polled yet
+//  1. Error   — the network refuses this client's protocol version
+//  2. Offline — no responsible node and no direct peer connected
+//  3. Syncing — at least one tracked tree has pending heads
+//  4. Synced  — a responsible node or direct peer confirmed heads of
+//     this space in this run and nothing is pending
+//  5. Unknown — a peer is connected but none has confirmed yet
+//
+// A space this device does not track reads Unknown whatever the
+// presence.
 type SyncState uint8
 
 const (
@@ -38,6 +42,43 @@ func (s SyncState) String() string {
 	}
 }
 
+// P2PState is the direct-peer sync state of a space: whether this
+// device is connected to LAN or global peers that share it.
+type P2PState uint8
+
+const (
+	P2PStateUnknown P2PState = iota
+	// P2PStateNotPossible — p2p is disabled in config, the device has
+	// no usable network interface, or local discovery is switched off
+	// with no LAN peer known and no global layer to find one.
+	P2PStateNotPossible
+	// P2PStateNotConnected — a p2p layer is on but no direct peer
+	// sharing this space is connected.
+	P2PStateNotConnected
+	// P2PStateConnected — at least one direct peer (LAN or global)
+	// sharing this space has a live connection.
+	P2PStateConnected
+	// P2PStateRestricted — the OS denies local-network access (e.g.
+	// iOS Local Network permission).
+	P2PStateRestricted
+)
+
+// String returns a stable lowercase token for logging / wire mapping.
+func (s P2PState) String() string {
+	switch s {
+	case P2PStateNotPossible:
+		return "notpossible"
+	case P2PStateNotConnected:
+		return "notconnected"
+	case P2PStateConnected:
+		return "connected"
+	case P2PStateRestricted:
+		return "restricted"
+	default:
+		return "unknown"
+	}
+}
+
 // SpaceSyncStatus is the per-space rolled-up sync state. Returned by
 // Service.Status and delivered on Service.SubscribeStatus events.
 //
@@ -48,12 +89,21 @@ func (s SyncState) String() string {
 //   - Synced = Total - count of trees the tracker currently holds in
 //     SyncStateSyncing. A tree that has never produced a status hook
 //     is treated as Synced — no evidence of work needed.
+//   - NetworkPeers = responsible sync nodes with a live connection.
+//   - LocalPeers = local-network (LAN) peers sharing this space with a
+//     live connection.
+//   - GlobalPeers = internet-wide (relay / hole-punched) peers sharing
+//     this space with a live connection. P2P summarizes LocalPeers and
+//     GlobalPeers as one state.
 type SpaceSyncStatus struct {
 	SpaceId      string
 	State        SyncState
 	Synced       int
 	Total        int
 	NetworkPeers int
+	LocalPeers   int
+	GlobalPeers  int
+	P2P          P2PState
 	LastSyncedAt time.Time
 }
 
@@ -79,8 +129,10 @@ type SyncStatusAPI interface {
 	// to call on every UI render.
 	Space() SpaceSyncStatus
 
-	// Object returns the state for a specific objectId. Unknown ids
-	// return ObjectSyncStatus{State: SyncStateUnknown}.
+	// Object returns the state for a specific objectId. An id with no
+	// sync activity this run returns ObjectSyncStatus{State:
+	// SyncStateUnknown} unless its tree is stored locally (not
+	// deleted) and a responsible peer has confirmed the space.
 	Object(objectId string) ObjectSyncStatus
 
 	// SubscribeObject delivers an ObjectSyncStatus event for

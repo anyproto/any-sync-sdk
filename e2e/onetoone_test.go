@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -41,7 +42,7 @@ func firstOneToOne(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK) (spac
 	return space.SpaceInfo{}, false
 }
 
-// TestE2E_OneToOne_DeclineSticky exercises the Phase-1 serverless state
+// TestE2E_OneToOne_DeclineSticky exercises the serverless state
 // machine with a single account and an out-of-band peer identity — no
 // cross-account sync needed, so it runs fast.
 //
@@ -50,6 +51,7 @@ func firstOneToOne(t *testing.T, ctx context.Context, sdk *anysyncsdk.SDK) (spac
 //	RegisterIncoming again → still declined (sticky, no re-prompt)
 //	OneToOne(peer) → overrides to active (un-decline)
 func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -78,6 +80,9 @@ func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
 	require.True(t, ok, "pending 1-1 row should exist")
 	assert.Equal(t, space.StatusOneToOnePending, si.Status)
 	assert.Equal(t, "Alice", si.Name)
+	// A 1-1 surfaces the friend's account identity as Author, even while
+	// only pending — clients identify who a 1-1 is with from the list.
+	assert.Equal(t, peerID, si.Author, "1-1 Author must be the friend identity")
 	id := si.Id
 
 	// Decline → declined.
@@ -107,6 +112,7 @@ func TestE2E_OneToOne_DeclineSticky(t *testing.T) {
 // space (the marker is not terminal, unlike a regular delete). Serverless
 // — no cross-account sync needed.
 func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -136,6 +142,18 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
 
+	// The members view must surface exactly the two real writers (us +
+	// the peer) — the synthetic ACL owner (sharedPk, ECDH-derived, held
+	// by nobody) is filtered out, per docs/one-to-one-spaces.md. See
+	// SYN-63: it used to leak as a nameless third "owner" member.
+	members, err := sp.Members().List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, members, 2, "1-1 members must be exactly the two writers")
+	for _, m := range members {
+		assert.NotEqual(t, space.PermissionOwner, m.Permission,
+			"synthetic 1-1 owner must not surface in the members list")
+	}
+
 	// Delete → surfaced as Deleted (synced offload marker), row still listed.
 	require.NoError(t, sdk.Spaces().Delete(ctx, id))
 	si, ok = infoByID(t, ctx, sdk, id)
@@ -159,6 +177,7 @@ func TestE2E_OneToOne_DeleteAndRecreate(t *testing.T) {
 // convergence rides the tech-space sync, so the propagation assertion is
 // best-effort (skips if tech-space doesn't converge in time).
 func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -202,10 +221,18 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 	peerID := peerPub.Account()
 
 	// A initiates; B also materializes the same 1-1 so it has a local copy
-	// to offload.
+	// to offload. B takes A's row first: without it, B's OneToOne writes
+	// a row of its own, concurrent with A's delete, and the merge may
+	// keep the 1-1 active on both devices — a valid outcome for a
+	// non-terminal delete, not the one under test.
 	aSp, err := a.Spaces().OneToOne(ctx, peerID)
 	require.NoError(t, err)
 	id := aSp.Id()
+	require.True(t, waitFor(ctx, 90*time.Second, time.Second, func() bool {
+		_ = b.Spaces().SyncSpaceList(ctx)
+		_, ok := infoByID(t, ctx, b, id)
+		return ok
+	}), "device B never received A's 1-1 row")
 	_, err = b.Spaces().OneToOne(ctx, peerID)
 	require.NoError(t, err)
 
@@ -215,17 +242,12 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, space.StatusDeleted, aInfo.Status, "A sees its own delete")
 
-	// B should converge on Deleted via tech-space sync. Best-effort.
-	deadline := time.Now().Add(2 * time.Minute)
-	for time.Now().Before(deadline) {
+	// B converges on Deleted via tech-space sync.
+	require.True(t, waitFor(ctx, 2*time.Minute, 2*time.Second, func() bool {
 		_ = b.Spaces().SyncSpaceList(ctx)
-		if si, ok := infoByID(t, ctx, b, id); ok && si.Status == space.StatusDeleted {
-			t.Logf("device B converged on the 1-1 delete")
-			return
-		}
-		time.Sleep(2 * time.Second)
-	}
-	t.Skipf("device B did not converge on the 1-1 delete in time (tech-space sync / node reachability)")
+		si, ok := infoByID(t, ctx, b, id)
+		return ok && si.Status == space.StatusDeleted
+	}), "device B never converged on the 1-1 delete")
 }
 
 // TestE2E_OneToOne_ApproveIncoming is the full two-account happy path:
@@ -233,6 +255,7 @@ func TestE2E_OneToOne_DeleteSyncsToOtherDevice(t *testing.T) {
 // space (symmetric derivation), approves it, and then converges on
 // Alice's content. Slow — needs cross-account replication.
 func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -245,20 +268,22 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
 	defer cancel()
 
-	openSDK := func(name string) *anysyncsdk.SDK {
+	openSDK := func(name string, p *fixedSeedProvider) (*anysyncsdk.SDK, string) {
 		t.Helper()
+		dir := t.TempDir()
 		cfg := config.Config{
-			Storage: config.Storage{DataDir: t.TempDir(), Topology: config.StorageShared},
+			Storage: config.Storage{DataDir: dir, Topology: config.StorageShared},
 			Network: config.Network{NodeConfYAML: yaml},
 		}
-		sdk, err := anysyncsdk.Open(ctx, cfg, newFixedSeedProvider(t))
+		sdk, err := anysyncsdk.Open(ctx, cfg, p)
 		require.NoError(t, err, "%s: Open", name)
 		t.Cleanup(func() { _ = sdk.Close() })
-		return sdk
+		return sdk, dir
 	}
 
-	alice := openSDK("alice")
-	bob := openSDK("bob")
+	bobProvider := newFixedSeedProvider(t)
+	alice, _ := openSDK("alice", newFixedSeedProvider(t))
+	bob, bobDir := openSDK("bob", bobProvider)
 	require.NotEqual(t, alice.Account().Id(), bob.Account().Id())
 
 	// Alice initiates — active immediately (implicit self-approval).
@@ -271,7 +296,9 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	assert.Equal(t, space.SpaceTypeOneToOne, si.Type)
 
 	// Alice writes content before Bob accepts.
-	objID, err := aliceSp.Objects().Create(ctx, space.CreateObjectOpts{})
+	objID, err := aliceSp.Objects().Create(ctx, space.CreateObjectOpts{
+		Type: markerTypeId(t, ctx, aliceSp, "Note"),
+	})
 	require.NoError(t, err, "alice: create object")
 
 	// Bob learns Alice's identity out-of-band → pending row on the SAME id
@@ -282,6 +309,28 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	require.True(t, ok, "bob must derive the same 1-1 id Alice initiated")
 	assert.Equal(t, space.StatusOneToOnePending, si.Status)
 
+	// While pending, a read path must not materialize the 1-1: Get is
+	// guarded, and no any-sync storage may exist. The stakes are higher
+	// than for a regular join — the two-writer ACL hands Bob a read key
+	// from derivation, so a stray Get would fully decrypt the space and
+	// reduce the accept gate to decoration.
+	_, err = bob.Spaces().Get(ctx, id)
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"Get on a pending incoming 1-1 must refuse to materialize")
+	require.NoFileExists(t, filepath.Join(bobDir, "anysync", id+".db"),
+		"a pending incoming 1-1 must not create any-sync space storage")
+
+	// Bob's SECOND device (same account, fresh device key). Discovery is
+	// per-device: it either registers its own pending row or receives
+	// device 1's row via tech-space sync (RegisterIncoming then no-ops).
+	// Both shapes are "unresolved on this device" and must refuse to
+	// materialize while no device has accepted.
+	bobB, bobBDir := openSDK("bob-2", sameAccountFreshDevice(t, bobProvider))
+	require.NoError(t, bobB.Spaces().RegisterIncoming(ctx, alice.Account().Id(), space.AccountMetadata{Name: "Alice"}))
+	_, err = bobB.Spaces().Get(ctx, id)
+	require.ErrorIs(t, err, space.ErrSpaceNotAccepted,
+		"an unresolved 1-1 on a second device must refuse to materialize")
+
 	// Bob approves → active, materialized.
 	bobSp, err := bob.Spaces().AcceptOneToOne(ctx, id)
 	require.NoError(t, err, "bob: AcceptOneToOne")
@@ -290,12 +339,38 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, space.StatusActive, si.Status)
 
+	// Cross-device acceptance: bob accepted on device 1 only. Once the
+	// synced remote=active reaches device 2 it wins over the stale
+	// device-local pending (acceptance is account-scoped) and Get adopts
+	// the 1-1 — derives storage, clears the pending — with no per-device
+	// re-accept.
+	adopted := false
+	syncDeadline := time.Now().Add(90 * time.Second)
+	for time.Now().Before(syncDeadline) {
+		_ = bobB.Spaces().SyncSpaceList(ctx)
+		if si, ok := infoByID(t, ctx, bobB, id); ok && si.Status == space.StatusActive {
+			adopted = true
+			break
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if !adopted {
+		t.Skipf("bob's second device did not converge on the accepted 1-1 in time (tech-space sync / node reachability)")
+	}
+	bobBSp, err := bobB.Spaces().Get(ctx, id)
+	require.NoError(t, err, "bob-2: Get must adopt a 1-1 accepted on another device")
+	require.Equal(t, id, bobBSp.Id())
+	require.FileExists(t, filepath.Join(bobBDir, "anysync", id+".db"),
+		"adoption must materialize local 1-1 storage")
+	si, ok = infoByID(t, ctx, bobB, id)
+	require.True(t, ok)
+	assert.Equal(t, space.StatusActive, si.Status)
+
 	// Content convergence is the only cross-account step and depends on the
-	// 1-1's derived replication-key nodes being reachable — that is Phase-2
-	// transport territory, not the Phase-1 serverless primitive this test
-	// covers. Best-effort: log if it lands, don't fail the suite on node
-	// reachability. (Promote to a hard require once Phase 2 wires/validates
-	// 1-1 cross-account sync against the local coordinator.)
+	// 1-1's derived replication-key nodes being reachable, which is
+	// transport, not the serverless primitive this test covers.
+	// Best-effort: log if it lands, don't fail the suite on node
+	// reachability.
 	converged := false
 	deadline := time.Now().Add(90 * time.Second)
 	for time.Now().Before(deadline) {
@@ -315,6 +390,6 @@ func TestE2E_OneToOne_ApproveIncoming(t *testing.T) {
 	if converged {
 		t.Logf("1-1 content converged: bob synced alice's object %s", objID)
 	} else {
-		t.Logf("1-1 content did NOT converge in time (object %s) — likely cross-account transport / node reachability, a Phase-2 concern", objID)
+		t.Logf("1-1 content did NOT converge in time (object %s) — likely cross-account transport / node reachability", objID)
 	}
 }

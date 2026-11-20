@@ -2,9 +2,11 @@ package spaceobjects
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/object"
@@ -20,27 +22,47 @@ import (
 // missing. The legacy hardcoded handler-version strings (e.g.
 // "systemPropertyHandler-v1") parse-fail and are treated as
 // unconstrained — the gate lets them through.
-func (s *Store) gateFor(objectId string) object.ApplyGate {
+//
+// The gate also parks a change whose DATASET this controller has no
+// handler for (spec §8.2 persist-but-skip): either the schema hasn't
+// arrived yet (dataset unknown everywhere) or it arrived after this
+// controller was built (stale reg set). Both drain the same way — the
+// defs apply refreshes the catalog and notifies the drainer, which
+// evicts the stale controller before replay. Without the park, one
+// unknown-dataset change would stall the object's replay at its
+// AddSeq. Cost on the accept path: one immutable-map lookup + one
+// atomic snapshot load.
+func (s *Store) gateFor(objectId string, ctrl *crdt.Controller) object.ApplyGate {
 	return func(ctx context.Context, ch *crdt.Change, raw []byte) (bool, error) {
-		pairs, err := types.ParseDataVersion(ch.DataVersion)
-		if err != nil {
-			// Legacy / unknown DataVersion shape — pass through.
-			return true, nil
-		}
-		if len(pairs) == 0 {
-			return true, nil
-		}
 		var missing []types.DataVersionPair
-		for _, p := range pairs {
-			known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
-			if kerr != nil {
-				return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
-			}
-			if !known {
-				missing = append(missing, p)
+		pairs, perr := types.ParseDataVersion(ch.DataVersion)
+		if perr == nil {
+			for _, p := range pairs {
+				known, kerr := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId)
+				if kerr != nil {
+					if ctx.Err() != nil {
+						return false, fmt.Errorf("gate: KnownShortId %s/%s: %w", p.TypeId, p.ShortId, kerr)
+					}
+					// A lookup that fails does not show the definition
+					// is known, so the change waits like any change
+					// whose definition is not: failing the replay
+					// instead would hold the whole tree back until a
+					// retry. any-store shows a collection to readers
+					// before the transaction creating it commits, and a
+					// lookup that gets there first fails — which is a
+					// type being applied next to an object that names
+					// it. The definition's commit drains the change.
+					storeLog.Warn("gate: definition lookup failed; change parked",
+						zap.String("objectId", objectId), zap.String("typeId", p.TypeId),
+						zap.String("shortId", p.ShortId), zap.Error(kerr))
+					known = false
+				}
+				if !known {
+					missing = append(missing, p)
+				}
 			}
 		}
-		if len(missing) == 0 {
+		if len(missing) == 0 && !s.controllerStaleFor(ctrl, ch.Dataset) {
 			return true, nil
 		}
 		row := DetachedRow{
@@ -52,12 +74,48 @@ func (s *Store) gateFor(objectId string) object.ApplyGate {
 			Timestamp: ch.Timestamp,
 			Payload:   append([]byte(nil), raw...),
 			Pending:   missing,
+			Dataset:   ch.Dataset,
 		}
-		if perr := s.Park(ctx, row); perr != nil {
+		if perr := s.parkGated(ctx, row); perr != nil {
 			return false, fmt.Errorf("gate: park: %w", perr)
 		}
 		return false, nil
 	}
+}
+
+// parkGated parks a change the gate held back and makes sure a drain
+// follows when nothing else will bring one.
+//
+// A change waiting on definitions is woken by their apply — unless
+// they applied between the gate's lookup and this park's commit: that
+// wake-up found no row, and no other is coming. So the lookup is
+// repeated once the row is in. Trees of one space apply side by side
+// (several per sync pass, plus the pushes), so a type and an object
+// that names it do interleave this way.
+//
+// A change parked only because its controller's registration is missing
+// or stale waits on nothing — the schema may already be fully applied —
+// so it is nudged too: Drain evicts the stale controller and replays
+// the row.
+func (s *Store) parkGated(ctx context.Context, row DetachedRow) error {
+	if err := s.Park(ctx, row); err != nil {
+		return err
+	}
+	if s.parkedHook != nil {
+		s.parkedHook()
+	}
+	// The row is in. The lookup that decides whether it gets its drain
+	// must not be lost to the caller's deadline.
+	ctx = context.WithoutCancel(ctx)
+	for _, p := range row.Pending {
+		// A lookup that fails here is a definition still being
+		// committed: its own wake-up follows.
+		if known, err := s.reg.KnownShortId(ctx, p.TypeId, p.ShortId); err != nil || !known {
+			return nil
+		}
+	}
+	s.drainer.Notify(types.DataVersionPair{})
+	return nil
 }
 
 // afterApplyFor is the post-apply hook. Two independent fan-outs
@@ -93,44 +151,78 @@ func (s *Store) afterApplyFor() object.AfterApply {
 		// when it does we still feed the drainer a generic wakeup to
 		// avoid stuck parked changes.
 		ids, idsErr := crdt.ResolveRecordIds(*ch)
+		if idsErr == nil {
+			// Events carry the id a record is stored and read under.
+			obj.Controller().StoreIds(ch.Dataset, ids)
+		}
 
 		if s.engine != nil && s.engine.HasSubscribers() {
 			rowIds, postValue := s.postValueFor(ctx, obj, ch, ids)
-			var derivedOps [][]crdt.Op
+			var (
+				derivedOps [][]crdt.Op
+				rejections []crdt.OpRejection
+			)
 			if res != nil {
-				derivedOps = res.DerivedOps
+				derivedOps, rejections = res.DerivedOps, res.Rejections
 			}
-			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, postValue)
+			ev := subscribe.BuildEvent(ch, rowIds, derivedOps, rejections, postValue)
+			if obj != nil {
+				// A refill reads through the object the apply ran on.
+				ev.Source = obj
+			}
 			s.engine.OnApply(ev, postValue)
+			if res != nil && len(res.ObjectStamps) > 0 && obj != nil {
+				s.dispatchObjectStamps(ctx, obj.Controller(), obj.Replaying(), obj, ch, res.ObjectStamps)
+			}
 		}
 
 		// Change-index feed: one notification per applied change across
 		// every dataset (base content, properties, type defs). Gated on
 		// hasSubscribers so the cold-restore / catch-up path stays free
 		// when no indexer is attached.
-		if s.changeSubs.hasSubscribers() {
-			s.changeSubs.dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
+		if s.changeSubs.HasSubscribers() {
+			s.changeSubs.Dispatch(ObjectChange{ObjectId: ch.ObjectId, ApplySeq: applySeqOf(res)})
+		}
+
+		// Read-state ping: the apply hook already recorded any unread
+		// entry inside the committed tx; this fires the best-effort
+		// subscriber notification. Over-notifies (an apply whose
+		// classification changed nothing still pings) — consumers pull
+		// ChangedSince and see an empty diff.
+		if s.readState != nil && s.readTrackingFor(ch.Dataset) != nil && !ch.Local && !ch.Injected {
+			s.readState.NotifyState(ch.ObjectId, applySeqOf(res))
 		}
 
 		// Row lifecycle events for the objects collection: creation is
 		// detected via the synthetic _ver.id derived op the apply path
 		// emits exactly once per record; deletion via a delete op in the
 		// change. Both key the account mirror's replay/GC.
-		if ch.Dataset == properties.Dataset && s.rowEvents.hasSubscribers() {
+		if ch.Dataset == properties.Dataset && s.rowEvents.HasSubscribers() {
 			for i, rc := range ch.Records {
 				rid := ch.ObjectId // shared collection: row id = objectId
 				if hasDeleteOp(rc.Ops) {
-					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: true})
+					s.rowEvents.Dispatch(RowEvent{ObjectId: rid, Deleted: true})
 					continue
 				}
 				if res != nil && i < len(res.DerivedOps) && hasCreationMarker(res.DerivedOps[i]) {
-					s.rowEvents.dispatch(RowEvent{ObjectId: rid, Deleted: false})
+					s.rowEvents.Dispatch(RowEvent{ObjectId: rid, Deleted: false})
 				}
 			}
 		}
 
-		if ch.Dataset != typetype.DatasetPropertyDefs {
+		if ch.Dataset != typetype.DatasetPropertyDefs && ch.Dataset != typetype.DatasetDefs {
 			return
+		}
+		// Dataset-defs applies refresh the runtime catalog BEFORE the
+		// drainer wakes, so Drain sees the new snapshot when it decides
+		// which parked rows are replayable.
+		if ch.Dataset == typetype.DatasetDefs {
+			if obj != nil && obj.Replaying() {
+				// The catalog passes through every replayed state:
+				// index the type's shared datasets once it settles.
+				s.holdIndexSync(ch.ObjectId)
+			}
+			s.refreshType(ctx, ch.ObjectId)
 		}
 		if idsErr != nil {
 			s.drainer.Notify(types.DataVersionPair{TypeId: ch.ObjectId})
@@ -142,9 +234,128 @@ func (s *Store) afterApplyFor() object.AfterApply {
 	}
 }
 
+// pendingStamps is one object's coalesced stamp work for the current
+// replay batch: the last landed stamps (their datasets/rows/paths) and
+// the VersionId of the last change that landed one.
+type pendingStamps struct {
+	versionId crdt.VersionId
+	stamps    []crdt.ObjectStamp
+}
+
+// dispatchObjectStamps routes the object stamps a change landed on
+// shared rows (crdt.ObjectStamper — the objects row's modifiedAt bumped
+// by a write to another dataset) to live queries on those datasets.
+// A single write (LocalWrite, a drained parked change) emits at once.
+// Inside a replay batch (inbound sync, cold restore, re-index rebuild)
+// the stamps are only recorded and flushObjectStamps emits one event
+// per object after the batch, with the row's final values — so a bulk
+// catch-up of a large object cannot flood an objects subscription with
+// one event per change and overflow its mailbox.
+//
+// source is the object the apply ran on, carried as Event.Source.
+func (s *Store) dispatchObjectStamps(ctx context.Context, ctrl *crdt.Controller, replaying bool, source any, ch *crdt.Change, stamps []crdt.ObjectStamp) {
+	if len(stamps) == 0 || ctrl == nil {
+		return
+	}
+	if replaying {
+		s.stampPending.Store(ch.ObjectId, pendingStamps{versionId: ch.VersionId, stamps: stamps})
+		return
+	}
+	for _, st := range stamps {
+		s.emitObjectStamp(ctx, ctrl, source, ch.SpaceId, ch.ObjectId, ch.VersionId, st)
+	}
+}
+
+// flushObjectStamps emits the stamps recorded for objectId during a
+// replay batch as one update event per shared row, re-reading each
+// stamped path from the row so the event carries the batch's final
+// values. No-op when nothing was recorded or nobody listens.
+func (s *Store) flushObjectStamps(ctx context.Context, ctrl *crdt.Controller, source any, objectId string) {
+	v, ok := s.stampPending.LoadAndDelete(objectId)
+	if !ok || ctrl == nil || s.engine == nil || !s.engine.HasSubscribers() {
+		return
+	}
+	pending := v.(pendingStamps)
+	for _, st := range pending.stamps {
+		row, err := ctrl.Lookup(ctx, st.Dataset, st.RowId)
+		if err != nil {
+			// The row could not be read: the event still goes out,
+			// with an unreadable post value, so each window in scope
+			// settles from storage or closes.
+			s.emitObjectStampWith(ctx, source, s.spaceId, objectId, pending.versionId, st,
+				func(int) (*anyenc.Value, error) { return nil, err })
+			continue
+		}
+		if row == nil {
+			continue
+		}
+		ops := make([]crdt.Op, 0, len(st.Ops))
+		for _, op := range st.Ops {
+			if len(op.Path) == 0 {
+				continue
+			}
+			if val := row.Get(op.Path...); val != nil {
+				ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: op.Path, Payload: val})
+			}
+		}
+		if len(ops) == 0 {
+			continue
+		}
+		s.emitObjectStamp(ctx, ctrl, source, s.spaceId, objectId, pending.versionId,
+			crdt.ObjectStamp{Dataset: st.Dataset, RowId: st.RowId, Ops: ops})
+	}
+}
+
+// emitObjectStamp feeds the engine one event shaped like an update of
+// the stamped row carrying only the stamp ops; the row's post value is
+// read on demand like any other apply event.
+func (s *Store) emitObjectStamp(ctx context.Context, ctrl *crdt.Controller, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp) {
+	s.emitObjectStampWith(ctx, source, spaceId, objectId, versionId, st, func(i int) (*anyenc.Value, error) {
+		if i != 0 {
+			return nil, nil
+		}
+		return ctrl.Lookup(ctx, st.Dataset, st.RowId)
+	})
+}
+
+// emitObjectStampWith is emitObjectStamp with the post-value lookup
+// supplied; source is carried as Event.Source.
+func (s *Store) emitObjectStampWith(_ context.Context, source any, spaceId, objectId string, versionId crdt.VersionId, st crdt.ObjectStamp, postValue subscribe.PostValueFn) {
+	synthetic := crdt.Change{
+		SpaceId:   spaceId,
+		ObjectId:  objectId,
+		Dataset:   st.Dataset,
+		VersionId: versionId,
+		Records:   []crdt.RecordChange{{Id: st.RowId}},
+	}
+	ev := subscribe.BuildEvent(&synthetic, []string{st.RowId}, [][]crdt.Op{st.Ops}, nil, postValue)
+	if source != nil {
+		ev.Source = source
+	}
+	s.engine.OnApply(ev, postValue)
+}
+
+// afterReplayFor is the per-batch hook: flushes the object stamps
+// coalesced by dispatchObjectStamps during the batch.
+func (s *Store) afterReplayFor() object.AfterReplay {
+	return func(ctx context.Context, obj *object.Object) {
+		if obj == nil || obj.Controller() == nil {
+			return
+		}
+		s.flushObjectStamps(ctx, obj.Controller(), obj, obj.Controller().ObjectId())
+		s.releaseIndexSync(obj.Controller().ObjectId())
+	}
+}
+
+// errNoController is the post-value read error of a change whose
+// object has no controller to read rows from.
+var errNoController = errors.New("spaceobjects: no controller for the post-apply read")
+
 // postValueFor returns the row-id slice and the per-record post-apply
 // lookup the dispatcher needs to project $inc / $addToSet / etc. ops
-// down to a $set against the merged value.
+// down to a $set against the merged value. The lookup reports a read
+// that failed as an error, never as an absent row: a live window must
+// not drop a row it could not read.
 //
 // Shared datasets (per-space `objects`): the controller stores all
 // rows under ch.ObjectId regardless of the change's RecordChange.Id;
@@ -159,13 +370,13 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 	// id would block on the load channel that hasn't closed yet,
 	// producing a self-recursive deadlock that any-sync surfaces as
 	// `panic: app.Close timeout`.
-	if obj == nil {
-		return ids, nil
+	if obj == nil || obj.Controller() == nil {
+		// Nothing to read rows from: every record of the change is
+		// unreadable, and each window in scope settles from storage
+		// or closes.
+		return ids, func(int) (*anyenc.Value, error) { return nil, errNoController }
 	}
 	ctrl := obj.Controller()
-	if ctrl == nil {
-		return ids, nil
-	}
 	rowIds := ids
 	if ctrl.IsShared(ch.Dataset) {
 		rowIds = make([]string, len(ids))
@@ -173,37 +384,65 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 			rowIds[i] = ch.ObjectId
 		}
 	}
-	return rowIds, func(i int) *anyenc.Value {
+	var logged bool
+	return rowIds, func(i int) (*anyenc.Value, error) {
 		if i < 0 || i >= len(rowIds) {
-			return nil
+			return nil, nil
 		}
 		rowId := rowIds[i]
 		if rowId == "" {
-			return nil
+			return nil, nil
 		}
-		return ctrl.Get(ctx, ch.Dataset, rowId)
+		v, err := ctrl.LookupStored(ctx, ch.Dataset, rowId)
+		if err != nil && !logged {
+			// One line per change: the event builder and every sub
+			// in scope read the same row.
+			logged = true
+			storeLog.Warn("post-apply row read failed; live windows settle from storage or close",
+				zap.String("objectId", ch.ObjectId), zap.String("dataset", ch.Dataset),
+				zap.String("rowId", rowId), zap.Error(err))
+		}
+		return v, err
 	}
 }
 
 // Drain scans the detached collection, re-checks each parked
 // change's pending list, and replays any that are now satisfied.
-// Idempotent — call as often as you like.
+// Idempotent — call as often as you like: passes are serialized, so
+// two callers can't both collect a row before either unparks it and
+// double-replay it (a replayed change re-tracks as unread if the user
+// read it between the deliveries).
 func (s *Store) Drain(ctx context.Context) error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	var ready []DetachedRow
 	if err := s.IterDetached(ctx, func(row DetachedRow) bool {
 		all, err := s.allPendingKnown(ctx, row.Pending)
-		if err != nil {
+		if err != nil || !all {
 			return true
 		}
-		if all {
-			ready = append(ready, row)
+		// A row parked for a dataset that is STILL not registered
+		// anywhere (removed, or its schema never arrived) can't replay
+		// yet — skip before paying the payload decode. Retried when a
+		// later defs apply refreshes the catalog. Rows from older SDKs
+		// carry no dataset and take the decode path as before.
+		if row.Dataset != "" && !s.datasetRegistered(row.Dataset) {
+			return true
 		}
+		ready = append(ready, row)
 		return true
 	}); err != nil {
 		return err
 	}
 	for _, row := range ready {
 		if err := s.replayParked(ctx, row); err != nil {
+			if treeDeleted(err) || errors.Is(err, crdt.ErrInvalidChange) {
+				// The object is gone for good, or the change itself is
+				// malformed: it can never apply. The purge removes the
+				// rows of a deleted object too — this covers a row it
+				// did not reach.
+				_ = s.Unpark(ctx, row.ChangeId)
+			}
 			// Don't surface — keep draining the rest. A stuck row
 			// will be retried on the next drain pass.
 			continue
@@ -247,6 +486,20 @@ func (s *Store) replayParked(ctx context.Context, row DetachedRow) error {
 	obj, err := s.Get(ctx, row.ObjectId)
 	if err != nil {
 		return fmt.Errorf("drain: get %s: %w", row.ObjectId, err)
+	}
+	// A row parked for a then-unknown (or since-evolved) dataset may
+	// target a controller built before the schema arrived. Evict and
+	// reload so the rebuild picks the current catalog snapshot up
+	// through buildRegs. Runs on the drainer goroutine, off apply
+	// locks — eviction is safe here.
+	if s.controllerStaleFor(obj.Controller(), decoded.Dataset) {
+		if _, known := s.catalog.lookup(decoded.Dataset); !known && !obj.Controller().HasDataset(decoded.Dataset) {
+			return fmt.Errorf("drain: dataset %q still unknown for %s", decoded.Dataset, row.ChangeId)
+		}
+		s.Drop(row.ObjectId)
+		if obj, err = s.Get(ctx, row.ObjectId); err != nil {
+			return fmt.Errorf("drain: reload %s: %w", row.ObjectId, err)
+		}
 	}
 	return obj.ApplyDecoded(ctx, decoded)
 }

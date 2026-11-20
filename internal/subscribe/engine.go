@@ -35,15 +35,51 @@ type SubConfig struct {
 	Filter      query.Filter // already ANDed with `_deletedAt missing`
 	Sort        query.Sort   // required when Limit > 0
 	Limit       int          // 0 = unbounded; no sentinel, no fast-reject
+	Offset      int          // rows the snapshot skipped; a window past offset 0 never starts complete
 	MailboxCap  int          // 0 → defaultMailboxCap; clamped to >= minMailboxCap
 	DriftBudget int          // percent of limit; 0 → defaultDriftBudgetPercent; ignored when Limit == 0
+	// Refill opens a re-read of the sub's rows under engine.mu (the
+	// snapshot's contract). nil disables refills: departures count
+	// toward the drift budget and an unreadable row closes the sub.
+	Refill RefillFn
+}
+
+// RefillFn opens one read of the sub's rows. source is Event.Source of
+// the apply behind the refill (nil for a notification; the rebuilt
+// object behind Resync). The engine closes the read. Storage not final:
+// return an error wrapping ErrRefillDeferred.
+type RefillFn func(source any) (RefillRead, error)
+
+// ErrRefillDeferred marks a read of rows an object is rebuilding: the
+// engine counts nothing and re-reads the window at Resync.
+var ErrRefillDeferred = errors.New("subscribe: refill deferred: storage is not final")
+
+// RefillRead is one read a refill reconciles the held set from, in a
+// single transaction so its rows and lookups agree.
+type RefillRead struct {
+	// Rows yields the sub's query in order, as the snapshot did.
+	Rows func(yield func(id string, doc *anyenc.Value)) error
+	// Lookup reads one row by id, ignoring the query: nil when absent, a
+	// tombstone or out of scope. A nil Lookup leaves a dropped row
+	// displaced.
+	Lookup func(id string) (*anyenc.Value, error)
+	// Close ends the read.
+	Close func()
 }
 
 // SnapshotFn is the caller-supplied populator. It runs UNDER engine.mu
 // (held by Subscribe), so apply events fired during the read block
 // waiting on engine.mu and process after the new sub is registered.
-// The callback yields each result row's (id, post-doc) to the engine,
-// which extracts the sort tuple via cfg.Sort and inserts the entry.
+// The callback yields every row its read returns, in sort order, as
+// (id, post-doc); the engine extracts the sort tuple via cfg.Sort and
+// inserts the entry, skipping a row with no doc or id. A windowed sub
+// that then holds at most Limit rows holds every match: the read asked
+// for Limit+1.
+//
+// The callback must only read already-materialised rows. Anything that
+// can apply a change — loading an object (its replay runs OnApply),
+// writing to the DAG — needs engine.mu itself and deadlocks the engine.
+// Resolve objects before calling Subscribe.
 type SnapshotFn func(yield func(id string, doc *anyenc.Value)) error
 
 // ErrEngineClosed is returned by Subscribe after Close.
@@ -93,7 +129,10 @@ func (e *Engine) HasSubscribers() bool {
 // Subscribe registers a new querySub. The snapshot callback runs
 // under engine.mu so the apply path is fenced between the snapshot
 // read and the sub's registration — no events are missed and no
-// events fire against an unregistered sub.
+// events fire against an unregistered sub. The sub counts from before
+// its snapshot: the apply path gates on HasSubscribers without the
+// lock, and an apply that commits during the read must build its
+// event and queue on the fence rather than skip the engine.
 //
 // Returns space.ErrSubscribeUnsupported when the engine is closed.
 // Returns ErrLimitWithoutSort when cfg.Limit > 0 and cfg.Sort is nil.
@@ -118,31 +157,40 @@ func (e *Engine) Subscribe(cfg SubConfig, snapshot SnapshotFn) (*Sub, error) {
 		return nil, ErrEngineClosed
 	}
 
+	e.counter.Add(1)
 	sub := newSub(cfg)
-	if err := snapshot(func(id string, doc *anyenc.Value) {
-		sub.appendInitial(id, doc)
-	}); err != nil {
+	if err := snapshot(sub.appendInitial); err != nil {
+		e.counter.Add(-1)
 		return nil, err
 	}
-	sub.initialHeld = len(sub.entries)
 	if cfg.Limit > 0 {
-		sub.driftBudgetAbs = (cfg.Limit * cfg.DriftBudget) / 100
-		if sub.driftBudgetAbs < 1 {
-			sub.driftBudgetAbs = 1 // at least one loss triggers when limit*budget rounds to 0
-		}
+		// The snapshot reads limit+1 rows; holding fewer means nothing
+		// lies past the window's edge.
+		sub.complete = cfg.Offset == 0 && len(sub.entries) <= cfg.Limit
+		sub.lostLimit = lossLimit(cfg.Limit, cfg.DriftBudget)
 	}
 
 	sub.id = e.nextId.Add(1)
 	sub.engine = e
 	e.subs[sub.id] = sub
 	e.scope.add(sub)
-	e.counter.Add(1)
 	return &Sub{querySub: sub}, nil
 }
+
+// errNoPostValue is the read error of a change that came with no
+// post-apply lookup: every live record of it is unreadable.
+var errNoPostValue = errors.New("subscribe: change carries no post-apply lookup")
+
+// noPostValue stands in for a nil PostValueFn. A deleted record never
+// reads its post value; any other record of the change is unreadable,
+// and each sub in scope settles from storage or closes.
+func noPostValue(int) (*anyenc.Value, error) { return nil, errNoPostValue }
 
 // OnApply is the apply-path hook. afterApply calls this with the same
 // Event built once for the dispatcher, plus the PostValueFn that
 // lets the engine evaluate filter / sort against the post-apply doc.
+// A nil postValue serves an event of deleted records only; for any
+// other record it reads as an error.
 //
 // Cheap when there are no subs (HasSubscribers check returns false
 // before this is even invoked by the caller). When subs exist, takes
@@ -155,9 +203,7 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 		return
 	}
 	if postValue == nil {
-		// Apply path couldn't provide a post-apply lookup (rare; see
-		// gate.go.postValueFor). No filter / sort eval possible — skip.
-		return
+		postValue = noPostValue
 	}
 
 	e.mu.Lock()
@@ -173,9 +219,112 @@ func (e *Engine) OnApply(ev Event, postValue PostValueFn) {
 		}
 		sub.apply(ev, postValue)
 	}
+	// A sub closed later must not stay reachable through the scratch
+	// until a fan-out of the same size overwrites its slot.
+	clear(e.scratch)
 }
 
-// closeSub removes a sub from the engine. Called via Sub.Close.
+// Resync re-reads the windows an object's rebuild may have left behind:
+// every window on objectId (one that cannot re-read closes), and every
+// shared window that was deferred or holds the object's row, the latter
+// by one lookup when the window is unbounded or past an offset.
+func (e *Engine) Resync(objectId string, source any) {
+	if e.closed.Load() || e.counter.Load() == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, perDs := range e.scope.perObj[objectId] {
+		for _, s := range perDs {
+			if !s.closed {
+				s.resync(source)
+			}
+		}
+	}
+	for _, s := range e.scope.shared {
+		switch {
+		case s.closed:
+		case !s.canRefill() || (!s.deferred && !s.windowed()):
+			if s.entries[objectId] != nil {
+				s.resettleRow(objectId, nil)
+			}
+		case s.deferred || s.entries[objectId] != nil:
+			s.resync(nil)
+		}
+	}
+}
+
+// NotifyDeleted emits a synthetic delete event for objectId in the
+// given dataset scope, so live subscriptions drop the row and report
+// RemoveDeleted — without an underlying CRDT apply.
+//
+// The delete-callback path (spaceobjects.Store.DeleteTree, fired when
+// any-sync catches a settings-tree deletion) uses this: it removes the
+// materialized row directly, device-local, instead of writing a CRDT
+// tombstone into the tree that is being reclaimed. There is no
+// post-value lookup: a deleted record carries no post-apply doc, and
+// applyRecord never reads one for a Deleted record.
+//
+// The emitted SubscriptionEvent carries an empty VersionId (there is no
+// underlying DAG change to draw an orderId from). A Removed{RemoveDeleted}
+// therefore cannot be version-fenced — consumers must not drop a Removed
+// via the VersionId replay fence; act on it directly.
+func (e *Engine) NotifyDeleted(spaceId, dataset, objectId string) {
+	e.OnApply(Event{
+		SpaceId:  spaceId,
+		Dataset:  dataset,
+		ObjectId: objectId,
+		Records:  []EventRecord{{Id: objectId, Deleted: true}},
+	}, nil)
+}
+
+// NotifyRecordsDeleted emits a synthetic delete for records ids of
+// (objectId, dataset): the rows a purge removed from a shared dataset's
+// collection. Like NotifyDeleted, the event carries no VersionId.
+func (e *Engine) NotifyRecordsDeleted(spaceId, dataset, objectId string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	records := make([]EventRecord, len(ids))
+	for i, id := range ids {
+		records[i] = EventRecord{Id: id, Deleted: true}
+	}
+	e.OnApply(Event{
+		SpaceId:  spaceId,
+		Dataset:  dataset,
+		ObjectId: objectId,
+		Records:  records,
+	}, nil)
+}
+
+// CloseObject closes every per-object subscription on objectId, across
+// its datasets, with reason as the close error: the object was purged,
+// so nothing will ever reach those subscriptions again. Runs after
+// NotifyDeleted, so a Removed batch precedes the close. Shared and
+// per-dataset subscriptions are untouched. The held set goes now;
+// like an overflow close, the sub stays registered until the
+// consumer's Close releases it. reason must be a plain sentinel (the
+// close reason is an atomic value of one concrete type).
+func (e *Engine) CloseObject(objectId string, reason error) {
+	if e.closed.Load() || e.counter.Load() == 0 {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, perDs := range e.scope.perObj[objectId] {
+		for _, s := range perDs {
+			if s.closed {
+				continue
+			}
+			s.closeWith(reason)
+			s.release()
+		}
+	}
+}
+
+// closeSub removes a sub from the engine and releases its held set;
+// the consumer's Sub handle keeps only the mailbox. Called via
+// Sub.Close.
 func (e *Engine) closeSub(s *querySub) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -186,6 +335,7 @@ func (e *Engine) closeSub(s *querySub) {
 		s.closed = true
 		_ = s.mb.Close()
 	}
+	s.release()
 	delete(e.subs, s.id)
 	e.scope.remove(s)
 	e.counter.Add(-1)
@@ -203,6 +353,7 @@ func (e *Engine) Close() error {
 			s.closed = true
 			_ = s.mb.Close()
 		}
+		s.release()
 	}
 	e.subs = map[uint64]*querySub{}
 	e.scope = newScopeIndex()
@@ -222,9 +373,10 @@ type Sub struct {
 // delivery or WaitOne for single events.
 func (s *Sub) Events() *mb.MB[space.SubscriptionEvent] { return s.mb }
 
-// Err returns the close reason — nil while live or after user Close,
-// space.ErrSubscriptionOverflow on mailbox overflow,
-// space.ErrSubscriptionDrifted on drift-budget exceeded.
+// Err returns the close reason: nil while live or after Close,
+// space.ErrSubscriptionOverflow, space.ErrSubscriptionDrifted (drift
+// budget spent, a row that could not be settled, a failed re-read), or
+// space.ErrObjectDeleted (CloseObject).
 func (s *Sub) Err() error {
 	if v, ok := s.err.Load().(error); ok {
 		return v

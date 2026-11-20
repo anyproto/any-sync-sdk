@@ -1,6 +1,7 @@
 package spaceimpl
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
@@ -13,18 +14,29 @@ import (
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-sync/commonspace/acl/aclwaiter"
+	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treechangeproto"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
 	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
+	"github.com/anyproto/any-sync-sdk/internal/files/status"
+	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
+	"github.com/anyproto/any-sync-sdk/internal/files/upload"
 	"github.com/anyproto/any-sync-sdk/internal/inbox"
 	"github.com/anyproto/any-sync-sdk/internal/object"
+	"github.com/anyproto/any-sync-sdk/internal/readsync"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -33,24 +45,24 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
+var storeLog = logger.NewNamed("sdk.spacestore")
+
 // normalizeSpaceType applies the SpaceType allow-list before
 // stamping the value into an immutable space header. The
-// any-sync-coordinator rejects anything outside this set with
+// any-sync-coordinator rejects anything outside its allow-list with
 // "unknown space type: <value>", causing periodic headsync to fail
 // forever — and since the type is content-addressable into the
 // header, you can't fix the space after the fact. Catch it here.
 //
-// Empty defaults to SpaceTypeRegular, mirroring anytype-heart and
-// matching the coordinator's "" → SpaceTypeRegular treatment.
+// The SDK mints only any.space; empty means the same. 1-1 spaces are
+// derived, never created, so their type is not accepted here.
 func normalizeSpaceType(t string) (string, error) {
 	switch t {
-	case "":
-		return space.SpaceTypeRegular, nil
-	case space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne:
-		return t, nil
+	case "", space.SpaceTypeAny:
+		return space.SpaceTypeAny, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: unsupported SpaceType %q (allowed: %s, %s, %s)",
-			t, space.SpaceTypeRegular, space.SpaceTypeChat, space.SpaceTypeOneToOne)
+		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s or empty)",
+			space.ErrBadSpaceType, t, space.SpaceTypeAny)
 	}
 }
 
@@ -85,14 +97,49 @@ type Service struct {
 	indexer space.Indexer
 	db      anystore.DB
 
-	// extTypes carry through to every per-space Store created by
-	// storeFor — each type's handlers are applied alongside the
-	// built-in catalog.
-	extTypes []handler.Type
+	// readSyncSvc is the SDK-level read-state sync service, injected
+	// by sdk.Open after construction (it needs the tech space open).
+	// Guarded by readSyncMu; nil until SetReadSync.
+	readSyncMu  sync.RWMutex
+	readSyncSvc *readsync.Service
+
+	// extTypes and modules carry through to every per-space Store
+	// created by storeFor — each type's handlers and each module's
+	// canonical collection are applied alongside the built-in catalog.
+	extTypes       []handler.Type
+	extCollections []handler.Collection
+	modules        []handler.Module
+
+	// files/fetch/fstore/fqueue are the SDK-level byte-layer services
+	// behind every space's Files() surface. Set once by SetFiles right
+	// after construction (sdk.Open); nil only in tests that never
+	// touch files.
+	files  *upload.Service
+	fetch  *fetch.Service
+	fstore *filestore.Store
+	fqueue *status.Queue
+
+	// fileStatusSubs fans queue transitions + local attach events out
+	// to per-space Files().SubscribeStatus callbacks.
+	fileStatusSubs fileSubs
 
 	mu     sync.Mutex
 	stores map[string]*spaceobjects.Store
 	allocs map[string]*object.VersionAllocator
+	// gapSets holds each space's apply-gap set across store rebuilds
+	// (an evict and reload keeps it); an offload drops it.
+	gapSets map[string]*spaceobjects.GapSet
+	// building holds the done channel of each store build in flight
+	// (storeOnce), closed when the build ends: the store is published,
+	// or the build panicked (runBuild).
+	building map[string]chan struct{}
+	// techSpace is the restricted handle over the tech space, built on
+	// first Get(techSpaceId). One instance per process: its bundles
+	// API holds per-id install locks.
+	techSpace *techSpace
+	// derivations holds the request behind every space id DeriveId or
+	// Derive computed in this process. Get builds missing storage from it.
+	derivations map[string]space.DeriveRequest
 
 	// spaceIndexIds caches the deterministic spaceIndex object id per
 	// spaceId so SetMetadata / Info-side reads don't re-derive on every
@@ -104,6 +151,12 @@ type Service struct {
 	// and forwards converged state into the Indexer. Lifetime: until
 	// SDK.Close (mirrors the members-watcher sticky lifecycle).
 	spaceIndexWatchers map[string]*spaceIndexWatcher
+	// oneToOneKeyWatchers holds one identity-key watcher per loaded
+	// one-to-one spaceId (onetoone_keys.go).
+	oneToOneKeyWatchers map[string]*oneToOneKeysWatcher
+	// oneToOnePublishing holds the spaceIds with an identity-key
+	// publish in flight (one per space at a time).
+	oneToOnePublishing map[string]struct{}
 	// accountMirrors holds one account-values mirror per loaded
 	// spaceId — the tech-space → target-space apply side of
 	// account-scoped values (see accountmirror.go).
@@ -118,15 +171,27 @@ type Service struct {
 	// spaceId so all handles for one space share a single watcher.
 	memberWatchers map[string]*memberWatcher
 
+	// aclMirrorWatchers holds one ACL mirror per loaded spaceId
+	// (see aclmirror_watcher.go) — ACL state → the tech-space row's
+	// `push` + `ownRole` fields. Same sticky Service-level-singleton
+	// lifecycle as the watchers above.
+	aclMirrorWatchers map[string]*aclMirrorWatcher
+
+	// aclMuxes fans each space's single syncacl AclUpdater slot out to
+	// its subscribers (member + ACL mirror watchers) — see aclkick.go.
+	aclMuxes map[string]*aclKickMux
+
 	// watchers tracks every active members poller across all loaded
 	// spaceImpls so SDK shutdown can drain them deterministically.
 	watchers watcherRegistry
 
-	// seedWG / seedCtx track the fire-and-forget spaceIndex lazy-seed
-	// goroutines (goSeed). Close cancels seedCtx and waits on seedWG so
-	// no background seed is still touching the store / tech space when
-	// the SDK tears them down. closing (under mu) stops new seeds from
-	// being spawned during shutdown.
+	// seedWG / seedCtx track the fire-and-forget background goroutines
+	// the service owns: the spaceIndex lazy-seeds (goSeed) and the boot
+	// identity-profile resolve (ResolveIdentityProfilesAsync). Close
+	// cancels seedCtx and waits on seedWG so no background work is
+	// still touching the store / tech space when the SDK tears them
+	// down. closing (under mu) stops new work from being spawned
+	// during shutdown.
 	seedWG     sync.WaitGroup
 	seedCtx    context.Context
 	seedCancel context.CancelFunc
@@ -136,31 +201,57 @@ type Service struct {
 	// spaces to the coordinator (signed SpaceDelete) and offloads spaces
 	// the coordinator reports gone. delKick wakes it immediately after a
 	// local Delete; otherwise it ticks on deletionReconcileInterval.
+	// Started by StartDeletionReconciler once the tech space is open;
 	// delCancel/delWG are drained in Close before watchers.stopAll.
 	delCancel context.CancelFunc
 	delWG     sync.WaitGroup
 	delKick   chan struct{}
 
 	// Join controller: a background loop that drives joiner-side
-	// post-acceptance loading. For each tech-space row with
-	// localStatus="joining" it runs an any-sync ACL waiter; on
-	// acceptance it loads the space and flips the row to active, on
-	// decline it marks it deleted. joinKick wakes it immediately after
-	// a local Join; otherwise it ticks on joinReconcileInterval.
-	// joinWaiters holds the live waiter per spaceId (guarded by mu),
-	// like memberWatchers. joinCancel/joinWG are drained in Close.
+	// post-acceptance loading. For each tech-space row that reads
+	// StatusJoining it runs an any-sync ACL waiter; on acceptance it
+	// loads the space and flips the row to active, on decline it marks
+	// it ended. joinKick wakes it immediately after a local Join /
+	// CancelJoin and on every tech-space index change (a joining row
+	// synced in from another device); otherwise it ticks on
+	// joinReconcileInterval. joinWaiters holds the live waiter per
+	// spaceId (guarded by mu), like memberWatchers; joinProbes is the
+	// per-row throttle on chain probes a kick-driven pass may run.
+	// joinCtx is the loop's context, shared by the background loads it
+	// spawns from other goroutines; joinCancel/joinWG are drained in
+	// Close.
+	joinCtx     context.Context
 	joinCancel  context.CancelFunc
 	joinWG      sync.WaitGroup
 	joinKick    chan struct{}
-	joinWaiters map[string]aclwaiter.AclWaiter
+	joinWaiters map[string]*joinWaiter
+	joinProbes  map[string]time.Time
 
-	// One-to-one inbox (Layer-2 discovery, docs/13). inboxNotifier is the
+	// pendingLoads dedups the join controller's background load
+	// goroutines per spaceId (guarded by mu): the accepted-invite /
+	// guest pull-until-available loads (no ACL waiter — the account or
+	// the shared guest identity is already a member) and the accepted
+	// join loads.
+	pendingLoads map[string]struct{}
+
+	// pushKeys caches the per-space derived push-notification keys —
+	// see push.go (PushKeys).
+	pushKeys pushKeyCache
+
+	// onSpaceBorn, when set, is called with the space id after every
+	// successful Create/Derive. The SDK marks such spaces clean for the
+	// close-time watermark snapshot: the author device materializes its
+	// own writes by definition. Guarded by mu; set once from sdk.Open.
+	onSpaceBorn func(spaceId string)
+
+	// One-to-one inbox (Layer-2 discovery, docs/one-to-one-spaces.md). inboxNotifier is the
 	// receive worker (coordinator push + poll → RegisterIncoming); the
 	// invite* fields drive the send-retry loop that (re)delivers
 	// initiated-1-1 notifications. Wired and started by StartOneToOneInbox
 	// (from sdk.Open, after the tech space opens); drained in Close. Nil /
 	// inert when the inbox transport is unavailable.
 	inboxNotifier *inbox.Notifier
+	inviteCtx     context.Context
 	inviteCancel  context.CancelFunc
 	inviteWG      sync.WaitGroup
 	inviteKick    chan struct{}
@@ -173,26 +264,36 @@ type Service struct {
 // the seam through which the tech-space mirrors converged in-space
 // spaceIndex state into its rows; usually tsp itself (which
 // satisfies space.Indexer).
-func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type) *Service {
+func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db anystore.DB, extTypes []handler.Type, extCollections []handler.Collection, modules []handler.Module) *Service {
 	s := &Service{
-		app:                app,
-		tsp:                tsp,
-		indexer:            indexer,
-		db:                 db,
-		extTypes:           extTypes,
-		stores:             make(map[string]*spaceobjects.Store),
-		allocs:             make(map[string]*object.VersionAllocator),
-		spaceIndexIds:      make(map[string]string),
-		spaceIndexWatchers: make(map[string]*spaceIndexWatcher),
-		accountMirrors:     make(map[string]*accountMirror),
-		memberWatchers:     make(map[string]*memberWatcher),
-		delKick:            make(chan struct{}, 1),
-		joinKick:           make(chan struct{}, 1),
-		joinWaiters:        make(map[string]aclwaiter.AclWaiter),
-		inviteKick:         make(chan struct{}, 1),
+		app:                 app,
+		tsp:                 tsp,
+		indexer:             indexer,
+		db:                  db,
+		extTypes:            extTypes,
+		extCollections:      extCollections,
+		modules:             modules,
+		stores:              make(map[string]*spaceobjects.Store),
+		allocs:              make(map[string]*object.VersionAllocator),
+		gapSets:             make(map[string]*spaceobjects.GapSet),
+		building:            make(map[string]chan struct{}),
+		derivations:         make(map[string]space.DeriveRequest),
+		spaceIndexIds:       make(map[string]string),
+		spaceIndexWatchers:  make(map[string]*spaceIndexWatcher),
+		oneToOneKeyWatchers: make(map[string]*oneToOneKeysWatcher),
+		oneToOnePublishing:  make(map[string]struct{}),
+		accountMirrors:      make(map[string]*accountMirror),
+		memberWatchers:      make(map[string]*memberWatcher),
+		aclMirrorWatchers:   make(map[string]*aclMirrorWatcher),
+		aclMuxes:            make(map[string]*aclKickMux),
+		delKick:             make(chan struct{}, 1),
+		joinKick:            make(chan struct{}, 1),
+		joinWaiters:         make(map[string]*joinWaiter),
+		joinProbes:          make(map[string]time.Time),
+		pendingLoads:        make(map[string]struct{}),
+		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
-	s.startDeletionReconciler()
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
@@ -208,9 +309,37 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 			}
 			return store.RegularObjectCount(context.Background())
 		})
+		ss.SetHasTreeFn(s.hasLiveTree)
 	}
 	return s
 }
+
+// hasLiveTree reports whether this device stores treeId's content in
+// spaceId (Store.HoldsTree). It backs a context-free status read, so it
+// never loads a space: a space with no store yet, or not loaded, holds
+// no tree it can vouch for.
+func (s *Service) hasLiveTree(spaceId, treeId string) bool {
+	var store *spaceobjects.Store
+	if s.tsp != nil && spaceId == s.tsp.SpaceId() {
+		store = s.tsp.Store()
+	} else {
+		store = s.peekStore(spaceId)
+	}
+	if store == nil {
+		return false
+	}
+	return store.HoldsTree(context.Background(), treeId)
+}
+
+// SetFiles wires the SDK-level files byte-layer services. Called once
+// from sdk.Open before any Space handle is handed out.
+func (s *Service) SetFiles(up *upload.Service, fe *fetch.Service, st *filestore.Store, q *status.Queue) {
+	s.files, s.fetch, s.fstore, s.fqueue = up, fe, st, q
+}
+
+// filesStore returns the local payload store (nil-safe accessor for
+// the Files surface).
+func (s *Service) filesStore() *filestore.Store { return s.fstore }
 
 // storeFor returns the per-space spaceobjects.Store, building it on
 // first access. The allocator is also lazily created and shared
@@ -218,19 +347,170 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 // drain of the per-space _detached collection — picks up any
 // changes whose missing shortIds landed during a previous session.
 func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
-	s.mu.Lock()
-	if st, ok := s.stores[spaceId]; ok {
+	return s.storeOnce(spaceId, s.buildStore)
+}
+
+// storeOnce returns spaceId's Store, running build once on first
+// access. The build does DB work (the store constructor opens the
+// read-state collections, the applySeq backfill writes), so it runs
+// outside s.mu: one builder per space, callers for the same space
+// wait on its done channel (building), every other s.mu user
+// proceeds. The two teardown paths wait for a build in flight:
+// takeSpaceRuntime (awaitBuildLocked) before it acts on the map, so
+// an offload closes the store a build publishes; closeStores
+// (waitStoreBuilds) after its pass, so the builds in flight finish
+// their db work before Close returns. A store published while the
+// service is closing is closed before anyone sees it, with no
+// background work started: a sync message during app teardown
+// (callers dereference the result).
+func (s *Service) storeOnce(spaceId string, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
+	for {
+		s.mu.Lock()
+		if st, ok := s.stores[spaceId]; ok {
+			s.mu.Unlock()
+			return st
+		}
+		if done, ok := s.building[spaceId]; ok {
+			s.mu.Unlock()
+			<-done
+			continue
+		}
+		done := make(chan struct{})
+		s.building[spaceId] = done
+		closing := s.closing
 		s.mu.Unlock()
+
+		st := s.runBuild(spaceId, done, closing, build)
+
+		s.mu.Lock()
+		closed := s.closing
+		if closed {
+			// Only idle goroutines run on the store, so this is quick;
+			// waiters get it closed. Store.Close is idempotent for
+			// closeStores' own pass.
+			_ = st.Close()
+		}
+		s.stores[spaceId] = st
+		delete(s.building, spaceId)
+		close(done)
+		s.mu.Unlock()
+		if closed {
+			return st
+		}
+		// Converge any pending re-index in the background instead of waiting
+		// for every object to be opened (spaceobjects/reindex.go). No-op when
+		// no handler version changed.
+		st.StartReindexSweep()
+		// Shared datasets' declared indexes missing from a previous run.
+		st.StartIndexSync()
+		// Kick the drainer once so prior-session parked rows whose
+		// dependencies have since landed get picked up on first touch.
+		st.NotifyDrainer(types.DataVersionPair{})
 		return st
 	}
-	alloc := object.NewVersionAllocator("")
-	s.allocs[spaceId] = alloc
-	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes)
-	s.stores[spaceId] = st
+}
+
+// runBuild runs build for spaceId. A panicking build drops its
+// building entry and closes done, so its waiters rebuild instead of
+// waiting forever; the panic propagates to the builder's caller.
+func (s *Service) runBuild(spaceId string, done chan struct{}, closing bool, build func(spaceId string, closing bool) *spaceobjects.Store) *spaceobjects.Store {
+	built := false
+	defer func() {
+		if built {
+			return
+		}
+		s.mu.Lock()
+		delete(s.building, spaceId)
+		close(done)
+		s.mu.Unlock()
+	}()
+	st := build(spaceId, closing)
+	built = true
+	return st
+}
+
+// waitStoreBuilds blocks until every store build in flight at the call
+// has ended (published, or panicked). Builds that start later are not
+// covered.
+func (s *Service) waitStoreBuilds() {
+	s.mu.Lock()
+	building := make([]chan struct{}, 0, len(s.building))
+	for _, done := range s.building {
+		building = append(building, done)
+	}
 	s.mu.Unlock()
-	// Kick the drainer once so prior-session parked rows whose
-	// dependencies have since landed get picked up on first touch.
-	st.NotifyDrainer(types.DataVersionPair{})
+	for _, done := range building {
+		<-done
+	}
+}
+
+// awaitBuildLocked returns once no build of spaceId's store is in
+// flight. Called and returns with s.mu held; the lock is dropped while
+// waiting.
+func (s *Service) awaitBuildLocked(spaceId string) {
+	for {
+		done, ok := s.building[spaceId]
+		if !ok {
+			return
+		}
+		s.mu.Unlock()
+		<-done
+		s.mu.Lock()
+	}
+}
+
+// buildStore constructs spaceId's Store and primes it. Runs outside
+// s.mu (storeOnce). closing hands back the store with only the global
+// gate set; storeOnce closes it on publish.
+func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
+	alloc := object.NewVersionAllocator("")
+	s.mu.Lock()
+	s.allocs[spaceId] = alloc
+	s.mu.Unlock()
+	st := spaceobjects.NewStore(s.app, s.db, s.app.AccountKeys().SignKey, spaceId, alloc, s.extTypes, s.extCollections, s.modules)
+	st.SetGapSet(s.gapSetFor(spaceId))
+	// Account-wide gate: once the tech space carries a CRDT version
+	// above this SDK's, every synced write fails with
+	// space.ErrCRDTVersionNewer (techspace.Service.WriteGate).
+	st.SetGlobalGate(s.tsp.WriteGate)
+	if closing {
+		return st
+	}
+	// Read-only gate on every user-authored synced write
+	// (Object.LocalWrite, Store.Create). Guest-mode is fixed for the
+	// store's lifetime — a key refresh tears the runtime down — so it
+	// seeds once here; ACL role changes (reader) are maintained
+	// event-driven by the per-space ACL mirror (mirrorWriteGate).
+	if rec, ok := s.tsp.Get(context.Background(), spaceId); ok && rec.GuestKey != "" {
+		st.SetWriteGateErr(space.ErrReadOnlySpace)
+	}
+	// A purged object's file leftovers (index entries, live file
+	// queries) clear with it.
+	st.SetPurgeHook(func(ctx context.Context, objectId string) {
+		s.purgeFileLeftovers(ctx, spaceId, st, objectId)
+	})
+	// Resolve the read-sync service lazily: stores can be created
+	// before sdk.Open injects it, and untracked spaces never call it.
+	st.SetSeedHeadsProvider(func(ctx context.Context, objectId string) ([][]string, error) {
+		rs := s.readSync()
+		if rs == nil {
+			return nil, nil
+		}
+		return rs.PublishedFrontiers(ctx, spaceId, objectId)
+	})
+	// Drain the one-off applySeq backfill BEFORE publishing the store, so
+	// no apply or consumer read ever triggers the backfill's WriteTx from
+	// inside the applySeqMeta sync.Once. That lazy path otherwise
+	// lock-order-inverts against any-store's write mutex (an apply holds
+	// writeMu then wants the Once; a concurrent ChangedObjects holds the
+	// Once then wants writeMu) and deadlocks. storeOnce runs one build
+	// per space and its caller never holds the write mutex, so forcing
+	// the backfill here is the safe, race-free place. Best-effort: a
+	// transient error is cached by the Once and resurfaces on the next
+	// feed read.
+	if err := st.EnsureApplySeq(context.Background()); err != nil {
+		storeLog.Warn("eager applySeq seed failed", zap.String("spaceId", spaceId), zap.Error(err))
+	}
 	return st
 }
 
@@ -239,6 +519,78 @@ func (s *Service) storeFor(spaceId string) *spaceobjects.Store {
 // spacesync catch-up driver invoked from SDK.Open) that need the
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
+
+// ApplyGapCount is the number of spaceId's objects with a stored
+// change that may be unapplied (spaceobjects.GapSet), 0 for a space
+// never loaded this session.
+func (s *Service) ApplyGapCount(spaceId string) int {
+	s.mu.Lock()
+	g := s.gapSets[spaceId]
+	s.mu.Unlock()
+	if g == nil {
+		return 0
+	}
+	return g.Count()
+}
+
+// gapSetFor returns spaceId's gap set, creating it on first use.
+func (s *Service) gapSetFor(spaceId string) *spaceobjects.GapSet {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	g, ok := s.gapSets[spaceId]
+	if !ok {
+		g = spaceobjects.NewGapSet()
+		s.gapSets[spaceId] = g
+	}
+	return g
+}
+
+// dropGapSet forgets spaceId's gap set: the space's state is gone.
+func (s *Service) dropGapSet(spaceId string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.gapSets, spaceId)
+}
+
+// peekStore returns spaceId's Store only if already built — never
+// constructs. Used by watchers that must not create runtime state.
+func (s *Service) peekStore(spaceId string) *spaceobjects.Store {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stores[spaceId]
+}
+
+// SetOnSpaceBorn registers the successful-Create/Derive hook (see the
+// onSpaceBorn field). Called once from sdk.Open.
+func (s *Service) SetOnSpaceBorn(fn func(spaceId string)) {
+	s.mu.Lock()
+	s.onSpaceBorn = fn
+	s.mu.Unlock()
+}
+
+// spaceBorn fires the onSpaceBorn hook, if any.
+func (s *Service) spaceBorn(spaceId string) {
+	s.mu.Lock()
+	fn := s.onSpaceBorn
+	s.mu.Unlock()
+	if fn != nil {
+		fn(spaceId)
+	}
+}
+
+// SetReadSync injects the SDK-level read-state sync service. Called
+// once from sdk.Open after the tech space is up.
+func (s *Service) SetReadSync(rs *readsync.Service) {
+	s.readSyncMu.Lock()
+	s.readSyncSvc = rs
+	s.readSyncMu.Unlock()
+}
+
+func (s *Service) readSync() *readsync.Service {
+	s.readSyncMu.RLock()
+	defer s.readSyncMu.RUnlock()
+	return s.readSyncSvc
+}
 
 // accountMirror returns the live account-values mirror for spaceId,
 // or nil before the space's wiring ran. Used by Properties.Set's
@@ -271,16 +623,10 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: ensureSpaceIndexWiring: %w", err)
 	}
-	derivePayload := objecttree.ObjectTreeDerivePayload{
-		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
-		SpaceId:       spaceId,
-		IsEncrypted:   true,
-	}
-	storagePayload, err := handle.Inner().TreeBuilder().DeriveTree(ctx, derivePayload)
+	objectId, err := spaceIndexTreeId(spaceId)
 	if err != nil {
-		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
+		return "", err
 	}
-	objectId := storagePayload.RootRawChange.Id
 
 	s.mu.Lock()
 	if existing, ok := s.spaceIndexIds[spaceId]; ok {
@@ -317,6 +663,27 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 		}
 	}
 
+	// One-to-one key exchange: the peer's identityKeys row → the
+	// identities directory (onetoone_keys.go). Same dedup dance; the
+	// initial pass runs inside newOneToOneKeysWatcher.
+	if store != nil && s.tsp != nil && s.isOneToOne(ctx, spaceId) {
+		s.mu.Lock()
+		_, dup := s.oneToOneKeyWatchers[spaceId]
+		s.mu.Unlock()
+		if !dup {
+			w := newOneToOneKeysWatcher(ctx, s, store, spaceId, objectId)
+			s.mu.Lock()
+			if _, raced := s.oneToOneKeyWatchers[spaceId]; raced {
+				s.mu.Unlock()
+				w.stop()
+			} else {
+				s.oneToOneKeyWatchers[spaceId] = w
+				s.watchers.register(w)
+				s.mu.Unlock()
+			}
+		}
+	}
+
 	// Account-values mirror: tech-space carrier → this space's objects
 	// rows. Same dedup dance; the initial re-mirror runs inside
 	// newAccountMirror.
@@ -338,7 +705,75 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 			}
 		}
 	}
+
+	// ACL mirror: ACL state → this space's tech-space row `push` +
+	// `ownRole` fields (aclmirror_watcher.go). Same dedup dance; the
+	// initial mirror pass is primed inside newAclMirrorWatcher.
+	// Registered on the space's ACL kick fan-out so read-key rotations
+	// and permission changes land promptly.
+	if s.tsp != nil {
+		s.mu.Lock()
+		_, dup := s.aclMirrorWatchers[spaceId]
+		s.mu.Unlock()
+		if !dup {
+			w := newAclMirrorWatcher(s, spaceId)
+			s.mu.Lock()
+			if _, raced := s.aclMirrorWatchers[spaceId]; raced {
+				s.mu.Unlock()
+				w.stop()
+			} else {
+				s.aclMirrorWatchers[spaceId] = w
+				s.watchers.register(w)
+				s.mu.Unlock()
+				var mux *aclKickMux
+				if acl := handle.Inner().Acl(); acl != nil {
+					mux = s.aclKickFanout(spaceId, acl)
+					mux.add(w)
+					// Close the wiring gap: the primed mirror pass may
+					// already have read ACL state BEFORE the mux
+					// subscription above — an ACL record applied in that
+					// window produced no kick, and on a quiet space
+					// nothing else ever would. One post-subscribe kick
+					// re-mirrors from current state; coalescing makes it
+					// free when the primed pass hasn't run yet.
+					w.kick()
+				}
+				// Re-check against a concurrent offload: closeSpaceRuntime
+				// stops watchers and clears the maps under s.mu, but this
+				// wiring ran outside it — if the space was torn down
+				// meanwhile (spaceIndexIds entry gone), unwind so no live
+				// watcher survives against a closed space.
+				s.mu.Lock()
+				if _, live := s.spaceIndexIds[spaceId]; !live {
+					delete(s.aclMirrorWatchers, spaceId)
+					s.mu.Unlock()
+					if mux != nil {
+						mux.remove(w)
+					}
+					s.watchers.unregister(w)
+					w.stop()
+				} else {
+					s.mu.Unlock()
+				}
+			}
+		}
+	}
 	return objectId, nil
+}
+
+// spaceIndexTreeId is the id of spaceId's derived spaceIndex tree, a
+// pure function of the space id. An id lookup, not a creation: the
+// builder's creation rules do not apply, the pure root derivation does.
+func spaceIndexTreeId(spaceId string) (string, error) {
+	root, err := objecttree.DeriveObjectTreeRoot(objecttree.ObjectTreeDerivePayload{
+		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
+		SpaceId:       spaceId,
+		IsEncrypted:   true,
+	}, nil)
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: derive spaceIndex tree id: %w", err)
+	}
+	return root.Id, nil
 }
 
 // spaceIndexObjectIdFor returns the cached spaceIndex object id for
@@ -380,15 +815,25 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	// Reuse the tech-space's replication key so all spaces for this
 	// account land on the same coordinator shard. The tech space is
 	// derived deterministically from the account key, so its repKey
-	// is the canonical per-account value (per docs/03-space.md
+	// is the canonical per-account value (per docs/space.md
 	// § "Replication key").
+	// Owner metadata in the ACL root is the owner's metadata symkey only,
+	// so joiners learn the key and resolve the owner's profile from
+	// identityRepo (no inline name/icon on the ACL).
+	ownerMeta, err := encodeSelfSymKeyMetadata(keys.SignKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: derive metadata key: %w", err)
+	}
 	payload := spacepayloads.SpaceCreatePayload{
-		SigningKey:     keys.SignKey,
-		MasterKey:      keys.SignKey,
-		ReadKey:        readKey,
-		MetadataKey:    metadataKey,
-		SpaceType:      spaceType,
-		ReplicationKey: replicationKeyFromSpaceId(s.tsp.SpaceId()),
+		SigningKey:  keys.SignKey,
+		MasterKey:   keys.SignKey,
+		ReadKey:     readKey,
+		MetadataKey: metadataKey,
+		Metadata:    ownerMeta,
+		SpaceType:   spaceType,
+		// any.* headers are files-v2 only (coordinator-enforced).
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+		ReplicationKey:   replicationKeyFromSpaceId(s.tsp.SpaceId()),
 	}
 	spaceId, err := s.app.SpaceService().CreateSpace(ctx, payload)
 	if err != nil {
@@ -428,6 +873,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	if err := s.seedSpaceIndexOnCreate(ctx, store, spaceId, req, spaceType); err != nil {
 		return nil, fmt.Errorf("spaceimpl: seed spaceIndex: %w", err)
 	}
+	s.spaceBorn(spaceId)
 	return newSpace(spaceId, s.app, s.tsp, store, s), nil
 }
 
@@ -441,10 +887,112 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 // to receive pushed changes for an arbitrarily long stretch.
 //
 // Mirrors the eager-load that Create / Derive / OneToOne already do.
+//
+// The tech space id returns the restricted tech handle (no registry
+// row, no load, no index wiring) — see space.ErrUnsupported.
 func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) {
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
-		return nil, fmt.Errorf("spaceimpl: unknown space %q", spaceId)
+	if id := s.tsp.SpaceId(); id != "" && spaceId == id {
+		return s.techHandle(), nil
 	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return nil, fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	// Deleted rows are refused outright, mirroring the boot eager-load:
+	// the storage is offloaded (or was never created), a load would
+	// SpacePull a space the account removed, and the node rejects
+	// deleted spaces anyway. mapStatus ranks deleted above pending, so
+	// without this a deleted-elsewhere pending row would fall through
+	// the guard into a pull.
+	if rec.IsDeleted() {
+		return nil, fmt.Errorf("spaceimpl: space %q: %w", spaceId, space.ErrSpaceDeleted)
+	}
+	if err := MaterializeBlock(rec); err != nil {
+		return nil, err
+	}
+	// A 1-1 accepted (or initiated) on another of this account's devices:
+	// the synced remote=active landed while this device never processed
+	// the 1-1 itself — its localStatus is a stale pending (own inbox
+	// discovery) or empty (row synced in first). Adopt via the accept
+	// path instead of a bare load — AcceptOneToOne derives the 1-1
+	// storage locally (load would SpacePull) and stamps local=active, so
+	// acceptance stays an account-level decision made once. A local
+	// delete (localStatus=deleted) is not adopted — this device removed
+	// the space on purpose.
+	if rec.Type == space.SpaceTypeOneToOne &&
+		rec.RemoteStatus == techspace.StatusActive &&
+		(rec.LocalStatus == "" || rec.LocalStatus == oneToOnePendingLocalStatus) {
+		return s.AcceptOneToOne(ctx, spaceId)
+	}
+	// A derived space another of this account's devices created: the row
+	// synced in, the storage did not. Build it from the seed — a bare
+	// load would wait for a node to pull it from.
+	if req, ok := s.derivation(spaceId); ok && !s.app.SpaceExists(spaceId) {
+		if _, err := s.loadDerived(ctx, req); err != nil {
+			return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
+		}
+	}
+	return s.load(ctx, spaceId)
+}
+
+// techHandle returns the process-wide tech-space handle.
+func (s *Service) techHandle() *techSpace {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.techSpace == nil {
+		s.techSpace = newTechSpace(s.app, s.tsp, s)
+	}
+	return s.techSpace
+}
+
+// MaterializeBlock reports why rec must not be materialized — loaded,
+// and, when local storage is absent, pulled from the responsible nodes
+// (any-sync's NewSpace falls back to a SpacePull bootstrap on missing
+// storage) — or nil when loading is allowed. "Nothing is downloaded
+// until accepted" is the whole materialization gate: it guards every
+// pending flavor, not just direct-add invites. Every accept path flips
+// its row (or calls the unguarded load) before materializing, so
+// legitimate loads pass:
+//   - join: the ACL waiter's loadJoinedSpace uses load directly (the
+//     row stays "joining" until the load succeeds);
+//   - incoming 1-1: activateOneToOne flips both statuses to active
+//     first;
+//   - direct-add invite: AcceptInvite flips the row to active before
+//     it loads.
+//
+// Shared with sdk.Open's boot eager-load, which must skip pending rows
+// even when storage exists (a pre-guard build may have materialized
+// one; eager-loading it would run headsync/treesyncer on a space this
+// account can't read yet).
+//
+// The predicate is the mapStatus classification, not the raw fields, so
+// the guard and the surfaced Status can never disagree. In particular
+// acceptance is account-scoped: a 1-1 accepted or initiated on ANY of
+// the account's devices carries synced remote=active, which mapStatus
+// resolves as Active over a stale device-local pending — such a row
+// must load, not demand a per-device re-accept. Conversely a bare 1-1
+// row synced in before this device set any status classifies as
+// pending and blocks.
+func MaterializeBlock(rec techspace.SpaceIndexRecord) error {
+	switch mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) {
+	case space.StatusJoining:
+		return fmt.Errorf("spaceimpl: space %q join is pending owner approval: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case space.StatusOneToOnePending:
+		return fmt.Errorf("spaceimpl: space %q is an incoming 1-1; AcceptOneToOne it first: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case space.StatusOneToOneDeclined:
+		return fmt.Errorf("spaceimpl: space %q is a declined 1-1; OneToOne the peer to un-decline: %w", rec.Id, space.ErrSpaceNotAccepted)
+	case space.StatusInvitePending, space.StatusInviteDeclined:
+		return fmt.Errorf("spaceimpl: space %q is a pending direct-add invite; AcceptInvite it first: %w", rec.Id, space.ErrSpaceNotAccepted)
+	}
+	return nil
+}
+
+// load materializes spaceId unconditionally — no pending guard. Used by
+// Get after MaterializeBlock, and by the join controller's
+// post-acceptance loaders (loadJoinedSpace / loadAcceptedInvite), which
+// run while the row still carries its pending localStatus: the flip to
+// active happens only after a successful load.
+func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error) {
 	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
 		return nil, fmt.Errorf("spaceimpl: load space %q: %w", spaceId, err)
 	}
@@ -457,7 +1005,26 @@ func (s *Service) Get(ctx context.Context, spaceId string) (space.Space, error) 
 	// owner can write the initial spaceIndex properties, and non-
 	// owners skip silently (the owner's eventual write propagates).
 	s.goSeed(sp)
+	s.backfillHeaderType(ctx, spaceId)
 	return sp, nil
+}
+
+// backfillHeaderType fills the set-once tech-space row `type` from the
+// now-loaded space's on-wire header. Rows registered on join/track are
+// created before the header is readable and carry an empty type until
+// the first successful load lands here. Best-effort: a miss retries on
+// the next load, and the handler's set-once rule absorbs races.
+func (s *Service) backfillHeaderType(ctx context.Context, spaceId string) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok || rec.Type != "" {
+		return
+	}
+	ht := s.headerTypeFromHeader(ctx, spaceId)
+	if ht == "" {
+		return
+	}
+	// Failure just leaves the row unknown; the next load retries.
+	_, _ = s.tsp.SetType(ctx, spaceId, ht)
 }
 
 // SyncSpaceList forces an immediate head-sync round on the tech space
@@ -468,9 +1035,43 @@ func (s *Service) SyncSpaceList(ctx context.Context) error {
 	return s.tsp.SyncHeads(ctx)
 }
 
+// WaitListSynced blocks until the tech space completes a clean
+// head-sync round with no parked trees (same convergence test as
+// inboxReplayGuard), retrying rounds until ctx expires. SyncHeads
+// no-ops (nil) on a not-open tech space — that must read as "not
+// ready", not as a clean round. A nil round alone is NOT proof of
+// convergence — any-sync's diffsyncer swallows per-peer sync failures
+// and returns nil — so the gate also requires the tracker rollup to
+// report Synced: that flips only on HeadsApply from a responsible
+// peer, stays Syncing on a swallowed failure, and reads Offline with
+// no peers, which is exactly the "empty list because nothing was
+// fetched" case this gate must not bless.
+func (s *Service) WaitListSynced(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if s.tsp.SpaceId() != "" &&
+			s.tsp.SyncHeads(ctx) == nil &&
+			s.app.ParkedTreeCount(s.tsp.SpaceId()) == 0 &&
+			s.app.SyncStatus().Status(s.tsp.SpaceId()).State == space.SyncStateSynced {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
 // List returns the space-index snapshot.
 func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
-	rows := s.tsp.List(ctx)
+	rows, err := s.tsp.List(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]space.SpaceInfo, 0, len(rows))
 	for _, r := range rows {
 		out = append(out, s.recordToInfo(ctx, r))
@@ -483,20 +1084,106 @@ func (s *Service) List(ctx context.Context) ([]space.SpaceInfo, error) {
 // Shared by List and the Subscribe translator so both surface the same
 // shape.
 func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord) space.SpaceInfo {
+	// The header/ACL peeks below never *trigger* a load (PickSpace),
+	// but ocache's Pick waits on a load already in flight — and rows
+	// with an empty type are exactly the mid-pull ones. Bound the
+	// peeks so a stuck pull can't stall List or the Subscribe
+	// translator; a timed-out peek just reports the row as-is.
+	peekCtx, cancelPeek := context.WithTimeout(ctx, time.Second)
+	defer cancelPeek()
+	// A 1-1 space's ACL "owner" is a synthetic shared key nobody holds
+	// (see docs/one-to-one-spaces.md), so resolveAuthor returns nothing meaningful. The
+	// useful value is the other participant's account identity, recorded
+	// on the row as OneToOnePeer; surface it as Author so clients can tell
+	// who a 1-1 is with — and resolve their profile — straight from
+	// List/Subscribe, without loading or even materializing the space.
+	author := r.OneToOnePeer
+	if r.Type != space.SpaceTypeOneToOne {
+		author = s.resolveAuthor(peekCtx, r.Id)
+	}
+	// An empty row type (joined/tracked space not yet loaded on any
+	// device) falls back to the header when the space happens to be
+	// resident; the durable backfill happens in load.
+	typ := r.Type
+	if typ == "" {
+		typ = s.headerTypeFromHeader(peekCtx, r.Id)
+	}
 	info := space.SpaceInfo{
-		Id:          r.Id,
-		Type:        r.Type,
-		SpaceType:   s.resolveSpaceType(ctx, r.Id, r.SpaceType),
-		Author:      s.resolveAuthor(ctx, r.Id),
-		Name:        r.Name,
-		Description: r.Description,
-		IconCID:     r.IconCID,
-		Status:      mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		Id:           r.Id,
+		Type:         typ,
+		SpaceType:    s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
+		Author:       author,
+		Name:         r.Name,
+		Description:  r.Description,
+		IconCID:      r.IconCID,
+		Status:       mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		OwnRole:      r.OwnRole,
+		Settings:     r.Settings,
+		PushKeys:     r.PushKeys,
+		Derived:      r.Derived,
+		P2PAdvertise: r.P2PAdvertise,
+	}
+	// A 1-1 has no space-set name; show the friend's resolved profile from
+	// the identities directory (the row's name/icon stays as an out-of-band
+	// displayHint fallback when nothing is resolved yet).
+	if r.Type == space.SpaceTypeOneToOne && r.OneToOnePeer != "" {
+		if id, ok := s.tsp.GetIdentity(ctx, r.OneToOnePeer); ok && id.Name != "" {
+			info.Name = id.Name
+			info.Description = id.Description
+			info.IconCID = id.IconCID
+		}
 	}
 	if r.CreatedAt > 0 {
 		info.CreatedAt = time.Unix(r.CreatedAt, 0)
 	}
 	return info
+}
+
+// SetSettings patches the per-space client settings on spaceId's
+// tech-space row (see space.Service.SetSettings for the contract).
+// The row must exist: the techspace write is a strict (non-upsert)
+// modify — on an absent id it would silently no-op — so the unknown-id
+// case is turned into an error here. Deleted rows pass: the handler's
+// terminal-delete rule guards only status fields, and a tombstone's
+// settings staying editable is deliberate (the row remains the
+// account's record of the space).
+func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error {
+	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+		return fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	_, err := s.tsp.SetSettings(ctx, spaceId, set, unset)
+	return err
+}
+
+// SetDevice upserts this device's row in the devices registry (see
+// space.Service.SetDevice for the contract). Thin wrapper — the
+// techspace method owns the peer-id resolution and op encoding.
+func (s *Service) SetDevice(ctx context.Context, up space.DeviceUpsert) error {
+	_, err := s.tsp.SetDevice(ctx, up)
+	return err
+}
+
+// ClaimActive claims the active role for app on peerId's device, or on
+// this device when peerId is "" (see space.Service.ClaimActive for the
+// contract).
+func (s *Service) ClaimActive(ctx context.Context, app, peerId string) error {
+	_, err := s.tsp.ClaimActive(ctx, app, peerId)
+	return err
+}
+
+// DeleteDevice prunes a device row (see space.Service.DeleteDevice
+// for the contract; the techspace method owns the exists-check that
+// keeps a typo from minting a permanent tombstone).
+func (s *Service) DeleteDevice(ctx context.Context, peerId string) error {
+	_, err := s.tsp.DeleteDevice(ctx, peerId)
+	return err
+}
+
+// ListDevices returns the devices-registry snapshot. Unavailability
+// (techspace not open, index object not loadable) surfaces as an
+// error — it must never read as an empty registry.
+func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
+	return s.tsp.ListDevices(ctx)
 }
 
 // Delete removes a space. It is offline-first and returns as soon as the
@@ -519,8 +1206,33 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 // delete to the account's other devices — each offloads its local copy —
 // while the row stays re-creatable (a later OneToOne(peer) flips it back to
 // active). No coordinator SpaceDelete is ever sent.
+//
+// The tech space (system-owned, never in the list) and seed-derived
+// spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
+// refused outright.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
-	if rec, ok := s.tsp.Get(ctx, spaceId); ok && rec.Type == space.SpaceTypeOneToOne {
+	if spaceId == s.tsp.SpaceId() {
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrIsTechSpace)
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if ok && mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) == space.StatusJoining {
+		// Removing a pending join is a withdrawal, not a tombstone: the
+		// request would otherwise stay on the ACL chain while the
+		// terminal deleted status made the space unjoinable for this
+		// account forever. CancelJoin leaves the same StatusDeleted the
+		// caller asked for, re-enterable. ErrJoinNotPending means the
+		// owner accepted meanwhile — a member's space now, deleted below
+		// like any other.
+		err := s.CancelJoin(ctx, spaceId)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, space.ErrJoinNotPending) {
+			return fmt.Errorf("spaceimpl: Delete: withdraw pending join: %w", err)
+		}
+	}
+	switch {
+	case ok && rec.Type == space.SpaceTypeOneToOne:
 		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.OneToOneDeletedStatus); err != nil {
 			return fmt.Errorf("spaceimpl: mark 1-1 deleted: %w", err)
 		}
@@ -528,6 +1240,23 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// No coordinator kick: a 1-1 is never node-deleted. Other devices
 		// offload via their own reconciler when the synced marker arrives.
 		return nil
+	case ok && rec.GuestKey != "":
+		// Guest-mode space: same shape as the 1-1 delete — synced,
+		// NON-terminal marker (a later JoinGuest re-adds), local offload,
+		// no coordinator SpaceDelete (the space isn't ours on the
+		// network). Other devices offload via their reconciler when the
+		// marker arrives.
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.GuestDeletedRemoteStatus); err != nil {
+			return fmt.Errorf("spaceimpl: mark guest space deleted: %w", err)
+		}
+		s.OffloadSpace(ctx, spaceId)
+		return nil
+	case ok && rec.Derived:
+		return space.ErrIsDerivedSpace
+	case !ok:
+		// No row = the account doesn't know this space; deleting would
+		// silently succeed while writing nothing (strict-skip modify).
+		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
@@ -543,13 +1272,15 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 // deferred-updater listener) and translates each engine event into a
 // SpaceListEvent. Delta-only: callers seed current state via List.
 //
-// Mapping: a row whose localStatus is "deleted" (sticky soft-delete)
-// surfaces under Removed regardless of whether the engine classified it
-// Added/Updated; everything else maps to Added/Updated as the engine
-// saw it. The cancel func stops the drain goroutine and closes the sub.
+// Mapping: a row in any deleted shape (the synced tombstone, the 1-1 /
+// guest offload markers, an ended join) surfaces under Removed
+// regardless of whether the engine classified it Added/Updated;
+// everything else maps to Added/Updated as the engine saw it. The
+// cancel func stops the drain goroutine and closes the sub.
 func (s *Service) Subscribe(cb func(space.SpaceListEvent)) (cancel func()) {
 	sub, err := s.tsp.SubEngine().Subscribe(subscribe.SubConfig{
-		Scope: subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
+		Scope:  subscribe.Scope{ObjectId: s.tsp.IndexObjectId(), Dataset: techspace.SpaceIndexDataset},
+		Refill: ObjectRefill(s.tsp.Store(), s.tsp.IndexObjectId(), techspace.SpaceIndexDataset),
 	}, func(func(id string, doc *anyenc.Value)) error { return nil })
 	if err != nil {
 		return func() {}
@@ -585,9 +1316,13 @@ func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEve
 			return
 		}
 		r := techspace.DecodeSpaceIndexRecord(rec.Doc)
-		if r.RemoteStatus == techspace.StatusDeleted || r.RemoteStatus == techspace.OneToOneDeletedStatus {
-			// Account-wide delete (synced) → leaves the live list. The 1-1
-			// offload marker counts too (synced, surfaced as deleted).
+		if r.IsDeleted() {
+			// Every deleted shape leaves the live list: the synced
+			// tombstone, the 1-1 and guest offload markers, and the
+			// ended join (synced, or the legacy device-local marker). A
+			// consumer keying per-space state on this stream drops it
+			// here; a later revival (Join on an ended row) re-enters as
+			// an Updated row it no longer knows — same as a fresh Added.
 			out.Removed = append(out.Removed, r.Id)
 			return
 		}
@@ -615,7 +1350,7 @@ func (s *Service) toSpaceListEvent(ctx context.Context, ev space.SubscriptionEve
 
 // SpaceIndexObjectId returns the well-known id of the tech-space index
 // object. Pass it to Query/Subscribe to read the system datasets
-// (spaces, profile) generically. Future system objects expose their
+// (spaces, profile, devices) generically. Future system objects expose their
 // own ids the same way.
 func (s *Service) SpaceIndexObjectId() string { return s.tsp.IndexObjectId() }
 
@@ -628,9 +1363,11 @@ func (s *Service) Query(objectId, dataset string) space.Query {
 }
 
 // Datasets returns the JSON-Schema description of the tech-space system
-// datasets (spaces, profile) for discovery.
+// datasets (spaces, profile, devices, …) for discovery. The tech
+// handle's Space.Datasets lists everything the tech Store hosts,
+// bundle datasets included.
 func (s *Service) Datasets() []space.DatasetSchema {
-	return toDatasetSchemas(s.tsp.Store().Schemas())
+	return toDatasetSchemas(s.tsp.Store().SystemSchemas())
 }
 
 // toDatasetSchemas marshals each dataset's declared schema into a public
@@ -643,7 +1380,11 @@ func toDatasetSchemas(named []spaceobjects.NamedSchema) []space.DatasetSchema {
 		if err != nil {
 			continue
 		}
-		out = append(out, space.DatasetSchema{Name: ns.Name, JSONSchema: raw})
+		ds := space.DatasetSchema{Name: ns.Name, JSONSchema: raw, Owners: ns.Owners, Module: ns.Module, Shared: ns.Shared}
+		for _, idx := range ns.Indexes {
+			ds.Indexes = append(ds.Indexes, space.IndexDraft{Key: idx.Key, Fields: idx.Fields, Sparse: idx.Sparse})
+		}
+		out = append(out, ds)
 	}
 	return out
 }
@@ -666,33 +1407,33 @@ func (s *Service) SubscribeStatus(cb func(space.SpaceSyncStatus)) (cancel func()
 // repeat calls are idempotent and just return the existing space if
 // it already exists locally.
 func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Space, error) {
-	keys := s.app.AccountKeys()
-	if keys == nil {
-		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
-	}
-	payload := s.derivePayload(keys, req)
-	spaceId, err := s.app.SpaceService().DeriveId(ctx, payload)
+	// Load (creating storage on first derive) BEFORE writing the active
+	// row — an active row without storage is a state Get heals only
+	// while this process knows the seed (see activateOneToOne).
+	spaceId, err := s.loadDerived(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: derive id: %w", err)
+		return nil, err
 	}
-	if !s.app.SpaceExists(spaceId) {
-		if _, err := s.app.SpaceService().DeriveSpace(ctx, payload); err != nil {
-			return nil, fmt.Errorf("spaceimpl: derive: %w", err)
-		}
-	}
-	if _, ok := s.tsp.Get(ctx, spaceId); !ok {
+	if rec, ok := s.tsp.Get(ctx, spaceId); !ok {
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           spaceId,
-			Type:         space.SpaceTypeRegular,
+			Type:         space.SpaceTypeAny,
 			SpaceType:    deriveSpaceTypeTag(req.SpaceType),
+			Name:         req.Name,
 			LocalStatus:  techspace.StatusActive,
 			RemoteStatus: techspace.StatusActive,
+			// Synced: every device of the account refuses Delete, not
+			// just the device that ran Derive.
+			Derived: true,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 		}
-	}
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
-		return nil, err
+	} else if !rec.Derived {
+		// Heal rows that predate the flag (older SDK, or a Track of the
+		// derived id): the set-once gate permits the first true write.
+		if _, err := s.tsp.SetDerived(ctx, spaceId); err != nil {
+			return nil, fmt.Errorf("spaceimpl: flag derived row: %w", err)
+		}
 	}
 	store := s.storeFor(spaceId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
@@ -700,7 +1441,50 @@ func (s *Service) Derive(ctx context.Context, req space.DeriveRequest) (space.Sp
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
+	s.spaceBorn(spaceId)
 	return sp, nil
+}
+
+// loadDerived loads the space req derives and returns its id. A device
+// with no storage for it builds the storage from the seed; no node is
+// asked.
+func (s *Service) loadDerived(ctx context.Context, req space.DeriveRequest) (string, error) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return "", errors.New("spaceimpl: anysyncx app has no account keys")
+	}
+	storageCreate, err := spacepayloads.StoragePayloadForSpaceDeriveV1(s.derivePayload(keys, req))
+	if err != nil {
+		return "", fmt.Errorf("spaceimpl: derive: %w", err)
+	}
+	spaceId := storageCreate.SpaceHeaderWithId.Id
+	s.rememberDerivation(spaceId, req)
+	// Storage creation rides the GetSpace cache load (see
+	// ctxWithCreatePayload): derived ids are deterministic, so an
+	// out-of-band exists-check + create here would let two concurrent
+	// loads of the same seed race the storage create.
+	if _, err := s.app.GetSpaceCreating(ctxWithCreatePayload(ctx, storageCreate), spaceId); err != nil {
+		return "", err
+	}
+	return spaceId, nil
+}
+
+// rememberDerivation records the request spaceId derives from.
+func (s *Service) rememberDerivation(spaceId string, req space.DeriveRequest) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.derivations[spaceId]; !ok {
+		s.derivations[spaceId] = space.DeriveRequest{Seed: bytes.Clone(req.Seed), SpaceType: req.SpaceType}
+	}
+}
+
+// derivation returns the request spaceId derives from, when DeriveId or
+// Derive computed that id in this process.
+func (s *Service) derivation(spaceId string) (space.DeriveRequest, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	req, ok := s.derivations[spaceId]
+	return req, ok
 }
 
 // DeriveId returns the deterministic spaceId for req without creating
@@ -715,31 +1499,33 @@ func (s *Service) DeriveId(ctx context.Context, req space.DeriveRequest) (string
 	if err != nil {
 		return "", fmt.Errorf("spaceimpl: derive id: %w", err)
 	}
+	s.rememberDerivation(id, req)
 	return id, nil
 }
 
 // derivePayload builds the any-sync derive payload shared by Derive and
-// DeriveId. The on-wire header SpaceType stays SpaceTypeRegular
-// (coordinator-gated). The app-level SpaceType tag and the seed are
-// encoded together into SpaceHeaderPayload, which is part of the header
-// (and thus the derived id) and is recoverable from the header alone on
-// cold restore. Both Derive and DeriveId build the identical payload, so
-// the derived id is stable for a given (seed, SpaceType) pair.
+// DeriveId. The on-wire header SpaceType is SpaceTypeAny
+// (coordinator-gated, files-v2 only). The app-level SpaceType tag and
+// the seed are encoded together into SpaceHeaderPayload, which is part
+// of the header (and thus the derived id) and is recoverable from the
+// header alone on cold restore. Both Derive and DeriveId build the
+// identical payload, so the derived id is stable for a given
+// (seed, SpaceType) pair.
 func (s *Service) derivePayload(keys *accountdata.AccountKeys, req space.DeriveRequest) spacepayloads.SpaceDerivePayload {
 	return spacepayloads.SpaceDerivePayload{
-		SigningKey:   keys.SignKey,
-		MasterKey:    keys.SignKey,
-		SpaceType:    space.SpaceTypeRegular,
-		SpacePayload: encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
+		SigningKey:       keys.SignKey,
+		MasterKey:        keys.SignKey,
+		SpaceType:        space.SpaceTypeAny,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+		SpacePayload:     encodeDerivePayload(req.Seed, deriveSpaceTypeTag(req.SpaceType)),
 	}
 }
 
-// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting an
-// empty request value to SpaceTypeRegular so existing Derive callers
-// keep today's behavior.
+// deriveSpaceTypeTag resolves the app-level SpaceType tag, defaulting
+// an empty request value to SpaceTypeAny.
 func deriveSpaceTypeTag(t string) string {
 	if t == "" {
-		return space.SpaceTypeRegular
+		return space.SpaceTypeAny
 	}
 	return t
 }
@@ -757,6 +1543,26 @@ const oneToOnePendingLocalStatus = "oneToOnePending"
 // space.StatusOneToOneDeclined.
 const oneToOneDeclinedRemoteStatus = "oneToOneDeclined"
 
+// ctxWithCreatePayload arms ctx so the space cache load can CREATE the
+// missing storage instead of pull-bootstrapping it: NewSpace, running
+// inside the ocache's per-id single-flight, builds the storage from the
+// AddSpaceCtxKey description — the same path inbound SpacePush uses.
+// This is the only sanctioned way to create storage for a
+// deterministic id: CreateSpaceStorage is concurrency-safe only under
+// that single-flight (its husk sweep and error cleanup delete the db
+// file), so calling SpaceService Derive*/Create* directly for an id
+// two callers can compute (1-1 derive, seed derive) races
+// destructively. Random-id Create doesn't need this.
+func ctxWithCreatePayload(ctx context.Context, p spacestorage.SpaceStorageCreatePayload) context.Context {
+	return context.WithValue(ctx, commonspace.AddSpaceCtxKey, commonspace.SpaceDescription{
+		SpaceHeader:          p.SpaceHeaderWithId,
+		AclId:                p.AclWithId.Id,
+		AclPayload:           p.AclWithId.Payload,
+		SpaceSettingsId:      p.SpaceSettingsWithId.Id,
+		SpaceSettingsPayload: p.SpaceSettingsWithId.RawChange,
+	})
+}
+
 // OneToOne reaches out to — or explicitly accepts / un-declines — the 1-1
 // space shared with otherIdentity. Derives the shared space, materializes
 // its storage, and activates it locally (implicit self-approval). Same id
@@ -768,19 +1574,20 @@ func (s *Service) OneToOne(ctx context.Context, otherIdentity string) (space.Spa
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
 	}
 	if otherIdentity == keys.SignKey.GetPublic().Account() {
-		return nil, errors.New("spaceimpl: OneToOne: cannot pair with self")
+		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", space.ErrSelfPair)
 	}
 	otherPk, err := decodeIdentity(otherIdentity)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: OneToOne: %w", err)
 	}
-	// DeriveOneToOneSpace creates the storage as a side effect (idempotent —
-	// ErrSpaceStorageExists is swallowed) and returns the derived id.
-	spaceId, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: derive 1-1: %w", err)
 	}
-	sp, err := s.activateOneToOne(ctx, spaceId, otherIdentity)
+	spaceId := payload.SpaceHeaderWithId.Id
+	// Storage creation rides the activate's cache load (see
+	// ctxWithCreatePayload); no-op when storage already exists.
+	sp, err := s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, otherIdentity)
 	if err != nil {
 		return nil, err
 	}
@@ -803,7 +1610,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	}
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: unknown space %q", spaceId)
+		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type != space.SpaceTypeOneToOne {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %q is not a 1-1 space", spaceId)
@@ -815,11 +1622,13 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: AcceptOneToOne: %w", err)
 	}
-	// Pending rows carry no storage — materialize it now.
-	if _, err := s.app.SpaceService().DeriveOneToOneSpace(ctx, keys.SignKey, otherPk); err != nil {
+	// Pending rows carry no storage — the activate's cache load creates
+	// it from the derived payload (see ctxWithCreatePayload).
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(keys.SignKey, otherPk, space.SpaceTypeOneToOne)
+	if err != nil {
 		return nil, fmt.Errorf("spaceimpl: materialize 1-1: %w", err)
 	}
-	return s.activateOneToOne(ctx, spaceId, rec.OneToOnePeer)
+	return s.activateOneToOne(ctxWithCreatePayload(ctx, payload), spaceId, rec.OneToOnePeer)
 }
 
 // DeclineOneToOne rejects an incoming 1-1. Writes the synced, sticky
@@ -829,7 +1638,7 @@ func (s *Service) AcceptOneToOne(ctx context.Context, spaceId string) (space.Spa
 func (s *Service) DeclineOneToOne(ctx context.Context, spaceId string) error {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok {
-		return fmt.Errorf("spaceimpl: DeclineOneToOne: unknown space %q", spaceId)
+		return fmt.Errorf("spaceimpl: DeclineOneToOne: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	if rec.Type != space.SpaceTypeOneToOne {
 		return fmt.Errorf("spaceimpl: DeclineOneToOne: %q is not a 1-1 space", spaceId)
@@ -851,7 +1660,7 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 		return errors.New("spaceimpl: anysyncx app has no account keys")
 	}
 	if peerIdentity == keys.SignKey.GetPublic().Account() {
-		return errors.New("spaceimpl: RegisterIncoming: cannot pair with self")
+		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", space.ErrSelfPair)
 	}
 	otherPk, err := decodeIdentity(peerIdentity)
 	if err != nil {
@@ -863,7 +1672,13 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 	if err != nil {
 		return fmt.Errorf("spaceimpl: RegisterIncoming: %w", err)
 	}
-	if _, ok := s.tsp.Get(ctx, spaceId); ok {
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
+		// Existing row: respect an active space or sticky decline (no-op).
+		// For a still-pending row, (re)try resolving the peer's name — an
+		// earlier attempt may have run before the peer's symkey arrived.
+		if rec.LocalStatus == oneToOnePendingLocalStatus {
+			s.goResolveOneToOnePeerName(peerIdentity)
+		}
 		return nil
 	}
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
@@ -880,15 +1695,86 @@ func (s *Service) RegisterIncoming(ctx context.Context, peerIdentity string, dis
 	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, oneToOnePendingLocalStatus); err != nil {
 		return fmt.Errorf("spaceimpl: RegisterIncoming: mark pending: %w", err)
 	}
+	// Resolve the peer's display name from identityRepo in the background:
+	// with symkey-only invites the pending row starts identity-only, so we
+	// fetch + decrypt the peer's profile and write name/icon onto the row.
+	s.goResolveOneToOnePeerName(peerIdentity)
 	return nil
 }
 
-// activateOneToOne wires a 1-1 whose storage already exists and flips its
+// goResolveOneToOnePeerName runs resolveOneToOnePeerName in the
+// background, tracked by seedWG and bound to seedCtx like goSeed: Close
+// cancels the coordinator round-trip and drains the goroutine before
+// the tech space is torn down. No-op once closing.
+func (s *Service) goResolveOneToOnePeerName(peerIdentity string) {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		s.resolveOneToOnePeerName(s.seedCtx, peerIdentity)
+	}()
+}
+
+// resolveOneToOnePeerName best-effort resolves a 1-1 peer's identityRepo
+// profile (decrypted with the cached metadata symkey) into the identities
+// directory and records the 1-1 space as a sighting, so the space list
+// (via recordToInfo) shows the friend by name rather than identity-only.
+// No-op when the symkey isn't cached yet, the coordinator is offline, the
+// profile is empty, or the row is no longer a non-declined 1-1.
+// Best-effort: runs through goResolveOneToOnePeerName; all failures are
+// dropped (a later RegisterIncoming or key-watcher reconcile retries).
+func (s *Service) resolveOneToOnePeerName(ctx context.Context, peerIdentity string) {
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return
+	}
+	otherPk, err := decodeIdentity(peerIdentity)
+	if err != nil {
+		return
+	}
+	spaceId, err := deriveOneToOneId(keys.SignKey, otherPk)
+	if err != nil {
+		return
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok || rec.Type != space.SpaceTypeOneToOne || rec.RemoteStatus == oneToOneDeclinedRemoteStatus {
+		return
+	}
+	// Record the sighting regardless of whether the profile resolves.
+	_ = s.tsp.AddIdentitySpace(ctx, peerIdentity, spaceId)
+
+	key := s.metadataSymKeyFor(ctx, peerIdentity)
+	if key == nil {
+		return
+	}
+	prof, ok := s.fetchIdentityProfile(ctx, peerIdentity, key)
+	if !ok || prof.IsEmpty() {
+		return
+	}
+	s.setIdentityProfile(ctx, peerIdentity, prof)
+}
+
+// activateOneToOne loads (creating storage from the armed ctx when
+// missing — see ctxWithCreatePayload) and wires a 1-1, then flips its
 // index row to active, clearing any pending (device-local) or declined
 // (synced) state. Shared by OneToOne (initiate) and AcceptOneToOne.
+// The load runs BEFORE the flips — same rule as the join loaders: a
+// row must never say active while storage doesn't exist, or a crash in
+// between strands a state plain Get can't heal (its adopt branch keys
+// on pending, and an unarmed load can only SpacePull). A crash after
+// the load leaves storage + a pending row, which the accept paths and
+// Get's adoption both recover.
 // peerIdentity is recorded on a freshly-created row so any of the account's
 // devices can re-derive the space.
 func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity string) (space.Space, error) {
+	if _, err := s.app.GetSpaceCreating(ctx, spaceId); err != nil {
+		return nil, err
+	}
 	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
 		// SetRemoteStatus(active) overrides a synced decline
 		// (oneToOneDeclined is non-terminal); SetLocalStatus clears a
@@ -912,15 +1798,15 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 	}); err != nil {
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 	}
-	if _, err := s.app.GetSpace(ctx, spaceId); err != nil {
-		return nil, err
-	}
 	store := s.storeFor(spaceId)
 	if _, err := s.ensureSpaceIndexWiring(ctx, spaceId); err != nil {
 		return nil, err
 	}
 	sp := newSpace(spaceId, s.app, s.tsp, store, s)
 	s.goSeed(sp)
+	// Resolve the friend's name onto the active 1-1 row so the space list
+	// shows it (no-op until we hold their symkey; best-effort).
+	s.goResolveOneToOnePeerName(peerIdentity)
 	return sp, nil
 }
 
@@ -929,7 +1815,7 @@ func (s *Service) activateOneToOne(ctx context.Context, spaceId, peerIdentity st
 // SpaceService.DeriveOneToOneSpace, which materializes it. Used by
 // RegisterIncoming to record a pending row before the user accepts.
 func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, error) {
-	payload, err := spacepayloads.StoragePayloadForOneToOneSpace(mySignKey, peerPub)
+	payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(mySignKey, peerPub, space.SpaceTypeOneToOne)
 	if err != nil {
 		return "", err
 	}
@@ -937,10 +1823,9 @@ func deriveOneToOneId(mySignKey crypto.PrivKey, peerPub crypto.PubKey) (string, 
 }
 
 // ErrJoinPending is returned by Join after a RequestToJoin invite was
-// successfully posted but the owner has not yet accepted. The space
-// is recorded in the tech-space index with LocalStatus=Joining;
-// callers can poll List for the status flip and then call Get.
-var ErrJoinPending = errors.New("spaceimpl: join pending owner approval")
+// successfully posted but the owner has not yet accepted. Wraps the
+// public space.ErrJoinPending for errors.Is.
+var ErrJoinPending = fmt.Errorf("spaceimpl: %w", space.ErrJoinPending)
 
 // Join sends a join request via the invite. v1 only supports
 // RequestToJoin invites — AnyoneCanJoin is deferred until any-sync
@@ -964,48 +1849,472 @@ func (s *Service) Join(ctx context.Context, req space.JoinRequest) (space.Space,
 	if jc == nil {
 		return nil, errors.New("spaceimpl: Join: joining client unavailable")
 	}
+	keys := s.app.AccountKeys()
+	if keys == nil {
+		return nil, errors.New("spaceimpl: Join: anysyncx app has no account keys")
+	}
+	// The join record carries our metadata symkey only, not inline
+	// name/icon: co-members cache it and read our profile from
+	// identityRepo (which our account republishes on boot / UpdateMetadata).
+	// req.Metadata no longer flows into the ACL.
+	joinMeta, err := encodeSelfSymKeyMetadata(keys.SignKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: Join: derive metadata key: %w", err)
+	}
+	// An existing row decides whether a request may be posted at all. A
+	// synced tombstone (Delete, the 1-1 / guest offload markers) is
+	// sticky: a request against it would land on the ACL with nothing
+	// local able to complete it. An ended join is the one deleted shape
+	// a re-request revives — checked before the RPC so a refused Join
+	// leaves no dangling request on the chain.
+	rec, exists := s.tsp.Get(ctx, inv.SpaceId)
+	if exists && rec.IsDeleted() && !rec.JoinEnded() {
+		return nil, fmt.Errorf("spaceimpl: Join: space %q was deleted on this account (tombstones are sticky): %w",
+			inv.SpaceId, space.ErrSpaceDeleted)
+	}
+	if exists && rec.GuestKey != "" {
+		// A guest row's storage is opened under the shared guest
+		// identity; a member upgrade in place is not a supported path,
+		// and a request posted for it would sit on the chain with no row
+		// state behind it.
+		return nil, fmt.Errorf("spaceimpl: Join: space %q is a guest-mode space on this account; a member upgrade in place is %w",
+			inv.SpaceId, space.ErrUnsupported)
+	}
 	aclHeadId, err := jc.RequestJoin(ctx, inv.SpaceId, list.RequestJoinPayload{
 		InviteKey: inv.InviteKey,
-		Metadata:  encodeMetadata(req.Metadata),
+		Metadata:  joinMeta,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)
+		// The record builder refuses a request from an identity the ACL
+		// already grants permissions: the account became a member by
+		// another route — accepted after a join from another device, or
+		// added directly — while this device's row still reads ended or
+		// pending. Nothing watches the ACL of an unloaded space, so this
+		// is the moment to notice: the account is a member, so the space
+		// loads now and the row flips to active after the load — no
+		// request, no waiter, and no synced "joining" that would briefly
+		// misreport a member on the account's other devices. An active
+		// row keeps the error — it is a member asking to join again.
+		if !errors.Is(err, list.ErrInsufficientPermissions) || !exists ||
+			mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) == space.StatusActive {
+			return nil, fmt.Errorf("spaceimpl: RequestJoin: %w", err)
+		}
+		s.clearLegacyJoinMarker(ctx, rec)
+		s.stopJoinWaiter(inv.SpaceId)
+		s.startJoinLoad(inv.SpaceId)
+		return nil, ErrJoinPending
 	}
-	// Record the pending-join state in the tech space so it shows up
-	// in List with StatusJoining. The synced row carries the metadata;
-	// the joining lifecycle is per-device (localStatus is a local field),
-	// so it's set separately via SetLocalStatus after the row exists.
-	if _, ok := s.tsp.Get(ctx, inv.SpaceId); !ok {
+	// Record the pending join in the tech space — SYNCED, so every
+	// device of the account reads the row as joining: List shows
+	// StatusJoining, nothing materializes the space, and the verdict
+	// observed on any device converges the rest. A request stood (posted
+	// or deduped) for an identity that is not an active member here, so
+	// whatever the row carried — nothing, an ended join, a tracked row —
+	// it reads joining from now on. Written even when the cached row
+	// already reads joining: the write stamps a fresh version, so a
+	// verdict for the PREVIOUS request still in flight from another
+	// device (a withdrawal, a decline) cannot land over this request
+	// under last-writer-wins and leave it orphaned on the chain.
+	if !exists {
+		// Type is unknown at join time (the header isn't readable until
+		// the space loads) — left empty, backfilled set-once by load.
 		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
 			Id:           inv.SpaceId,
-			Type:         space.SpaceTypeRegular,
-			RemoteStatus: techspace.StatusActive,
+			RemoteStatus: techspace.JoiningRemoteStatus,
 		}); err != nil {
 			return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 		}
-		if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, joiningLocalStatus); err != nil {
+	} else {
+		if _, err := s.tsp.SetRemoteStatus(ctx, inv.SpaceId, techspace.JoiningRemoteStatus); err != nil {
 			return nil, fmt.Errorf("spaceimpl: mark joining: %w", err)
 		}
+		s.clearLegacyJoinMarker(ctx, rec)
 	}
 	// Persist the ACL head so the post-acceptance waiter can detect a
-	// decline, then kick the join controller to start waiting now (it
-	// would otherwise pick the row up on its next boot/tick pass).
-	if _, err := s.tsp.SetAclHeadId(ctx, inv.SpaceId, aclHeadId); err != nil {
-		return nil, fmt.Errorf("spaceimpl: record acl head: %w", err)
+	// decline (a request gone from the chain at-or-after this record).
+	// An empty head means the joining client posted nothing — our
+	// request is already on the chain (a repeat, or a join from another
+	// device: the head is device-local, so this device has none) — and
+	// the current chain head serves the same probe.
+	if aclHeadId == "" && (!exists || rec.AclHeadId == "") {
+		if recs, gErr := jc.AclGetRecords(ctx, inv.SpaceId, ""); gErr == nil && len(recs) > 0 {
+			aclHeadId = recs[len(recs)-1].Id
+		}
 	}
+	if aclHeadId != "" {
+		if _, err := s.tsp.SetAclHeadId(ctx, inv.SpaceId, aclHeadId); err != nil {
+			return nil, fmt.Errorf("spaceimpl: record acl head: %w", err)
+		}
+	}
+	// A waiter left over from the previous attempt is bound to the
+	// previous request: dropping it makes the kick below rebuild one on
+	// the head just stored, so a late verdict on the old request cannot
+	// land on the revived row.
+	s.stopJoinWaiter(inv.SpaceId)
 	s.kickJoinController()
 	return nil, ErrJoinPending
 }
 
-// joiningLocalStatus is the localStatus value the SDK stamps on a
-// space-index entry while a RequestToJoin is still pending owner
-// approval. Maps to space.StatusJoining via mapStatus.
+// CancelJoin withdraws this account's pending join request — see
+// space.Service.CancelJoin. Rides the joining client, never the space:
+// a pending join holds no local storage and must not materialize one
+// (the guard Get enforces), while the request record lives on the ACL
+// chain the nodes serve directly.
+func (s *Service) CancelJoin(ctx context.Context, spaceId string) error {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return fmt.Errorf("spaceimpl: CancelJoin: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	if mapStatus(rec.Type, rec.LocalStatus, rec.RemoteStatus) != space.StatusJoining {
+		return fmt.Errorf("spaceimpl: CancelJoin: space %q: %w", spaceId, space.ErrJoinNotPending)
+	}
+	jc := s.app.JoiningClient()
+	if jc == nil {
+		return errors.New("spaceimpl: CancelJoin: joining client unavailable")
+	}
+	// The joining client snapshots the chain, then posts. A snapshot
+	// with no pending request of ours reads as ErrNoSuchRecord; an
+	// owner verdict landing between the snapshot and the post makes the
+	// node reject the record instead, with an opaque transport error —
+	// one re-snapshot tells the two apart, so a benign race never
+	// surfaces as a hard failure.
+	err := jc.CancelJoin(ctx, spaceId)
+	if err != nil && !errors.Is(err, list.ErrNoSuchRecord) && ctx.Err() == nil {
+		err = jc.CancelJoin(ctx, spaceId)
+	}
+	if err != nil {
+		if errors.Is(err, list.ErrNoSuchRecord) {
+			return s.cancelJoinWithoutRequest(ctx, spaceId)
+		}
+		return fmt.Errorf("spaceimpl: CancelJoin: %w", err)
+	}
+	// The cancel is on the chain. A waiter holding a head would read it
+	// as a decline on its next poll and stamp the same marker; stamp it
+	// now so the caller observes the end state synchronously, and so a
+	// device with no head (one that learned of the join from the synced
+	// row) converges too. The write outlives the caller's ctx: the
+	// network side is done, and a row left joining with no request
+	// behind it would sit until the waiter's next poll — so on a failed
+	// write the waiter is kept (kicked) as the fallback, and only after
+	// a successful write is it dropped rather than left polling a request
+	// that no longer exists.
+	if wErr := s.markJoinEnded(context.WithoutCancel(ctx), spaceId); wErr != nil {
+		s.kickJoinController()
+		return fmt.Errorf("spaceimpl: CancelJoin: mark ended: %w", wErr)
+	}
+	s.stopJoinWaiter(spaceId)
+	s.kickJoinController()
+	return nil
+}
+
+// cancelJoinWithoutRequest settles a CancelJoin whose chain snapshot
+// held no pending request of ours. Consensus is linear, so exactly one
+// of accept / decline / cancel landed first — but the error does not say
+// which, and a device that learned of the join from the synced row holds
+// no head to tell a decline from a request that never existed. One more
+// snapshot decides: permissions granted means the owner accepted (the
+// space loads now, the request cannot be withdrawn); a request still on
+// the chain means the first snapshot was stale (the waiter settles it);
+// neither means the request is gone — declined, or withdrawn on another
+// device whose marker has not synced yet — and the caller asked for
+// exactly that end state, so the row is marked ended here.
+func (s *Service) cancelJoinWithoutRequest(ctx context.Context, spaceId string) error {
+	notPending := fmt.Errorf("spaceimpl: CancelJoin: space %q: %w", spaceId, space.ErrJoinNotPending)
+	res := s.resolveJoin(ctx, spaceId)
+	switch {
+	case res.err != nil:
+		// Nothing was decided: the row is left as it is (the waiter or
+		// the requesting device's synced verdict settles it) and the
+		// caller sees the transport failure, not a verdict.
+		return fmt.Errorf("spaceimpl: CancelJoin: space %q: read chain: %w", spaceId, res.err)
+	case res.granted:
+		s.stopJoinWaiter(spaceId)
+		s.startJoinLoad(spaceId)
+		return notPending
+	case res.head != "":
+		s.kickJoinController()
+		return notPending
+	}
+	if err := s.markJoinEnded(context.WithoutCancel(ctx), spaceId); err != nil {
+		s.kickJoinController()
+		return fmt.Errorf("spaceimpl: CancelJoin: mark ended: %w", err)
+	}
+	s.stopJoinWaiter(spaceId)
+	s.kickJoinController()
+	return nil
+}
+
+// joiningLocalStatus is the LEGACY device-local localStatus the old Join
+// stamped while a RequestToJoin was pending. Still read — mapStatus maps
+// it to space.StatusJoining and the controller runs a waiter for it, so
+// a join left pending across the upgrade completes — never written: the
+// pending join lives in the synced techspace.JoiningRemoteStatus now.
 const joiningLocalStatus = "joining"
 
-// Close stops per-space subsystems the SDK owns directly — currently
-// just members watchers (one polling goroutine each). The any-sync
-// side of each space is owned by the App's space cache and torn down
-// separately by App.Close.
+// clearLegacyJoinMarker drops the device-local join marker of the
+// pre-synced lifecycle ("joining", or the "deleted" of an ended join)
+// off a row that now carries its lifecycle in the synced field. A local
+// set — no DAG change; the synced state outranks the marker anyway
+// (mapStatus, LocalDeleteStands), so this is hygiene, not correctness:
+// a failure is logged, never returned — no caller may fail a join or a
+// verdict the network already holds over it. Guest rows never carry one.
+func (s *Service) clearLegacyJoinMarker(ctx context.Context, rec techspace.SpaceIndexRecord) {
+	if rec.GuestKey != "" || (rec.LocalStatus != joiningLocalStatus && rec.LocalStatus != techspace.StatusDeleted) {
+		return
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, rec.Id, ""); err != nil {
+		joinLog.Warn("clear legacy join marker", zap.String("spaceId", rec.Id), zap.Error(err))
+	}
+}
+
+// markJoinEnded records that the account's join ended without
+// membership — the synced techspace.JoinEndedRemoteStatus every device
+// converges on (Get refuses it, the eager-loader skips it, Subscribe
+// emits Removed, Join revives it). Written by the waiter's decline path
+// and by CancelJoin. The stored ACL head is dropped with it: it belongs
+// to the request that just ended, and a later re-request must resolve
+// its own.
+func (s *Service) markJoinEnded(ctx context.Context, spaceId string) error {
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.JoinEndedRemoteStatus); err != nil {
+		return err
+	}
+	if rec, ok := s.tsp.Get(ctx, spaceId); ok {
+		s.clearLegacyJoinMarker(ctx, rec)
+		s.clearJoinHead(ctx, rec)
+	}
+	return nil
+}
+
+// clearJoinHead drops the device-local ACL head off a row that has left
+// joining. A head is a credential for ONE request — the any-sync waiter
+// reports a decline whenever the request is gone and the head it was
+// given exists on the chain, so a head kept across requests would turn a
+// lagging replica that has not seen the next request yet into a synced
+// decline over it. Best-effort: a failure leaves the head for the next
+// reconcile pass to clear.
+func (s *Service) clearJoinHead(ctx context.Context, rec techspace.SpaceIndexRecord) {
+	if rec.AclHeadId == "" {
+		return
+	}
+	if _, err := s.tsp.SetAclHeadId(ctx, rec.Id, ""); err != nil {
+		joinLog.Warn("clear acl head", zap.String("spaceId", rec.Id), zap.Error(err))
+	}
+}
+
+// guestLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
+// JoinGuest while this device is still pulling the guest space's
+// content. Crash-recoverable exactly like inviteLoading: the join
+// controller's boot/tick pass resumes the load (no ACL waiter — the
+// shared guest identity is already an ACL member); the load-complete
+// flip clears it to active.
+const guestLoadingLocalStatus = "guestLoading"
+
+// guestRevokedLocalStatus is the DEVICE-LOCAL localStatus the ACL
+// mirror stamps on a guest-mode row when the shared guest identity has
+// been removed from the ACL (owner revoked public access). Maps to
+// space.StatusGuestRevoked. Non-terminal: the mirror flips it back to
+// active if a fresh ACL shows the identity active again.
+const guestRevokedLocalStatus = "guestRevoked"
+
+// JoinGuest adds a space via a guest invite — see space.Service.JoinGuest.
+// No ACL write and no approval: the invite key IS the shared read-only
+// guest identity, already an active ACL member. The row is recorded
+// durably (synced guest key + device-local loading marker) before the
+// single bounded load attempt, so a crash or offline start resumes in
+// the join controller.
+func (s *Service) JoinGuest(ctx context.Context, invite string) (space.Space, error) {
+	if invite == "" {
+		return nil, errors.New("spaceimpl: JoinGuest: invite required")
+	}
+	inv, err := space.DecodeInvite(invite)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: %w", err)
+	}
+	if inv.Kind != space.InviteKindGuest {
+		return nil, errors.New("spaceimpl: JoinGuest: not a guest invite — use Join")
+	}
+	encoded, err := crypto.EncodeKeyToString(inv.InviteKey)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: encode guest key: %w", err)
+	}
+	if rec, ok := s.tsp.Get(ctx, inv.SpaceId); ok {
+		rejoin := rec.GuestKey != "" && rec.RemoteStatus == techspace.GuestDeletedRemoteStatus &&
+			rec.LocalStatus != techspace.StatusDeleted
+		if rec.IsDeleted() && !rejoin {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q was deleted on this account (tombstones are sticky)", inv.SpaceId)
+		}
+		if rec.GuestKey == "" {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: space %q is already tracked by this account — guest access would demote it", inv.SpaceId)
+		}
+		// Guest row already exists (another device joined, a prior
+		// attempt, or a guestDeleted row being re-added) — refresh the
+		// key when the invite carries a rotated one (owner revoked +
+		// re-created), then (re)drive the load.
+		if rec.GuestKey != encoded {
+			if _, err := s.tsp.SetGuestKey(ctx, inv.SpaceId, encoded); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: refresh guest key: %w", err)
+			}
+			// The loaded runtime (commonspace AND the Store's cached
+			// objects/trees) still signs and decrypts as the old
+			// identity; tear it all down so the next load rebuilds with
+			// the fresh key. Disk state stays.
+			s.closeSpaceRuntime(ctx, inv.SpaceId)
+		}
+		if rejoin {
+			// Un-delete AFTER the loading marker is durable, mirroring
+			// AcceptInvite: a crash between the two writes must leave a
+			// resumable marker, never an account-wide un-delete nobody
+			// finishes. loadAcceptedInvite completes the flip when it
+			// finds the marker with the row still guestDeleted.
+			if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, guestLoadingLocalStatus); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: mark loading: %w", err)
+			}
+			if _, err := s.tsp.SetRemoteStatus(ctx, inv.SpaceId, techspace.StatusActive); err != nil {
+				return nil, fmt.Errorf("spaceimpl: JoinGuest: un-delete: %w", err)
+			}
+		}
+	} else {
+		// Type unknown until the guest space loads; backfilled by load.
+		if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
+			Id:           inv.SpaceId,
+			RemoteStatus: techspace.StatusActive,
+			GuestKey:     encoded,
+		}); err != nil {
+			return nil, fmt.Errorf("spaceimpl: JoinGuest: write index entry: %w", err)
+		}
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, guestLoadingLocalStatus); err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: mark loading: %w", err)
+	}
+	sp, err := s.load(ctx, inv.SpaceId)
+	if err != nil {
+		// Content not pullable yet (or offline). The join controller owns
+		// the retry; the guest row itself is already durable.
+		s.kickJoinController()
+		return nil, space.ErrGuestJoinPending
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, inv.SpaceId, techspace.StatusActive); err != nil {
+		return nil, fmt.Errorf("spaceimpl: JoinGuest: flip active: %w", err)
+	}
+	s.kickJoinController() // reap any pending-load bookkeeping
+	return sp, nil
+}
+
+// inviteLoadingLocalStatus is the DEVICE-LOCAL localStatus stamped by
+// AcceptInvite while this device is still pulling the accepted space's
+// content. Crash-recoverable: the join controller's boot/tick pass
+// resumes the load (no ACL waiter — the account is already a member);
+// loadJoinedSpace clears it to active. Maps to StatusActive via
+// mapStatus' default — the synced accept already happened, loading is a
+// device detail, and the account's other devices show Active too.
+const inviteLoadingLocalStatus = "inviteLoading"
+
+// AcceptInvite approves a direct-add invite by space id: flips the
+// SYNCED row status to active (every device converges — declined is
+// non-terminal, so this also un-declines) and loads the space. The
+// account is already an ACL member, so unlike Join there is nothing to
+// wait for on the ACL — just a pull-until-available load. One bounded
+// synchronous attempt is made; if the content isn't pullable yet
+// (add still propagating, offline) it returns (nil,
+// ErrInviteAcceptPending) and the join controller finishes the load
+// durably in the background.
+func (s *Service) AcceptInvite(ctx context.Context, spaceId string) (space.Space, error) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	if rec.Type == space.SpaceTypeOneToOne {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: %q %w — use AcceptOneToOne", spaceId, space.ErrIsOneToOne)
+	}
+	if rec.IsDeleted() {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is deleted", spaceId)
+	}
+	if rec.RemoteStatus == techspace.JoiningRemoteStatus || rec.LocalStatus == joiningLocalStatus {
+		// A token-join awaiting owner approval: accepting it here would
+		// clobber the joining state and tear down its ACL waiter,
+		// silencing an eventual owner decline. (The legacy device-local
+		// marker rides a remote=active row, which the switch below would
+		// otherwise take for an idempotent re-accept.)
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is awaiting join approval, not a direct-add invite", spaceId)
+	}
+	switch rec.RemoteStatus {
+	case techspace.InvitePendingRemoteStatus, techspace.InviteDeclinedRemoteStatus:
+	case techspace.StatusActive:
+		// Idempotent re-accept / resume of an interrupted load — but only
+		// from a plain active/loading row; any other device-local
+		// lifecycle (offloaded, …) is not this API's business.
+		switch rec.LocalStatus {
+		case "", techspace.StatusActive, inviteLoadingLocalStatus:
+		default:
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
+		}
+	default:
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
+	}
+	// Persist the loading obligation BEFORE the synced accept flip: a
+	// crash between the two writes must leave a resumable marker, never a
+	// durable account-wide accept nobody finishes. loadAcceptedInvite
+	// completes the remote flip when it finds the marker with the row
+	// still invite-pending.
+	if rec.LocalStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetLocalStatus(ctx, spaceId, inviteLoadingLocalStatus); err != nil {
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: mark loading: %w", err)
+		}
+	}
+	if rec.RemoteStatus != techspace.StatusActive {
+		if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+			return nil, fmt.Errorf("spaceimpl: AcceptInvite: %w", err)
+		}
+	}
+	sp, err := s.Get(ctx, spaceId)
+	if err != nil {
+		// Content not pullable yet (or offline). The join controller owns
+		// the retry; the accept itself is already durable.
+		s.kickJoinController()
+		return nil, ErrInviteAcceptPending
+	}
+	if _, err := s.tsp.SetLocalStatus(ctx, spaceId, techspace.StatusActive); err != nil {
+		return nil, fmt.Errorf("spaceimpl: AcceptInvite: flip active: %w", err)
+	}
+	s.kickJoinController() // reap any pending-load bookkeeping
+	return sp, nil
+}
+
+// ErrInviteAcceptPending is returned by AcceptInvite when the accept was
+// recorded but the space content is not pullable yet. Wraps the public
+// space.ErrInviteAcceptPending for errors.Is.
+var ErrInviteAcceptPending = fmt.Errorf("spaceimpl: %w", space.ErrInviteAcceptPending)
+
+// DeclineInvite rejects a direct-add invite. Writes the synced, sticky
+// InviteDeclined marker so the request is suppressed on every device; a
+// later AcceptInvite overrides it (non-terminal). No ACL write happens —
+// the account stays a member on the space's ACL — and nothing was
+// materialized, so there is nothing to offload.
+func (s *Service) DeclineInvite(ctx context.Context, spaceId string) error {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return fmt.Errorf("spaceimpl: DeclineInvite: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	if rec.Type == space.SpaceTypeOneToOne {
+		return fmt.Errorf("spaceimpl: DeclineInvite: %q %w — use DeclineOneToOne", spaceId, space.ErrIsOneToOne)
+	}
+	switch rec.RemoteStatus {
+	case techspace.InviteDeclinedRemoteStatus:
+		return nil // idempotent
+	case techspace.InvitePendingRemoteStatus:
+	default:
+		return fmt.Errorf("spaceimpl: DeclineInvite: space %q is %w", spaceId, space.ErrNotInvitePending)
+	}
+	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.InviteDeclinedRemoteStatus); err != nil {
+		return fmt.Errorf("spaceimpl: DeclineInvite: %w", err)
+	}
+	return nil
+}
+
+// Close stops what the SDK owns per space: the background goroutines,
+// the inbox, the deletion and join controllers, every watcher, then
+// each loaded space's Store. The any-sync side of each space is owned
+// by the App's space cache and torn down separately by App.Close.
 func (s *Service) Close(_ context.Context) error {
 	// Stop spawning new lazy-seed goroutines, cancel any in flight, and
 	// wait for them to return before the caller tears down the store /
@@ -1035,7 +2344,39 @@ func (s *Service) Close(_ context.Context) error {
 	s.joinWG.Wait()
 	s.stopJoinWaiters()
 	s.watchers.stopAll()
+	s.closeStores()
 	return nil
+}
+
+// closeStores closes every loaded space's Store: its drainer, read-state
+// materializer and reindex sweep write the SDK db, which the caller
+// closes next. Offload closes a store on its own; this covers the
+// spaces still loaded at shutdown. The closed stores stay in the map,
+// and storeOnce publishes only closed ones from here on (closing is
+// set), so a sync message during app teardown starts nothing new.
+// Builds in flight at the end of the pass are waited out: the
+// constructor writes the db, and the caller closes it once Close
+// returns. Concurrent: a store waits out its sweep's tree replay and
+// in-flight applies.
+func (s *Service) closeStores() {
+	s.mu.Lock()
+	stores := make(map[string]*spaceobjects.Store, len(s.stores))
+	for id, st := range s.stores {
+		stores[id] = st
+	}
+	s.mu.Unlock()
+	var wg sync.WaitGroup
+	for id, st := range stores {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := st.Close(); err != nil {
+				offloadLog.Warn("close store", zap.String("spaceId", id), zap.Error(err))
+			}
+		}()
+	}
+	wg.Wait()
+	s.waitStoreBuilds()
 }
 
 // goSeed launches the spaceIndex lazy-seed in the background, tracked by
@@ -1052,15 +2393,35 @@ func (s *Service) goSeed(sp *spaceImpl) {
 	go func() {
 		defer s.seedWG.Done()
 		sp.maybeLazySeedSpaceIndex(s.seedCtx)
+		sp.publishOneToOneKey(s.seedCtx)
 	}()
 }
 
-// KickProfiles asks every running members watcher to refetch
-// identityRepo profiles immediately. Called by the SDK after the
-// caller publishes their own profile via Account.UpdateMetadata so
-// the self-view propagates without waiting for the slow tick.
-func (s *Service) KickProfiles(ctx context.Context) {
-	s.watchers.kickProfiles(ctx)
+// ResolveIdentityProfilesAsync runs ResolveIdentityProfiles in the
+// background, tracked by seedWG and bound to seedCtx so Close cancels
+// and drains it — the goroutine can never race teardown of the tech
+// space or the coordinator client. No-op once closing. Called from
+// sdk.Open on every boot.
+func (s *Service) ResolveIdentityProfilesAsync() {
+	s.mu.Lock()
+	if s.closing {
+		s.mu.Unlock()
+		return
+	}
+	s.seedWG.Add(1)
+	s.mu.Unlock()
+	go func() {
+		defer s.seedWG.Done()
+		s.ResolveIdentityProfiles(s.seedCtx)
+	}()
+}
+
+// KickProfiles queues an identityRepo refetch on every running members
+// watcher's profile loop. Called by the SDK after the caller publishes
+// their own profile via Account.UpdateMetadata so the self-view
+// propagates without waiting for the slow tick.
+func (s *Service) KickProfiles() {
+	s.watchers.kickProfiles()
 }
 
 // SpaceRegistry implementation. Routes between the tech-space (which
@@ -1087,6 +2448,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 	return tree, nil
 }
 
+// HasTree reports whether (spaceId, treeId) is already in local storage.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId == s.tsp.SpaceId() {
+		return s.tsp.HasTree(ctx, spaceId, treeId)
+	}
+	return s.storeFor(spaceId).HasTree(ctx, treeId)
+}
+
 // PutTree binds a remote-delivered tree payload. Tech-space's
 // index tree is locally created, never put from the network — the
 // tech-space's adapter rejects this, which is the correct behavior.
@@ -1102,15 +2471,16 @@ func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestora
 }
 
 // MarkTreeDeleted is the soft-delete hook fired when the settings
-// tree announces a deletion. Drops the cached object so a future
-// load reflects the deleted state. Tech-space defers to its own
-// no-op adapter (the index tree itself is never marked deleted).
+// tree announces a deletion for a tree not present in local storage.
+// Reflects the deletion in local materialized state and drops the
+// cached object so a future load reflects the deleted state.
+// Tech-space defers to its own adapter (the index tree itself is
+// never marked deleted).
 func (s *Service) MarkTreeDeleted(ctx context.Context, spaceId, treeId string) error {
 	if spaceId == s.tsp.SpaceId() {
 		return s.tsp.MarkTreeDeleted(ctx, spaceId, treeId)
 	}
-	s.storeFor(spaceId).Drop(treeId)
-	return nil
+	return s.storeFor(spaceId).MarkTreeDeleted(ctx, treeId)
 }
 
 // DeleteTree performs the per-tree cleanup the deletion-manager
@@ -1124,6 +2494,139 @@ func (s *Service) DeleteTree(ctx context.Context, spaceId, treeId string) error 
 	return s.storeFor(spaceId).DeleteTree(ctx, treeId)
 }
 
+// ShouldPullTree is the selective-sync pull decision for a
+// locally-missing tree announced by a head update. The tech space is
+// always fully synced; regular spaces delegate to their Store, which
+// classifies by the update's root changeType and, when declining,
+// refreshes the tree's heads-only stub so the sync diff converges.
+func (s *Service) ShouldPullTree(ctx context.Context, spaceId, treeId string, root *treechangeproto.RawTreeChangeWithId, heads []string) bool {
+	if spaceId == s.tsp.SpaceId() {
+		return true
+	}
+	return s.storeFor(spaceId).ShouldPullTree(ctx, treeId, root, heads)
+}
+
+// PullFirst lists the trees a sync round handles before the rest, in a
+// regular space: the spaceIndex, so the space name reaches a joiner
+// before the rest of the space, and then the definitions this device
+// already knows of —
+//
+//   - the bundle roots the spaceIndex lists, the register and every
+//     root claimed: a bundle that declares a type or a collection does
+//     it on its root, whose changeType is a plain object's, so
+//     PullFirstTypes cannot find it;
+//   - the type and collection objects that are local: a device that
+//     holds the space pushes its trees to a peer that lacks them, and
+//     this puts the definitions at the front of that push. A joiner
+//     has none of them yet and finds them among the trees it fetches
+//     (PullFirstTypes).
+//
+// The tech space has none.
+//
+// Reads rows only, from collections that exist: the spaceIndex id is
+// derived from the space id, and nothing here builds a store, loads an
+// object or creates a collection. A round can run while the space is
+// being offloaded, and resolving through storeFor would rebuild the
+// store the offload just closed.
+func (s *Service) PullFirst(ctx context.Context, spaceId string) []string {
+	if spaceId == s.tsp.SpaceId() {
+		return nil
+	}
+	indexId, err := spaceIndexTreeId(spaceId)
+	if err != nil {
+		return nil
+	}
+	ids := []string{indexId}
+	if s.db == nil {
+		return ids
+	}
+	ids = append(ids, s.rowStrings(ctx, indexId+"_"+spaceindex.BundlesDataset, nil, bundleRowRoots)...)
+	objects := spaceId + "_" + spaceobjects.SpaceObjectsCollection
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveTypeRowsFilter, rowId)...)
+	ids = append(ids, s.rowStrings(ctx, objects, spaceobjects.LiveCollectionRowsFilter, rowId)...)
+	return ids
+}
+
+func rowId(row *anyenc.Value) []string { return []string{row.GetString("id")} }
+
+// bundleRowRoots returns every root a bundle row names: the register
+// and each root ever claimed. Which of them wins is the read path's
+// decision (a claimed canonical root beats the register); naming them
+// all needs none.
+func bundleRowRoots(row *anyenc.Value) []string {
+	out := []string{row.GetString(spaceindex.FieldBundleRootId)}
+	for _, v := range row.GetArray(spaceindex.FieldBundleRoots) {
+		if b, err := v.StringBytes(); err == nil {
+			out = append(out, string(b))
+		}
+	}
+	return out
+}
+
+// rowStrings returns what pick takes from every live row of an existing
+// collection that matches filter; nothing when the collection does not
+// exist.
+func (s *Service) rowStrings(ctx context.Context, collection string, filter any, pick func(row *anyenc.Value) []string) []string {
+	coll, err := s.db.OpenCollection(ctx, collection)
+	if err != nil {
+		return nil
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return nil
+	}
+	defer iter.Close()
+	var out []string
+	for iter.Next() {
+		doc, err := iter.Doc()
+		if err != nil {
+			continue
+		}
+		v := doc.Value()
+		if v == nil || v.Get(crdt.DeletedAtField) != nil {
+			continue
+		}
+		for _, str := range pick(v) {
+			if str != "" {
+				out = append(out, str)
+			}
+		}
+	}
+	return out
+}
+
+// pullFirstTypes are the root changeTypes of definition objects: a
+// type (typesAPI.Create) and a collection (collectionsAPI.Create).
+var pullFirstTypes = []string{typeChangeType, collectionChangeType}
+
+// PullFirstTypes lists the root changeTypes the sync job materializes
+// ahead of the other trees it fetched: types and collections, so the
+// objects that follow apply at once instead of parking until their
+// definition arrives. None for the tech space, whose rounds a caller
+// reads right after, and none under selective sync, whose fetch path
+// classifies every tree on its own.
+func (s *Service) PullFirstTypes(spaceId string) []string {
+	if spaceId == s.tsp.SpaceId() {
+		return nil
+	}
+	if s.app != nil && len(s.app.SelectiveTreeTypes()) > 0 {
+		return nil
+	}
+	return pullFirstTypes
+}
+
+// ReleaseTree hands a tree the sync job materialized to its store's
+// release (Store.Release). A space with no store holds nothing to
+// release, and none is built for it.
+func (s *Service) ReleaseTree(spaceId, treeId string) {
+	s.mu.Lock()
+	st := s.stores[spaceId]
+	s.mu.Unlock()
+	if st != nil {
+		st.Release(treeId)
+	}
+}
+
 // Compile-time check that we satisfy the registry contract.
 var _ anysyncx.SpaceRegistry = (*Service)(nil)
 
@@ -1131,14 +2634,6 @@ var _ anysyncx.SpaceRegistry = (*Service)(nil)
 // space.Status enum.
 func mapStatus(typ, local, remote string) space.Status {
 	switch {
-	case local == techspace.StatusDeleted:
-		// Device-local delete — the user removed this space on THIS device.
-		// Must report Deleted even when remote is still active, else a
-		// locally-deleted space surfaces as Active and clients trusting the
-		// mapped status re-adopt a space the user removed. Checked before
-		// the remote case so a local delete always wins locally. (Regressed
-		// when the index was Store-backed; this restores the prior case.)
-		return space.StatusDeleted
 	case remote == techspace.StatusDeleted:
 		// Account-wide delete (synced) — propagated to every device.
 		return space.StatusDeleted
@@ -1147,10 +2642,38 @@ func mapStatus(typ, local, remote string) space.Status {
 		// re-creatable. Surfaced as Deleted; checked before the
 		// declined/pending 1-1 cases.
 		return space.StatusDeleted
+	case remote == techspace.GuestDeletedRemoteStatus:
+		// Guest-space delete (synced, non-terminal): offloaded
+		// everywhere, re-addable via JoinGuest. Surfaced as Deleted.
+		return space.StatusDeleted
+	case remote == techspace.JoinEndedRemoteStatus:
+		// Ended join (synced, non-terminal): the owner declined or the
+		// account withdrew, observed on any device. Surfaced as Deleted;
+		// Join revives it.
+		return space.StatusDeleted
+	case remote == techspace.JoiningRemoteStatus:
+		// Pending join (synced): the account-wide truth, ranked above the
+		// device-local cases so a legacy ended-join marker left on this
+		// device cannot hide a join re-requested from another one.
+		return space.StatusJoining
+	case local == techspace.StatusDeleted && (remote == "" || remote == techspace.StatusActive):
+		// Device-local deleted marker — the legacy ended join (declined
+		// or withdrawn before the lifecycle was synced). Must report
+		// Deleted even though remote is still active, else it surfaces as
+		// Active and clients trusting the mapped status adopt a space the
+		// account is not a member of. No current writer stamps it; it
+		// stays readable until a synced lifecycle state lands over it —
+		// a re-request from another device, a direct add — which is the
+		// newer account-wide truth and reads through (LocalDeleteStands).
+		return space.StatusDeleted
 	case remote == oneToOneDeclinedRemoteStatus:
 		// Synced, sticky 1-1 decline — account-wide (could be declined on
 		// another device). Checked before the pending/active cases.
 		return space.StatusOneToOneDeclined
+	case remote == techspace.InviteDeclinedRemoteStatus:
+		// Synced, sticky direct-add decline — account-wide, non-terminal
+		// (AcceptInvite overrides).
+		return space.StatusInviteDeclined
 	case typ == space.SpaceTypeOneToOne && remote == techspace.StatusActive:
 		// Account-scoped resolution wins over a device-local pending. A 1-1
 		// processed (accepted/initiated) on ANY device carries synced
@@ -1161,8 +2684,20 @@ func mapStatus(typ, local, remote string) space.Status {
 		return space.StatusActive
 	case local == oneToOnePendingLocalStatus:
 		return space.StatusOneToOnePending
+	case remote == techspace.InvitePendingRemoteStatus:
+		// Synced direct-add pending: the account was added to the space's
+		// ACL and no device has accepted or declined yet. Before the
+		// joining/local cases — until the accept commits the synced active
+		// flip, the account-wide truth is still "pending".
+		return space.StatusInvitePending
 	case local == joiningLocalStatus:
+		// Legacy device-local pending join — see joiningLocalStatus.
 		return space.StatusJoining
+	case local == guestRevokedLocalStatus:
+		// Guest-mode space whose shared identity was removed from the
+		// ACL. Device-local (each device's mirror detects it) and
+		// non-terminal — the mirror self-heals back to active.
+		return space.StatusGuestRevoked
 	case typ == space.SpaceTypeOneToOne && local != techspace.StatusActive && remote != techspace.StatusActive:
 		// A 1-1 row that exists but carries no active/declined signal and no
 		// device-local pending: the row synced from the device that

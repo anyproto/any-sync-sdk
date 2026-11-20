@@ -7,12 +7,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 	"github.com/anyproto/any-store/v2/query"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 )
 
@@ -21,6 +22,13 @@ var (
 	ErrMissingRecordId       = errors.New("crdt: RecordChange.Id is empty and Change.ChangeId is also empty")
 	ErrEmptyIdRequiresUpsert = errors.New("crdt: RecordChange.Id is empty but Upsert is false")
 	ErrMissingDataVersion    = errors.New("crdt: Change.DataVersion is empty")
+	// ErrInvalidChange wraps the change-level checks of ApplyChange that
+	// no retry and no later schema can pass: the change itself is
+	// malformed. The inbound replay skips such a change; a halt would
+	// freeze the object on every device that receives it. A change on
+	// a dataset this controller has no handler for is not one: a later
+	// schema can carry the handler, so it stays ErrUnknownDataset.
+	ErrInvalidChange = errors.New("crdt: invalid change")
 
 	// ErrStrictSkipAbsent surfaces the documented strict-mode behaviour
 	// (Upsert=false on an absent record = silent no-op) as a per-record
@@ -69,6 +77,24 @@ type ApplyResult struct {
 	// change (0 when the Controller has no allocator — unit tests).
 	// Forwarded to the change-index feed so consumers cursor on it.
 	ApplySeq uint64
+	// ObjectStamps are the writes ObjectStampers landed on the
+	// object's rows in shared datasets alongside this change (see
+	// ObjectStamper). Empty when the change targets the shared dataset
+	// itself, arrived on the local/account route, wrote nothing, the
+	// row is absent/tombstoned, or every stamp op lost its LWW gate;
+	// Ops holds only the ops that took it. The dispatcher projects
+	// each as an update of that row so live queries on the shared
+	// dataset see it.
+	ObjectStamps []ObjectStamp
+}
+
+// ObjectStamp is one ObjectStamper write that landed: the shared
+// dataset, the row (the change's ObjectId) and the derived ops applied
+// to it with the change's VersionId.
+type ObjectStamp struct {
+	Dataset string
+	RowId   string
+	Ops     []Op
 }
 
 // Reserved field names.
@@ -81,7 +107,42 @@ const (
 	// collide. Backs the consumer-side change-index "records changed
 	// since N" scans.
 	AddSeqField = "_addSeq"
+
+	// ObjectIdField names the object a record of a keyed dataset
+	// (HandlerReg.Keyed) belongs to. Stamped by the Controller on every
+	// row it creates there, tombstones included.
+	ObjectIdField = "_objectId"
 )
+
+// keySeparator joins the object id and the record id into the document
+// id of a keyed dataset. An object id never contains it, so the first
+// one always splits.
+const keySeparator = "/"
+
+// KeyedId is the document id a caller names a record of objectId by in
+// a keyed dataset: an id already carrying the object's prefix is
+// returned as is, so a caller may pass either form. For the record id
+// a change carries use KeyedStoreId.
+func KeyedId(objectId, recordId string) string {
+	prefix := objectId + keySeparator
+	if strings.HasPrefix(recordId, prefix) {
+		return recordId
+	}
+	return prefix + recordId
+}
+
+// KeyedStoreId is the document id the record id of a change is stored
+// under on objectId. Always the object's prefix plus the id: two record
+// ids of one object never share a document, whatever they hold.
+func KeyedStoreId(objectId, recordId string) string {
+	return objectId + keySeparator + recordId
+}
+
+// KeyedBounds is the document-id range holding every row of objectId in
+// a keyed dataset: lo inclusive, hi exclusive.
+func KeyedBounds(objectId string) (lo, hi string) {
+	return objectId + keySeparator, objectId + string(rune(keySeparator[0]+1))
+}
 
 // Controller is the CRDT entrypoint for one any-sync object tree. It
 // applies version-gated changes to an any-store database, one collection
@@ -109,9 +170,29 @@ type Controller struct {
 	// collection is first opened.
 	versions map[string]int
 	indexes  map[string][]anystore.IndexInfo
+	// prunePrefixes: dataset → name prefix under which indexes is the
+	// whole set (HandlerReg.PruneIndexPrefix).
+	prunePrefixes map[string]string
 	// schemas is the per-dataset field declaration (field classes +
 	// Dynamic). Source of truth for synced/derived/local enforcement.
 	schemas map[string]schema.Dataset
+	// schemaRevs holds each runtime dataset's registered SchemaRev
+	// fingerprint (nil/absent for static regs). Immutable after
+	// construction, read lock-free by the store's staleness checks.
+	schemaRevs map[string]string
+
+	// staleDatasets are the datasets whose persisted handler version
+	// differs from the registered one — the re-index trigger. Computed
+	// once at construction from the stored _meta row, cleared by
+	// ResetForReindex. See reindex.go.
+	staleDatasets []string
+
+	// reindexPending is set while a rebuild is in flight: the captured
+	// local-scope leaves sit on the _meta row (reindexLocal, encoded)
+	// until the replay finishes and PersistVersions clears them. A load
+	// that finds it set resumes the rebuild. See reindex.go.
+	reindexPending bool
+	reindexLocal   []byte
 
 	// collMu guards collections. Per-object collections are opened
 	// lazily — on first write via db.Collection (creates), on read via
@@ -121,15 +202,29 @@ type Controller struct {
 	// protects map access only.
 	collMu      sync.Mutex
 	collections map[string]anystore.Collection
+	// collsReleased flips once CloseOwnedCollections has run (object
+	// evicted from the space cache). After that the lazy open paths
+	// stop caching handles: a stale Controller held past eviction
+	// opens by name per call, so it can never retain a handle that a
+	// successor controller's eviction later closes under it.
+	collsReleased atomic.Bool
 	// shared maps a dataset to a "shared" (typically per-space)
 	// collection that supersedes the per-object collection. Writes to
 	// such a dataset use the change's ObjectId as the row id (not
 	// RecordChange.Id), so all objects in the space project into one
 	// row each. Used for the per-space `objects` values collection.
-	shared    map[string]struct{}
+	shared map[string]struct{}
+	// keyed marks the supplied collections that hold one row per record
+	// of every object (HandlerReg.Keyed): the row id is
+	// `<objectId>/<recordId>`. A keyed dataset is in shared too.
+	keyed map[string]struct{}
 	// scopeByKey marks datasets whose undeclared field heads carry
 	// per-key scopes (HandlerReg.DynamicScopeByKey).
 	scopeByKey map[string]bool
+	// objectStampers are the shared datasets whose handler implements
+	// ObjectStamper, in registration order. Consulted once per applied
+	// synced change on any other dataset (see applyObjectStamps).
+	objectStampers []objectStamper
 
 	metaColl    anystore.Collection // _meta — persisted maxAddSeq/maxApplySeq + handler versions
 	maxAddSeq   uint64
@@ -138,6 +233,10 @@ type Controller struct {
 	// space's Controllers). nil disables applySeq stamping (unit
 	// tests, callers without a consumer feed).
 	applySeqs *ApplySeqAllocator
+
+	// applyHook runs inside the apply WriteTx after the record loop —
+	// the read-tracking classification seam. nil disables it.
+	applyHook ApplyHook
 
 	// Pools for the per-RecordChange hot path. Both are scoped to this
 	// Controller to keep contention bounded; the apply loop is single-
@@ -197,12 +296,14 @@ func NewControllerWithShared(ctx context.Context, objectId string, db anystore.D
 		return nil, fmt.Errorf("crdt: open meta collection: %w", err)
 	}
 	c.metaColl = metaColl
-	if err := ensureMetaIndexes(ctx, metaColl); err != nil {
+	if err := EnsureMetaIndexes(ctx, metaColl); err != nil {
 		return nil, fmt.Errorf("crdt: ensure meta indexes: %w", err)
 	}
-	if _, err := c.LoadAndSeedMeta(ctx, metaColl); err != nil {
+	stored, err := c.LoadAndSeedMeta(ctx, metaColl)
+	if err != nil {
 		return nil, fmt.Errorf("crdt: load meta: %w", err)
 	}
+	c.staleDatasets = staleDatasets(stored, c.versions)
 	return c, nil
 }
 
@@ -233,6 +334,23 @@ func (c *Controller) SetApplySeqAllocator(a *ApplySeqAllocator) {
 	c.applySeqs = a
 }
 
+// ApplyHook runs inside the apply WriteTx after every record of a
+// change has applied, before the watermark persist and commit — a
+// returned error rolls the whole change back. recordIds are the
+// resolved per-record ids (ChangeId sugar applied, shared-dataset
+// collapse done). The read-tracking classification closure installs
+// here so unread entries are atomic with the change.
+type ApplyHook func(txCtx context.Context, ch *Change, recordIds []string, res *ApplyResult) error
+
+// SetApplyHook wires the in-tx apply hook. Call once right after
+// construction, before the first apply. No-op on a nil controller.
+func (c *Controller) SetApplyHook(h ApplyHook) {
+	if c == nil {
+		return
+	}
+	c.applyHook = h
+}
+
 // RegisterHandler adds a handler at runtime (for late-bound datasets).
 func (c *Controller) RegisterHandler(ctx context.Context, reg HandlerReg) error {
 	return c.registerHandler(ctx, reg)
@@ -260,18 +378,42 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 		return fmt.Errorf("crdt: init handler %q: %w", name, err)
 	}
 	c.handlers[name] = reg.Handler
-	version := reg.Version
-	if version == 0 {
-		version = 1
-	}
-	c.versions[name] = version
+	c.versions[name] = NormalizedVersion(reg.Version)
 	c.indexes[name] = reg.Indexes
-	c.schemas[name] = reg.Schema
+	if reg.PruneIndexPrefix != "" {
+		if c.prunePrefixes == nil {
+			c.prunePrefixes = make(map[string]string)
+		}
+		c.prunePrefixes[name] = reg.PruneIndexPrefix
+	}
+	// Zero-value scopes are resolved once here (stamps → derived, rest →
+	// synced) so field-class enforcement never sees an unset scope.
+	c.schemas[name] = reg.Schema.Normalized()
+	if reg.SchemaRev != "" {
+		if c.schemaRevs == nil {
+			c.schemaRevs = make(map[string]string)
+		}
+		c.schemaRevs[name] = reg.SchemaRev
+	}
 	if reg.DynamicScopeByKey {
 		if c.scopeByKey == nil {
 			c.scopeByKey = make(map[string]bool)
 		}
 		c.scopeByKey[name] = true
+	}
+	if reg.Keyed {
+		if _, supplied := c.shared[name]; !supplied {
+			return fmt.Errorf("crdt: keyed dataset %q registered without its collection", name)
+		}
+		if c.keyed == nil {
+			c.keyed = make(map[string]struct{})
+		}
+		c.keyed[name] = struct{}{}
+	}
+	if st, ok := reg.Handler.(ObjectStamper); ok {
+		if c.IsShared(name) {
+			c.objectStampers = append(c.objectStampers, objectStamper{dataset: name, stamper: st})
+		}
 	}
 	// Per-object collections are opened lazily — on first write
 	// (creates) or on first read (no-create). This keeps unwritten
@@ -292,6 +434,22 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 	return nil
 }
 
+// HasDataset reports whether a handler is registered for the dataset.
+// The handler map is immutable after construction, so this is safe to
+// call concurrently (same contract as ValidateChange). Used by the
+// store to detect controllers built before a runtime dataset appeared.
+func (c *Controller) HasDataset(dataset string) bool {
+	_, ok := c.handlers[dataset]
+	return ok
+}
+
+// DatasetSchemaRev returns the SchemaRev the dataset registered with
+// ("" for static regs / unknown datasets). Immutable after
+// construction; concurrency-safe like HasDataset.
+func (c *Controller) DatasetSchemaRev(dataset string) string {
+	return c.schemaRevs[dataset]
+}
+
 // ensureHandlerIndexes calls EnsureIndex for every IndexInfo a dataset
 // declared on its HandlerReg. No-op for an empty slice. EnsureIndex is
 // idempotent, so callers may invoke this on every open without checking
@@ -299,6 +457,81 @@ func (c *Controller) registerHandler(ctx context.Context, reg HandlerReg) error 
 func ensureHandlerIndexes(ctx context.Context, indexes []anystore.IndexInfo, coll anystore.Collection) error {
 	for _, idx := range indexes {
 		if err := coll.EnsureIndex(ctx, idx); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileIndexes brings a per-object collection's indexes in line
+// with the dataset's registration when the collection is opened. A
+// controller whose collections were released was replaced by a newer
+// one: its registration may be the older, so it leaves the set under a
+// prune prefix to its successor.
+func (c *Controller) reconcileIndexes(ctx context.Context, dataset string, coll anystore.Collection) error {
+	prefix := c.prunePrefixes[dataset]
+	if prefix == "" || !c.collsReleased.Load() {
+		if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
+			return err
+		}
+	}
+	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
+		return err
+	}
+	if c.collsReleased.Load() {
+		return nil
+	}
+	return DropStaleIndexes(ctx, coll, c.indexes[dataset], prefix)
+}
+
+// StaleIndexes lists the collection's indexes named under prefix that
+// are not among want. An empty prefix lists none.
+func StaleIndexes(coll anystore.Collection, want []anystore.IndexInfo, prefix string) []string {
+	if prefix == "" {
+		return nil
+	}
+	keep := make(map[string]struct{}, len(want))
+	for _, idx := range want {
+		keep[idx.Name] = struct{}{}
+	}
+	var stale []string
+	for _, idx := range coll.GetIndexes() {
+		name := idx.Info().Name
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		if _, ok := keep[name]; !ok {
+			stale = append(stale, name)
+		}
+	}
+	return stale
+}
+
+// MissingIndexes lists the indexes of want the collection does not
+// hold yet, by name.
+func MissingIndexes(coll anystore.Collection, want []anystore.IndexInfo) []anystore.IndexInfo {
+	if len(want) == 0 {
+		return nil
+	}
+	have := make(map[string]struct{})
+	for _, idx := range coll.GetIndexes() {
+		have[idx.Info().Name] = struct{}{}
+	}
+	var missing []anystore.IndexInfo
+	for _, idx := range want {
+		if _, ok := have[idx.Name]; !ok {
+			missing = append(missing, idx)
+		}
+	}
+	return missing
+}
+
+// DropStaleIndexes drops the collection's indexes named under prefix
+// that are not among want, so the set under a prefix follows its
+// registration. No-op for an empty prefix.
+func DropStaleIndexes(ctx context.Context, coll anystore.Collection, want []anystore.IndexInfo, prefix string) error {
+	for _, name := range StaleIndexes(coll, want, prefix) {
+		if err := coll.DropIndex(ctx, name); err != nil && !errors.Is(err, anystore.ErrIndexNotFound) {
 			return err
 		}
 	}
@@ -332,16 +565,13 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 	if err != nil {
 		return nil, fmt.Errorf("crdt: open collection %q: %w", collName, err)
 	}
-	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
-		return nil, fmt.Errorf("crdt: ensure indexes for %q: %w", dataset, err)
-	}
-	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
-		return nil, fmt.Errorf("crdt: ensure builtin indexes for %q: %w", dataset, err)
+	if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
+		return nil, fmt.Errorf("crdt: indexes for %q: %w", dataset, err)
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
 		coll = existing
-	} else {
+	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
 	}
 	c.collMu.Unlock()
@@ -352,34 +582,92 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 // without creating it. Returns nil when no writer has materialised
 // the dataset yet — callers treat that as "no rows". Caches the
 // handle on first successful open.
+//
+// The nil also covers an eviction race: any-store's ErrCollectionClosed
+// WRAPS ErrCollectionNotFound, so a handle closed between resolution
+// and use reads as "absent" for one call — the next call re-opens by
+// name and sees the data again. Callers must treat the empty result as
+// a snapshot, never persist it as a negative fact (none do today; keep
+// it that way).
 func (c *Controller) collectionForRead(ctx context.Context, dataset string) anystore.Collection {
+	coll, _ := c.openForRead(ctx, dataset)
+	return coll
+}
+
+// openForRead is collectionForRead reporting why an open failed: a nil
+// collection with a nil error means the collection does not exist.
+func (c *Controller) openForRead(ctx context.Context, dataset string) (anystore.Collection, error) {
 	c.collMu.Lock()
 	if coll, ok := c.collections[dataset]; ok {
 		c.collMu.Unlock()
-		return coll
+		return coll, nil
 	}
 	c.collMu.Unlock()
 	if _, ok := c.handlers[dataset]; !ok {
-		return nil
+		return nil, nil
 	}
 	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
+	if errors.Is(err, anystore.ErrCollectionNotFound) {
+		return nil, nil
+	}
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	if err := ensureHandlerIndexes(ctx, c.indexes[dataset], coll); err != nil {
-		return nil
-	}
-	if err := ensureBuiltinIndexes(ctx, coll); err != nil {
-		return nil
+	if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
+		return nil, err
 	}
 	c.collMu.Lock()
 	if existing, ok := c.collections[dataset]; ok {
 		coll = existing
-	} else {
+	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
 	}
 	c.collMu.Unlock()
-	return coll
+	return coll, nil
+}
+
+// CloseOwnedCollections closes and forgets every cached PER-OBJECT
+// collection handle (`<objectId>_<dataset>`). Shared (per-space)
+// handles and the `_meta` collection stay untouched — the Store owns
+// those, and they are shared across every controller in the space.
+//
+// Called on ocache eviction (Object.Close / TryClose): each open
+// any-store handle pins its query-planner sketch and value caches for
+// the process lifetime, so with a collection-per-object schema an
+// account's heap grows linearly with objects ever touched unless idle
+// objects release their handles.
+//
+// Recovery is open-by-name: the lazy paths (collectionForWrite /
+// collectionForRead) re-open on the next touch, and after this call
+// they stop caching (collsReleased), so a stale Controller retained
+// past eviction can never hold a closed — or later-closed — handle.
+//
+// Serialization: the caller (Object close path) holds — or held —
+// tree.Lock with Object.closed set, so no apply is in flight on this
+// controller. Unlocked readers racing the close get a one-shot
+// ErrCollectionClosed and re-open by name on retry.
+func (c *Controller) CloseOwnedCollections() error {
+	if c == nil {
+		return nil
+	}
+	c.collMu.Lock()
+	c.collsReleased.Store(true)
+	var toClose []anystore.Collection
+	for name, coll := range c.collections {
+		if _, isShared := c.shared[name]; isShared {
+			continue
+		}
+		delete(c.collections, name)
+		toClose = append(toClose, coll)
+	}
+	c.collMu.Unlock()
+	var firstErr error
+	for _, coll := range toClose {
+		if err := coll.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 // Collection returns the any-store collection backing the named
@@ -397,6 +685,55 @@ func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Co
 	return c.collectionForRead(ctx, dataset)
 }
 
+// PeekCollection returns the dataset's collection for a read that must
+// not wait on any-store's writer: the resident handle, else the handle
+// opened by name with no index reconciliation and nothing cached. A
+// nil collection with a nil error means the dataset has no handler or
+// no collection on disk; an open that fails is an error, so the caller
+// does not mistake it for an empty dataset.
+//
+// Collection and the write path ensure the dataset's indexes in a
+// write transaction on first open. Under a lock the apply path waits
+// on (the subscribe engine's fence) that transaction would stall every
+// apply in the space for as long as the writer is busy — a declared
+// index build, for one. A read through a peeked handle may run before
+// the handler's indexes exist; the next Collection or write call
+// reconciles them.
+func (c *Controller) PeekCollection(ctx context.Context, dataset string) (anystore.Collection, error) {
+	c.collMu.Lock()
+	coll, ok := c.collections[dataset]
+	c.collMu.Unlock()
+	if ok {
+		return coll, nil
+	}
+	if _, ok := c.handlers[dataset]; !ok {
+		return nil, nil
+	}
+	coll, err := c.db.OpenCollection(ctx, c.objectId+"_"+dataset)
+	if errors.Is(err, anystore.ErrCollectionNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return coll, nil
+}
+
+// RecordGetter returns a ChangeCtx.Get implementation bound to ctx —
+// the one wrapper both the handler-hook and read-tracking classify
+// seams share. When ctx carries a WriteTx (the apply path), reads
+// reuse that tx (any-store's getReadTx), so calling it from inside a
+// Modify callback or an ApplyHook is safe. Empty ids resolve to nil
+// without a store round-trip.
+func (c *Controller) RecordGetter(ctx context.Context) func(dataset, id string) *anyenc.Value {
+	return func(dataset, id string) *anyenc.Value {
+		if id == "" {
+			return nil
+		}
+		return c.Get(ctx, dataset, id)
+	}
+}
+
 // Get returns the record by id from the dataset, or nil if absent.
 //
 // The returned *anyenc.Value is cloned off any-store's pooled doc
@@ -404,16 +741,62 @@ func (c *Controller) Collection(ctx context.Context, dataset string) anystore.Co
 // the value would alias a buffer that's released back to the pool
 // before this function returns (any-store's FindId releases via
 // defer).
+//
+// id is the record id a change carries. For the id a row is stored and
+// read under — what StoreIds, events and reads return — use GetStored.
 func (c *Controller) Get(ctx context.Context, dataset, id string) *anyenc.Value {
-	coll := c.collectionForRead(ctx, dataset)
-	if coll == nil {
-		return nil
-	}
-	doc, err := coll.FindId(ctx, id)
+	return c.GetStored(ctx, dataset, c.StoreId(dataset, id))
+}
+
+// Lookup is Get for callers that must tell an absent record from a
+// read that failed: (nil, nil) when the dataset or the record does not
+// exist, the store's error otherwise. Cloned like Get.
+func (c *Controller) Lookup(ctx context.Context, dataset, id string) (*anyenc.Value, error) {
+	coll, err := c.openForRead(ctx, dataset)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	return cloneValue(doc.Value())
+	if coll == nil {
+		return nil, nil
+	}
+	doc, err := coll.FindId(ctx, c.StoreId(dataset, id))
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return anyencx.Clone(doc.Value()), nil
+}
+
+// GetStored returns the record stored under storeId in the dataset, or
+// nil if absent: the document id as it is, with no object prefix added.
+// Cloned like Get. A read that fails reads as absent; callers that
+// must tell the two apart use LookupStored.
+func (c *Controller) GetStored(ctx context.Context, dataset, storeId string) *anyenc.Value {
+	v, _ := c.LookupStored(ctx, dataset, storeId)
+	return v
+}
+
+// LookupStored is GetStored for callers that must tell an absent record
+// from a read that failed: (nil, nil) when the dataset has no
+// collection or the record does not exist, the store's error otherwise.
+func (c *Controller) LookupStored(ctx context.Context, dataset, storeId string) (*anyenc.Value, error) {
+	coll, err := c.openForRead(ctx, dataset)
+	if err != nil {
+		return nil, err
+	}
+	if coll == nil {
+		return nil, nil
+	}
+	doc, err := coll.FindId(ctx, storeId)
+	if errors.Is(err, anystore.ErrDocNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return anyencx.Clone(doc.Value()), nil
 }
 
 // NextLocalVersion returns the VersionId to stamp on a device-local
@@ -441,15 +824,99 @@ func (c *Controller) NextLocalVersion(ctx context.Context, ch *Change) VersionId
 }
 
 // IsShared reports whether the dataset uses a per-space shared
-// collection (write-side rule: row id = ObjectId, not RecordChange.Id).
-// Subscribers projecting changes back to a path-based wire need this
-// to look up the right post-apply row.
+// collection holding one row per object (write-side rule: row id =
+// ObjectId, not RecordChange.Id). Subscribers projecting changes back
+// to a path-based wire need this to look up the right post-apply row.
+// A keyed dataset is not shared in this sense.
 func (c *Controller) IsShared(dataset string) bool {
 	if c == nil {
 		return false
 	}
-	_, ok := c.shared[dataset]
+	if _, ok := c.shared[dataset]; !ok {
+		return false
+	}
+	_, keyed := c.keyed[dataset]
+	return !keyed
+}
+
+// IsKeyed reports whether the dataset's records live in a per-space
+// collection under `<objectId>/<recordId>` (HandlerReg.Keyed). The
+// collection Collection returns for it holds every object's rows:
+// bound a read with KeyedBounds.
+func (c *Controller) IsKeyed(dataset string) bool {
+	if c == nil {
+		return false
+	}
+	_, ok := c.keyed[dataset]
 	return ok
+}
+
+// StoreId is the document id recordId — the id a change carries — is
+// stored under in dataset: the keyed id for a keyed dataset, recordId
+// itself otherwise.
+func (c *Controller) StoreId(dataset, recordId string) string {
+	if c == nil {
+		return recordId
+	}
+	if _, keyed := c.keyed[dataset]; keyed {
+		return KeyedStoreId(c.objectId, recordId)
+	}
+	return recordId
+}
+
+// StoreIds rewrites record ids to the document ids they are stored
+// under in dataset, in place. A no-op unless the dataset is keyed.
+func (c *Controller) StoreIds(dataset string, ids []string) {
+	if c == nil {
+		return
+	}
+	if _, keyed := c.keyed[dataset]; !keyed {
+		return
+	}
+	for i := range ids {
+		ids[i] = KeyedStoreId(c.objectId, ids[i])
+	}
+}
+
+// keyedObject is the object id rows of dataset are stamped with: this
+// controller's when the dataset is keyed, "" otherwise.
+func (c *Controller) keyedObject(dataset string) string {
+	if _, keyed := c.keyed[dataset]; keyed {
+		return c.objectId
+	}
+	return ""
+}
+
+// objectRows is the filter selecting this object's rows in a keyed
+// dataset's collection.
+func (c *Controller) objectRows() query.Filter { return KeyedRows(c.objectId) }
+
+// KeyedRows is the filter selecting objectId's rows in a keyed
+// dataset's collection — a range on the primary key.
+func KeyedRows(objectId string) query.Filter {
+	lo, hi := KeyedBounds(objectId)
+	return query.And{
+		query.Key{Path: []string{IdField}, Filter: query.NewComp(query.CompOpGte, lo)},
+		query.Key{Path: []string{IdField}, Filter: query.NewComp(query.CompOpLt, hi)},
+	}
+}
+
+// KeyedRecordId is the record id inside the keyed document id id: what
+// follows the object's prefix. An id without that prefix is returned
+// as is.
+func KeyedRecordId(objectId, id string) string {
+	return strings.TrimPrefix(id, objectId+keySeparator)
+}
+
+// KeyedNames lists the keyed datasets among regs, in order.
+func KeyedNames(regs []HandlerReg) []string {
+	var names []string
+	for i := range regs {
+		if regs[i].Keyed {
+			names = append(names, regs[i].Name)
+		}
+	}
+	return names
 }
 
 // Records returns all live (non-tombstone) records in the dataset.
@@ -459,49 +926,58 @@ func (c *Controller) IsShared(dataset string) bool {
 // (any-store's iter.Doc reuses one DocBuffer across Next() calls).
 // For streaming over many rows, hit Collection(dataset).Find(...) +
 // Iter directly and clone selectively — Records always materialises.
+//
+// nil for a dataset without a collection and for a read that failed;
+// ListRecords tells those apart.
 func (c *Controller) Records(ctx context.Context, dataset string) []*anyenc.Value {
-	coll := c.collectionForRead(ctx, dataset)
-	if coll == nil {
-		return nil
-	}
-	iter, err := coll.Find(nil).Iter(ctx)
+	out, err := c.ListRecords(ctx, dataset)
 	if err != nil {
 		return nil
+	}
+	return out
+}
+
+// ListRecords is Records with the read's error: a failed open, a scan
+// the context ended or a row the store cannot read is an error, never
+// a short result. A damaged page fails the whole list on purpose: the
+// registries read through here (devices, spaces) are only safe when
+// complete, so an incomplete list must not pass as the whole. A
+// dataset without a collection is (nil, nil).
+func (c *Controller) ListRecords(ctx context.Context, dataset string) ([]*anyenc.Value, error) {
+	coll, err := c.openForRead(ctx, dataset)
+	if err != nil {
+		return nil, err
+	}
+	if coll == nil {
+		return nil, nil
+	}
+	var filter any
+	if c.IsKeyed(dataset) {
+		filter = c.objectRows()
+	}
+	iter, err := coll.Find(filter).Iter(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("crdt: records iter: %w", err)
 	}
 	defer iter.Close()
 	var out []*anyenc.Value
 	for iter.Next() {
 		doc, err := iter.Doc()
 		if err != nil {
-			continue
+			return nil, fmt.Errorf("crdt: records doc: %w", err)
 		}
 		v := doc.Value()
 		if isTombstone(v) {
 			continue
 		}
-		if cloned := cloneValue(v); cloned != nil {
+		if cloned := anyencx.Clone(v); cloned != nil {
 			out = append(out, cloned)
 		}
 	}
-	return out
-}
-
-// cloneValue copies an anyenc value off whatever buffer it currently
-// lives on (any-store's pooled DocBuffer or an iterator's reused
-// parser) onto a fresh parser arena. Wraps anyencutil.Value.FillCopy
-// — the canonical helper.
-//
-// Each call allocates one fresh anyencutil.Value (i.e. one fresh
-// Parser + scratch buf). The returned *anyenc.Value points into
-// that parser's arena; Go's GC keeps the parser alive as long as
-// any caller retains the value.
-func cloneValue(v *anyenc.Value) *anyenc.Value {
-	if v == nil {
-		return nil
+	if err := iter.Err(); err != nil {
+		return nil, fmt.Errorf("crdt: records iter: %w", err)
 	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value
+	return out, nil
 }
 
 // ValidateChange runs the cheap up-front checks ApplyChange would
@@ -574,12 +1050,27 @@ func (c *Controller) PreValidateLocal(ctx context.Context, ch *Change) error {
 	if !ok {
 		return nil
 	}
+	// Multi-record validators resolve pre-state per record via the
+	// getter — the batch-friendly path (a change carrying N explicit-id
+	// records gets each one's current value, not just the first's).
+	if pvm, ok := h.(LocalPreValidatorMulti); ok {
+		return pvm.PreValidateMulti(ch, func(id string) *anyenc.Value {
+			if id == "" {
+				return nil
+			}
+			return c.Get(ctx, ch.Dataset, id)
+		})
+	}
 	pv, ok := h.(LocalPreValidator)
 	if !ok {
 		return nil
 	}
 	var before *anyenc.Value
 	if c.IsShared(ch.Dataset) {
+		// The row of a shared dataset is the controller's object,
+		// whatever record id the caller wrote; the pipeline stamps the
+		// same value on the change later, the validator needs it now.
+		ch.ObjectId = c.objectId
 		before = c.Get(ctx, ch.Dataset, c.objectId)
 	} else if ids, err := ResolveRecordIds(*ch); err == nil && len(ids) > 0 {
 		before = c.Get(ctx, ch.Dataset, ids[0])
@@ -597,30 +1088,36 @@ func (c *Controller) ApplyChange(ctx context.Context, ch Change) error {
 }
 
 // ApplyChangeWithResult applies a single change per spec §7 and
-// returns the list of per-op handler rejections. The change still
-// commits even when ops are rejected — silent drops were the
-// previous behavior; surfacing them here lets the writer detect
+// returns the list of per-op rejections. The change still commits
+// when ops are rejected; the rejections let the writer detect
 // "committed with a hole" without scanning post-state.
 //
 // Wraps all mutations in a WriteTx for atomicity. When the ctx
 // already carries a WriteTx (batch mode), a savepoint is used
 // instead — lightweight and correct.
 //
-// Path syntax validation is performed up-front and aborts the whole
-// Change on failure (protocol-level bug). Handler validation runs
-// inside the per-record Modify callback and drops only the
-// offending op (recorded into ApplyResult.Rejections).
+// Content validation (op-path syntax, field class) and handler
+// validation drop only the offending op or key, recorded into
+// ApplyResult.Rejections. Local writers fail fast in ValidateChange
+// before the change enters the DAG.
 func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (ApplyResult, error) {
 	var res ApplyResult
 	if ch.DataVersion == "" {
-		return res, ErrMissingDataVersion
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, ErrMissingDataVersion)
 	}
 	if ch.ObjectId != "" && c.objectId != "" && ch.ObjectId != c.objectId {
-		return res, fmt.Errorf("crdt: change for object %q applied to controller for %q", ch.ObjectId, c.objectId)
+		return res, fmt.Errorf("%w: change for object %q applied to controller for %q", ErrInvalidChange, ch.ObjectId, c.objectId)
 	}
 	handler, ok := c.handlers[ch.Dataset]
 	if !ok {
 		return res, ErrUnknownDataset
+	}
+	// A change on a shared dataset may create its row: forget that it
+	// was absent (see objectStamper.absent).
+	for i := range c.objectStampers {
+		if c.objectStampers[i].dataset == ch.Dataset {
+			c.objectStampers[i].absent = false
+		}
 	}
 	// Lazy-open the per-object collection on first write. Reads stay
 	// tolerant of "not yet materialised" — see collectionForRead.
@@ -634,13 +1131,16 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// change's ObjectId — collapse all resolved ids onto that.
 	resolvedIds, err := resolveRecordIds(ch)
 	if err != nil {
-		return res, err
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, err)
 	}
-	if _, isShared := c.shared[ch.Dataset]; isShared && ch.ObjectId != "" {
+	if c.IsShared(ch.Dataset) && ch.ObjectId != "" {
 		for i := range resolvedIds {
 			resolvedIds[i] = ch.ObjectId
 		}
 	}
+	// A keyed dataset stores each record under the object's prefix;
+	// handlers keep seeing the record id the change carries.
+	c.StoreIds(ch.Dataset, resolvedIds)
 
 	// Field-class enforcement (the dataset schema is the source of truth):
 	//   - Derived fields are handler-only — no input op may write one;
@@ -653,7 +1153,7 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 	// Local+Injected mutual exclusion is a constructed-change invariant
 	// (a DAG change is neither), so it stays a hard abort.
 	if ch.Local && ch.Injected {
-		return res, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive"))
+		return res, fmt.Errorf("%w: %w", ErrInvalidChange, errors.Join(ErrValidation, errors.New("crdt: Local and Injected are mutually exclusive")))
 	}
 	// Per-op content validation (op-path syntax + field-class scope) is
 	// NON-fatal here: an invalid op is dropped and recorded in
@@ -733,13 +1233,22 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 		}
 	}
 
+	// One getter for the whole change — backs ChangeCtx.Get in every
+	// record's handler hooks (in-tx reads; see RecordGetter).
+	getter := c.RecordGetter(txCtx)
+	// landed: some record materialized, applied an op past every gate,
+	// or was tombstoned. Gates the object stamp below the same way
+	// BeforeModify gates the shared row's own stamp — a change that
+	// wrote nothing is not a modification.
+	landed := false
 	for i := range ch.Records {
 		id := resolvedIds[i]
-		recRej, recDerived, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i])
+		recRej, recDerived, wrote, err := c.applyRecordChange(txCtx, coll, handler, &ch, id, &ch.Records[i], getter)
 		if err != nil {
 			_ = tx.Rollback()
 			return res, err
 		}
+		landed = landed || wrote
 		// Tag rejections with the record-level context for the caller.
 		for j := range recRej {
 			recRej[j].RecordIndex = i
@@ -753,6 +1262,20 @@ func (c *Controller) ApplyChangeWithResult(ctx context.Context, ch Change) (Appl
 				res.DerivedOps = make([][]Op, len(ch.Records))
 			}
 			res.DerivedOps[i] = recDerived
+		}
+	}
+
+	if landed {
+		if err := c.applyObjectStamps(txCtx, &ch, getter, &res); err != nil {
+			_ = tx.Rollback()
+			return res, err
+		}
+	}
+
+	if c.applyHook != nil {
+		if err := c.applyHook(txCtx, &ch, resolvedIds, &res); err != nil {
+			_ = tx.Rollback()
+			return res, fmt.Errorf("crdt: apply hook: %w", err)
 		}
 	}
 
@@ -922,11 +1445,13 @@ func filterOpFields(arena *anyenc.Arena, ds schema.Dataset, route schema.Scope, 
 // know the change committed with a hole — plus the extra ops the
 // modifier stamped beyond rc.Ops (handler-emitted derived ops,
 // _ver.id creation marker), which the dispatcher merges into the
-// EventRecord.
-func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange) ([]OpRejection, []Op, error) {
+// EventRecord, and wrote: whether the record materialized, applied
+// at least one op, or was tombstoned (recordModifier.wrote).
+func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collection, handler Handler, ch *Change, id string, rc *RecordChange, getter func(dataset, id string) *anyenc.Value) ([]OpRejection, []Op, bool, error) {
 	sink := c.sinkPool.Get().(*Sink)
 	mod := c.modifierPool.Get().(*recordModifier)
-	mod.set(handler, ch, id, rc, sink)
+	mod.set(handler, ch, id, rc, sink, getter)
+	mod.keyedObject = c.keyedObject(ch.Dataset)
 
 	defer func() {
 		mod.clear()
@@ -937,7 +1462,7 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 
 	if hasDelete(rc.Ops) || rc.Upsert {
 		if _, err := coll.UpsertId(ctx, id, mod); err != nil {
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	} else {
 		if _, err := coll.UpdateId(ctx, id, mod); err != nil {
@@ -948,14 +1473,15 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 				// per-record rejection so callers can distinguish "wrote
 				// successfully" from "structural id resolved but no
 				// projection happened".
-				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, nil
+				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
 			}
-			return nil, nil, err
+			return nil, nil, false, err
 		}
 	}
 
 	rejections := mod.takeRejections()
 	derived := mod.takeDerived()
+	wrote := mod.wrote
 
 	// Sibling writes go on different collections and so cannot reuse
 	// the same modifier instance (collection-keyed locks). Each runs
@@ -963,14 +1489,14 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	// rejected by the handler, drop siblings too — Project calls
 	// before the rejection are honored only when the record lands.
 	if mod.recordErr() != nil {
-		return rejections, derived, nil
+		return rejections, derived, wrote, nil
 	}
 	if len(sink.sibling) > 0 {
 		if err := c.applySiblings(ctx, ch, sink.sibling); err != nil {
-			return rejections, derived, err
+			return rejections, derived, wrote, err
 		}
 	}
-	return rejections, derived, nil
+	return rejections, derived, wrote, nil
 }
 
 // applySiblings runs each Sibling as its own UpsertId on the matching
@@ -991,11 +1517,14 @@ func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []S
 		}
 		mod := c.modifierPool.Get().(*recordModifier)
 		mod.setSibling(ch, sib)
+		id := c.StoreId(sib.Dataset, sib.Record.Id)
+		mod.id = id
+		mod.keyedObject = c.keyedObject(sib.Dataset)
 		op := sib.Record
 		if hasDelete(op.Ops) || op.Upsert {
-			_, err = coll.UpsertId(ctx, sib.Record.Id, mod)
+			_, err = coll.UpsertId(ctx, id, mod)
 		} else {
-			_, err = coll.UpdateId(ctx, sib.Record.Id, mod)
+			_, err = coll.UpdateId(ctx, id, mod)
 			if errors.Is(err, anystore.ErrDocNotFound) {
 				err = nil
 			}
@@ -1005,6 +1534,88 @@ func (c *Controller) applySiblings(ctx context.Context, ch *Change, siblings []S
 		if err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// objectStamper pairs a shared dataset with its ObjectStamper handler.
+type objectStamper struct {
+	dataset string
+	stamper ObjectStamper
+	// absent memoizes a strict update that found no row, so an object
+	// that has no row in the shared dataset (tech-space and plaintext
+	// objects never write one) stops paying a failed lookup per
+	// change. Cleared by any change on the stamper's own dataset — the
+	// only path that creates the row through this controller; a row
+	// deleted behind the controller's back (re-index wipe) costs one
+	// more failed lookup before the memo is set again.
+	absent bool
+}
+
+// applyObjectStamps runs every registered ObjectStamper for a synced
+// change on another dataset and applies what each queued to the
+// object's row in the stamper's dataset — the sibling path (no hooks,
+// the change's VersionId, LWW-gated per field) as a strict update:
+// an absent row is not created and a tombstone is left as is. Local
+// and Injected changes never stamp — their VersionIds live in other
+// version domains and the shared row's derived fields are synced-
+// domain. The row's `_traces` stay the row's own: the stamp runs
+// without the change's TraceIds. Only the ops that took the LWW gate
+// are reported on res.ObjectStamps (a gated-out stamp must not reach
+// subscribers as a stale $set). Sink.Project from a stamper is ignored.
+func (c *Controller) applyObjectStamps(ctx context.Context, ch *Change, getter func(dataset, id string) *anyenc.Value, res *ApplyResult) error {
+	if len(c.objectStampers) == 0 || ch.Local || ch.Injected || ch.ObjectId == "" {
+		return nil
+	}
+	for i := range c.objectStampers {
+		st := &c.objectStampers[i]
+		if st.dataset == ch.Dataset || st.absent {
+			continue
+		}
+		sink := c.sinkPool.Get().(*Sink)
+		st.stamper.StampObject(&ChangeCtx{Change: ch, Get: getter}, sink)
+		if len(sink.derived) == 0 {
+			sink.reset()
+			c.sinkPool.Put(sink)
+			continue
+		}
+		ops := append([]Op(nil), sink.derived...)
+		sink.reset()
+		c.sinkPool.Put(sink)
+
+		coll, err := c.collectionForWrite(ctx, st.dataset)
+		if err != nil {
+			return err
+		}
+		stampCh := *ch
+		stampCh.TraceIds = nil
+		sib := Sibling{Dataset: st.dataset, Record: RecordChange{Id: ch.ObjectId, Ops: ops}}
+		mod := c.modifierPool.Get().(*recordModifier)
+		mod.setSibling(&stampCh, &sib)
+		_, err = coll.UpdateId(ctx, ch.ObjectId, mod)
+		// Keep only the ops that took the gate: stamps on a row whose
+		// leaves sit at different versions can land one and lose
+		// another, and the live dispatcher ships reported payloads
+		// verbatim.
+		taken := ops[:0]
+		for i, took := range mod.took {
+			if took {
+				taken = append(taken, ops[i])
+			}
+		}
+		mod.clear()
+		c.modifierPool.Put(mod)
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			st.absent = true
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("crdt: object stamp %q: %w", st.dataset, err)
+		}
+		if len(taken) == 0 {
+			continue
+		}
+		res.ObjectStamps = append(res.ObjectStamps, ObjectStamp{Dataset: st.dataset, RowId: ch.ObjectId, Ops: taken})
 	}
 	return nil
 }
@@ -1069,6 +1680,14 @@ type recordModifier struct {
 	rec     *RecordChange
 	sink    *Sink
 
+	// keyedObject is the object a row of a keyed dataset is stamped
+	// with (ObjectIdField); empty for every other dataset.
+	keyedObject string
+
+	// getter backs ChangeCtx.Get for the handler hooks; nil in sibling
+	// mode (siblings run no hooks).
+	getter func(dataset, id string) *anyenc.Value
+
 	// sibling mode: when true, the modifier is applying a Sibling.Record
 	// without invoking handler hooks.
 	siblingMode bool
@@ -1093,20 +1712,45 @@ type recordModifier struct {
 	// Buffer is pool-recycled; payloads live on appliedDerivedArena.
 	appliedDerived      []Op
 	appliedDerivedArena *anyenc.Arena
+
+	// wrote reports that Modify changed the record: it materialized,
+	// at least one op reached applyOp, or a tombstone was written.
+	// Rejected ops, delete-wins absorption and an idempotent re-delete
+	// leave it false. In sibling mode it means at least one op took
+	// the LWW gate (the record's version at the op's path is this
+	// change's), and took records that per op — the object-stamp path
+	// reports only the ops that took. That reading is exact for
+	// $set/$unset/$incGated; $inc/$addToSet/$pull never write _ver and
+	// a broad $set merged over a newer subtree keeps the survivor's
+	// version, so those read as not taken (a missed report, never a
+	// stale one).
+	wrote bool
+	took  []bool
 }
 
-func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink) {
+func (m *recordModifier) set(h Handler, ch *Change, id string, rc *RecordChange, sink *Sink, getter func(dataset, id string) *anyenc.Value) {
 	m.handler = h
 	m.ch = ch
 	m.id = id
 	m.rec = rc
 	m.sink = sink
+	m.getter = getter
+	m.keyedObject = ""
 	m.siblingMode = false
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
+	m.took = m.took[:0]
+}
+
+// stampObject records the owning object on a row of a keyed dataset.
+func (m *recordModifier) stampObject(a *anyenc.Arena, doc *anyenc.Value) {
+	if m.keyedObject != "" {
+		doc.Set(ObjectIdField, a.NewString(m.keyedObject))
+	}
 }
 
 func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
@@ -1115,12 +1759,16 @@ func (m *recordModifier) setSibling(ch *Change, sib *Sibling) {
 	m.id = sib.Record.Id
 	m.rec = nil
 	m.sink = nil
+	m.getter = nil
+	m.keyedObject = ""
 	m.siblingMode = true
 	m.siblingRec = &sib.Record
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
+	m.took = m.took[:0]
 }
 
 func (m *recordModifier) clear() {
@@ -1129,11 +1777,15 @@ func (m *recordModifier) clear() {
 	m.id = ""
 	m.rec = nil
 	m.sink = nil
+	m.getter = nil
+	m.keyedObject = ""
 	m.siblingRec = nil
 	m.recordedErr = nil
 	m.rejections = m.rejections[:0]
 	m.appliedDerived = m.appliedDerived[:0]
 	m.appliedDerivedArena = nil
+	m.wrote = false
+	m.took = m.took[:0]
 }
 
 func (m *recordModifier) recordErr() error { return m.recordedErr }
@@ -1204,14 +1856,16 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			}
 			return existing, false, nil
 		}
-		ctx := &ChangeCtx{Change: ch, Before: existing}
+		ctx := &ChangeCtx{Change: ch, Before: existing, Get: m.getter}
 		if err := m.handler.BeforeDelete(ctx, rc, m.sink); err != nil {
 			m.recordedErr = err
 			m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
 			return existing, false, nil // drop record, batch keeps going
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
+		m.stampObject(a, tomb)
 		updateTraces(a, tomb, *ch)
+		m.wrote = true
 		return tomb, true, nil
 	}
 
@@ -1224,6 +1878,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
+		m.stampObject(a, existing)
 		// Mirror the stamp as a synthetic derived op so the dispatcher
 		// includes _ver.id in the create event. Allocates on the
 		// modifier's own arena — a's lifetime ends with this Modify
@@ -1234,22 +1889,35 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			Path:    []string{VersionsKey, IdField},
 			Payload: m.derivedArena().NewString(string(ch.VersionId)),
 		})
+		if m.keyedObject != "" {
+			m.appliedDerived = append(m.appliedDerived, Op{
+				Type:    OpSet,
+				Path:    []string{ObjectIdField},
+				Payload: m.derivedArena().NewString(m.keyedObject),
+			})
+		}
 
 		// Local and Injected materializations are handler-exclusive —
 		// their validation is writer-side (Properties.Set / the mirror).
 		if !ch.Local && !ch.Injected {
-			ctx := &ChangeCtx{Change: ch, Before: nil}
+			ctx := &ChangeCtx{Change: ch, Before: nil, Get: m.getter}
 			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
 				m.recordedErr = err
 				m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
 				return existing, false, nil
 			}
 		}
+		m.wrote = true
 		for i := range rc.Ops {
 			applyOp(a, existing, *ch, rc.Ops[i])
 		}
 		m.drainDerivedTo(a, existing, ch)
 	} else if isTombstone(existing) {
+		// Delete-wins: none of the ops land — the tombstone is sticky.
+		// Report the absorption so a local caller can tell it from a
+		// successful create; remote replays discard rejections. The
+		// convergence bookkeeping below is unchanged.
+		m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: ErrRecordDeleted})
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 			stampAddSeq(a, existing, ch.AddSeq)
 			updateTraces(a, existing, *ch)
@@ -1260,7 +1928,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		if rc.Upsert {
 			lowerCreationMarker(a, existing, ch.VersionId)
 		}
-		ctx := &ChangeCtx{Change: ch, Before: existing}
+		ctx := &ChangeCtx{Change: ch, Before: existing, Get: m.getter}
 		for i := range rc.Ops {
 			op := &rc.Ops[i]
 			// Local and Injected materializations are handler-exclusive
@@ -1268,6 +1936,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			// validation/derivation, just the gated apply.
 			if ch.Local || ch.Injected {
 				applyOp(a, existing, *ch, *op)
+				m.wrote = true
 				continue
 			}
 			m.beforeModifyApply(a, existing, ctx, op, i)
@@ -1300,9 +1969,11 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 // the field-class salvage filterOpFields does one layer up.
 //
 // Safe to call BeforeModify more than once: every handler's BeforeModify
-// is pure validation (no sink writes), so the combined-then-per-key
-// probing has no side effects, and each handler's single-path branch is
-// the per-key equivalent of its multi-field branch.
+// is pure validation, or writes the sink only from the multi-field
+// branch with an idempotent row (the property handler's duplicate-create
+// shortId), so the combined-then-per-key probing has no side effects,
+// and each handler's single-path branch is the per-key equivalent of its
+// multi-field branch.
 func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Value, ctx *ChangeCtx, op *Op, opIndex int) {
 	isMultiField := (op.Type == OpSet || op.Type == OpUnset) && len(op.Path) == 0 &&
 		op.Payload != nil && op.Payload.Type() == anyenc.TypeObject
@@ -1310,6 +1981,7 @@ func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Val
 	err := m.handler.BeforeModify(ctx, m.rec, op, m.sink)
 	if err == nil {
 		applyOp(a, existing, *m.ch, *op)
+		m.wrote = true
 		return
 	}
 	if !isMultiField {
@@ -1336,6 +2008,7 @@ func (m *recordModifier) beforeModifyApply(a *anyenc.Arena, existing *anyenc.Val
 		return
 	}
 	applyOp(a, existing, *m.ch, Op{Type: op.Type, Payload: kept})
+	m.wrote = true
 }
 
 // applySibling is the modifier path for a Sibling write — no handler, no
@@ -1356,7 +2029,9 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 			return existing, false, nil
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
+		m.stampObject(a, tomb)
 		updateTraces(a, tomb, *ch)
+		m.wrote = true
 		return tomb, true, nil
 	}
 
@@ -1364,6 +2039,7 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 		ver := a.NewObject()
 		ver.Set(IdField, a.NewString(string(ch.VersionId)))
 		existing.Set(VersionsKey, ver)
+		m.stampObject(a, existing)
 	} else if isTombstone(existing) {
 		if rc.Upsert && lowerCreationMarker(a, existing, ch.VersionId) {
 			stampAddSeq(a, existing, ch.AddSeq)
@@ -1377,12 +2053,37 @@ func (m *recordModifier) applySibling(a *anyenc.Arena, existing *anyenc.Value) (
 
 	for i := range rc.Ops {
 		applyOp(a, existing, *ch, rc.Ops[i])
+		took := opTook(existing, ch.VersionId, rc.Ops[i])
+		m.took = append(m.took, took)
+		m.wrote = m.wrote || took
 	}
 	stampAddSeq(a, existing, ch.AddSeq)
 	stampApplySeq(a, existing, ch.ApplySeq)
 	updateTraces(a, existing, *ch)
 	compactVersions(a, existing)
 	return existing, true, nil
+}
+
+// opTook reports whether op's write took the LWW gate: the record's
+// version at the op's path (any key of a multi-field payload) is the
+// change's own. Read before compactVersions, while the leaf is
+// explicit. A replay of the same change reads as took — its stamp is
+// the value already there.
+func opTook(rec *anyenc.Value, version VersionId, op Op) bool {
+	if len(op.Path) > 0 {
+		return GetRecordVersion(rec, op.Path...) == version
+	}
+	if op.Payload == nil || op.Payload.Type() != anyenc.TypeObject {
+		return false
+	}
+	took := false
+	obj, _ := op.Payload.Object()
+	obj.Visit(func(k []byte, _ *anyenc.Value) {
+		if !took && GetRecordVersion(rec, strings.Split(string(k), ".")...) == version {
+			took = true
+		}
+	})
+	return took
 }
 
 // drainDerivedTo applies and clears Sink.derived against target (the

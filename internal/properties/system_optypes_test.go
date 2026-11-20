@@ -74,15 +74,15 @@ func TestSystemPropertiesHandler_IncRequiresNumber(t *testing.T) {
 	assert.Equal(t, float64(6), rec.GetFloat64(typeAny, propRating), "$inc on the number field applied")
 }
 
-// T4c — multi-field $set (empty Path, dotted-key object payload) is
-// all-or-nothing per op: one bad key drops the WHOLE op (v1 doesn't
-// filter individual keys), and an all-good op lands every key.
-func TestSystemPropertiesHandler_MultiFieldAllOrNothing(t *testing.T) {
+// T4c — multi-field $set (empty Path, dotted-key object payload) sheds
+// per key: a bad key is dropped on its own and the good keys land; an
+// all-good op lands every key; an op whose every key fails drops.
+func TestSystemPropertiesHandler_MultiFieldShedsPerKey(t *testing.T) {
 	ctx := context.Background()
 	ctrl := newPropsController(t, defaultRegistry())
 	a := &anyenc.Arena{}
 
-	// One bad key (string into number) poisons the whole multi-field op.
+	// One bad key (string into number) is shed; the good key lands.
 	bad := a.NewObject()
 	bad.Set(typeAny+"."+propName, a.NewString("ok"))
 	bad.Set(typeAny+"."+propRating, a.NewString("not-a-number"))
@@ -91,10 +91,9 @@ func TestSystemPropertiesHandler_MultiFieldAllOrNothing(t *testing.T) {
 		crdt.Op{Type: crdt.OpSet, Payload: bad},
 	)))
 	rec := ctrl.Get(ctx, properties.Dataset, testObjectId)
-	if rec != nil {
-		assert.Nil(t, rec.Get(typeAny, propName), "good key dropped with the bad one (whole-op drop)")
-		assert.Nil(t, rec.Get(typeAny, propRating), "bad key dropped")
-	}
+	require.NotNil(t, rec)
+	assert.Equal(t, "ok", rec.GetString(typeAny, propName), "good key landed next to the shed one")
+	assert.Nil(t, rec.Get(typeAny, propRating), "bad key shed")
 
 	// All-good multi-field op lands every key.
 	good := a.NewObject()
@@ -110,7 +109,8 @@ func TestSystemPropertiesHandler_MultiFieldAllOrNothing(t *testing.T) {
 	assert.Equal(t, float64(3), rec.GetFloat64(typeAny, propRating))
 
 	// A key that isn't a dotted typeId.propId pair (here "any", no dot)
-	// is an invalid path → whole op drops, prior values untouched.
+	// is an invalid path; as the op's only key it drops the op, prior
+	// values untouched.
 	nodot := a.NewObject()
 	nodot.Set(typeAny, a.NewString("x"))
 	require.NoError(t, ctrl.ApplyChange(ctx, makeChange(

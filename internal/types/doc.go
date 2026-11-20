@@ -12,6 +12,6 @@
 //   - emits OnShortIdAdded so higher layers can drain detached changes
 //
 // Not public — space.TypesAPI wraps the registry for caller use. See
-// docs/06-data-structure.md §"Types, Properties & Data Schemas" and
+// docs/data-structure.md §"Types, Properties & Data Schemas" and
 // docs/types-properties-proposal.md.
 package types

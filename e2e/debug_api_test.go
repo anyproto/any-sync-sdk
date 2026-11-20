@@ -28,6 +28,7 @@ import (
 // config isn't present, same as the other end-to-end tests in this
 // package — Open requires a node-config YAML.
 func TestSDK_DebugAPI(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -57,7 +58,7 @@ func TestSDK_DebugAPI(t *testing.T) {
 	require.NoError(t, err)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 

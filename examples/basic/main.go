@@ -2,11 +2,6 @@
 // define a user type with properties, create an object of that type,
 // write property values at multiple scopes (base, account, device),
 // write user data to a type-owned dataset, query, subscribe.
-//
-// Compiles against the current public interfaces. The internal layers
-// are stubbed, so running this will currently return nil handles and
-// panic on the first method call — its purpose today is to pressure-test
-// the API shape from a caller's perspective.
 package main
 
 import (
@@ -81,7 +76,7 @@ func run() error {
 	// InitialProperties seeds base-scope values in one step (saves a
 	// separate SetBase roundtrip).
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 		InitialProperties: map[string]map[string]any{
 			typeId: {
 				"title": "Research",
@@ -213,6 +208,7 @@ func makeAuth(_ context.Context) (auth.Provider, error) {
 	p, err := auth.NewFileProvider(auth.FileProviderConfig{
 		Path:    filepath.Join(home, ".any", "wallet.key"),
 		Passkey: os.Getenv("ANY_SYNC_PASSKEY"),
+		Index:   auth.DefaultAccountIndex,
 	})
 	if err != nil {
 		return nil, err

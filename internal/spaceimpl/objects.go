@@ -4,24 +4,35 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/settings"
+	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// uniqueTypes returns the deduplicated typeIds touched by a Create
-// bootstrap — opts.Types ∪ keys(opts.InitialProperties). Order is
-// stable (Types first, then InitialProperties keys in iteration
+// uniqueOwners returns the deduplicated owner ids a Create bootstrap
+// touches — the type, the collections and the InitialProperties keys.
+// Order is stable (type, collections, then the keys in iteration
 // order).
-func uniqueTypes(opts space.CreateObjectOpts) []string {
-	seen := make(map[string]struct{}, len(opts.Types)+len(opts.InitialProperties))
-	out := make([]string, 0, len(opts.Types)+len(opts.InitialProperties))
-	for _, t := range opts.Types {
+func uniqueOwners(opts space.CreateObjectOpts) []string {
+	seen := make(map[string]struct{}, 1+len(opts.Collections)+len(opts.InitialProperties))
+	out := make([]string, 0, 1+len(opts.Collections)+len(opts.InitialProperties))
+	if opts.Type != "" {
+		seen[opts.Type] = struct{}{}
+		out = append(out, opts.Type)
+	}
+	for _, t := range opts.Collections {
 		if _, dup := seen[t]; dup {
 			continue
 		}
@@ -38,23 +49,23 @@ func uniqueTypes(opts space.CreateObjectOpts) []string {
 	return out
 }
 
-// dataVersionForTypes encodes a multi-type DataVersion using the
-// registry's latest shortId per type. Skips types with no important
-// changes — their pair is omitted (an absent type contributes
-// nothing to the gate).
+// dataVersionForOwners encodes a multi-owner DataVersion using the
+// registry's latest shortId per owner (a type or a collection). Skips
+// owners with no important changes — their pair is omitted (an absent
+// owner contributes nothing to the gate).
 //
-// Empty result (no types known to the registry) falls back to the
+// Empty result (no owner known to the registry) falls back to the
 // hardcoded handler version, which the gate treats as "no schema
 // constraint".
-func dataVersionForTypes(ctx context.Context, reg *types.LiveRegistry, typeIds []string) (string, error) {
-	if reg == nil || len(typeIds) == 0 {
+func dataVersionForOwners(ctx context.Context, reg *types.LiveRegistry, ownerIds []string) (string, error) {
+	if reg == nil || len(ownerIds) == 0 {
 		return properties.HandlerVersion, nil
 	}
-	pairs := make([]types.DataVersionPair, 0, len(typeIds))
-	for _, t := range typeIds {
+	pairs := make([]types.DataVersionPair, 0, len(ownerIds))
+	for _, t := range ownerIds {
 		shortId, err := reg.LatestShortId(ctx, t)
 		if err != nil {
-			return "", fmt.Errorf("dataVersionForTypes[%s]: %w", t, err)
+			return "", fmt.Errorf("dataVersionForOwners[%s]: %w", t, err)
 		}
 		if shortId == "" {
 			continue
@@ -68,6 +79,16 @@ func dataVersionForTypes(ctx context.Context, reg *types.LiveRegistry, typeIds [
 	return encoded, nil
 }
 
+var objectLog = logger.NewNamed("sdk.objects")
+
+// objectChangeType is the tree change-type every user-space object is
+// created and derived with. It is part of a derived object's id, so
+// every deriver of the same object must pass the same value.
+const objectChangeType = "object"
+
+// cleanupTimeout bounds the purge that reclaims a half-made object.
+const cleanupTimeout = 30 * time.Second
+
 // objectService implements space.ObjectService backed by the
 // per-space spaceobjects.Store.
 type objectService struct {
@@ -77,11 +98,24 @@ type objectService struct {
 func newObjectService(parent *spaceImpl) *objectService { return &objectService{parent: parent} }
 
 // Create makes a fresh object on the space, runs the optional
-// bootstrap modify (any.types + InitialProperties) in one extra
+// bootstrap modify (membership + InitialProperties) in one extra
 // change, and returns the new objectId.
 func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts) (string, error) {
+	var src *copySource
+	if opts.From != "" {
+		var err error
+		if src, opts, err = o.resolveCopy(ctx, opts); err != nil {
+			return "", err
+		}
+	}
+	if opts.Type == "" {
+		return "", fmt.Errorf("%w: CreateObjectOpts.Type", space.ErrTypeRequired)
+	}
+	if properties.IsMetaType(opts.Type) {
+		return "", fmt.Errorf("%w: CreateObjectOpts.Type %q", space.ErrMetaType, opts.Type)
+	}
 	obj, err := o.parent.store.Create(ctx, spaceobjects.CreateOpts{
-		ChangeType: "object",
+		ChangeType: objectChangeType,
 	})
 	if err != nil {
 		return "", err
@@ -90,79 +124,282 @@ func (o *objectService) Create(ctx context.Context, opts space.CreateObjectOpts)
 
 	if needsBootstrap(opts) {
 		if _, err := o.bootstrap(ctx, objectId, opts); err != nil {
+			// A refused bootstrap (a wrong slot, an owner the object
+			// does not have) would leave a bare tree nothing references.
+			// A root-only tree is outside head-sync, so a local purge
+			// reclaims it without a settings-tree deletion record. The
+			// purge runs on a context the failure's own cancellation
+			// cannot take down.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			derr := o.parent.store.DeleteTree(cleanupCtx, objectId)
+			cancel()
+			if derr != nil {
+				objectLog.Warn("orphaned tree after a refused bootstrap", zap.String("objectId", objectId), zap.Error(derr))
+			}
+			return "", err
+		}
+	}
+	if src != nil {
+		if err := o.copyDatasets(ctx, src, objectId); err != nil {
+			// The row is already written: a half copy is reclaimed the
+			// way a user delete is, best effort, on a context the
+			// failure's own cancellation cannot take down.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupTimeout)
+			derr := o.Delete(cleanupCtx, objectId)
+			cancel()
+			if derr != nil {
+				logCopyAbort(objectId, derr)
+			}
 			return "", err
 		}
 	}
 	return objectId, nil
 }
 
+// Get reads the object's row from the shared objects collection. An
+// absent or tombstoned row alone is ambiguous (deletion hard-removes
+// the row, and a live object that never wrote a property has none),
+// so the tree decides: deleted → ErrObjectDeleted, present without a
+// row → a synthetic {id} row, unknown → ErrNotFound.
+func (o *objectService) Get(ctx context.Context, objectId string) (*anyenc.Value, error) {
+	if objectId == "" {
+		return nil, errors.New("spaceimpl: Objects().Get: empty object id")
+	}
+	coll, err := o.parent.store.SharedObjects(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: shared objects: %w", err)
+	}
+	var row *anyenc.Value
+	doc, err := coll.FindId(ctx, objectId)
+	switch {
+	case err == nil:
+		row = doc.Value()
+	case errors.Is(err, anystore.ErrDocNotFound):
+	default:
+		return nil, fmt.Errorf("spaceimpl: find object %s: %w", objectId, err)
+	}
+	if live := liveObjectRow(row); live {
+		// Doc's buffer is reused; clone before returning.
+		return anyencx.Clone(row), nil
+	}
+	deleted, err := o.parent.store.TreeDeleted(ctx, objectId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: object %s: deleted status: %w", objectId, err)
+	}
+	if deleted {
+		return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrObjectDeleted)
+	}
+	present, err := o.parent.store.HasTree(ctx, objectId)
+	if err != nil {
+		return nil, fmt.Errorf("spaceimpl: object %s: tree presence: %w", objectId, err)
+	}
+	if present {
+		a := &anyenc.Arena{}
+		row := a.NewObject()
+		row.Set("id", a.NewString(objectId))
+		return row, nil
+	}
+	return nil, fmt.Errorf("spaceimpl: object %s: %w", objectId, space.ErrNotFound)
+}
+
+// liveObjectRow reports whether v is a present, non-tombstoned row.
+func liveObjectRow(v *anyenc.Value) bool {
+	return v != nil && v.Get(crdt.DeletedAtField) == nil
+}
+
 // Derive creates a deterministic object from a seed. Idempotent — a
-// second call with the same seed returns the same id.
+// second call with the same seed returns the same id and, when the
+// requested Types are already attached, writes no change at all.
 func (o *objectService) Derive(ctx context.Context, opts space.DeriveObjectOpts) (string, error) {
-	obj, err := o.parent.store.Derive(ctx, spaceobjects.DeriveOpts{
-		ChangeType:    "object",
+	derive := spaceobjects.DeriveOpts{
+		ChangeType:    objectChangeType,
 		ChangePayload: opts.Seed,
-	})
+		ParentId:      opts.ParentId,
+	}
+	// A derived tree cannot be deleted, so a meta type is refused before
+	// anything is minted, and only when it would be set: an object that
+	// already has a type keeps it (missingMembers).
+	if properties.IsMetaType(opts.Type) {
+		id, err := o.parent.store.DeriveId(ctx, derive)
+		if err != nil {
+			return "", err
+		}
+		members, err := o.parent.store.ObjectMembers(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if members.Type == "" {
+			return "", fmt.Errorf("%w: DeriveObjectOpts.Type %q", space.ErrMetaType, opts.Type)
+		}
+	}
+	if opts.Type == "" {
+		// The rule is checked before anything is minted, like Create:
+		// the id is a pure function of the seed, and the row tells
+		// whether the object already has a type.
+		id, err := o.parent.store.DeriveId(ctx, derive)
+		if err != nil {
+			return "", err
+		}
+		members, err := o.parent.store.ObjectMembers(ctx, id)
+		if err != nil {
+			return "", err
+		}
+		if members.Type == "" {
+			// A child not here yet is refused for its parent's state
+			// first: on a device the parent hasn't reached, the caller
+			// needs the retry-after-sync sentinel, not a type.
+			if opts.ParentId != "" {
+				if _, err := o.parent.store.CheckDeriveParent(ctx, id, opts.ParentId); err != nil {
+					return "", err
+				}
+			}
+			return "", fmt.Errorf("%w: DeriveObjectOpts.Type on an object with no type yet", space.ErrTypeRequired)
+		}
+	}
+	obj, err := o.parent.store.Derive(ctx, derive)
 	if err != nil {
 		return "", err
 	}
 	objectId := obj.Id()
 
-	// Type-binding is best-effort on Derive: if the index record
-	// doesn't exist yet we attempt to seed it. Subsequent calls (for
-	// the same id) skip — handler-level upsert semantics handle the
-	// idempotent case.
-	if len(opts.Types) > 0 {
-		if _, err := o.bootstrap(ctx, objectId, space.CreateObjectOpts{Types: opts.Types}); err != nil {
+	// Membership is idempotent in the DAG, not just in state: the
+	// requested type is set only when the row has none (a type it
+	// already has is never replaced), and only the collections the row
+	// lacks are added, one $addToSet op each — never a whole-array
+	// $set, so a collection attached concurrently is not clobbered.
+	// Derive runs on hot resolve paths ("the well-known chat/brain
+	// object of this space"), so a no-op call must not append a change.
+	setType, missing, err := o.missingMembers(ctx, objectId, opts.Type, opts.Collections)
+	if err != nil {
+		return "", err
+	}
+	if setType != "" || len(missing) > 0 {
+		if err := o.attachMembers(ctx, objectId, setType, missing); err != nil {
 			return "", err
 		}
 	}
 	return objectId, nil
 }
 
-// Delete tombstones the object, then marks it deleted via the space's
-// settings tree and drops our cached state.
+// missingMembers compares the wanted membership against the object's
+// row: the type to set (empty when the row already has one; a row
+// with none needs one — ErrTypeRequired) and the collections absent
+// from the row (deduplicated, input order preserved). A missing row
+// reads as nothing, so everything requested is reported on first
+// derive.
+func (o *objectService) missingMembers(ctx context.Context, objectId, wantType string, wantCollections []string) (string, []string, error) {
+	current, err := o.parent.store.ObjectMembers(ctx, objectId)
+	if err != nil {
+		return "", nil, err
+	}
+	setType := ""
+	if current.Type == "" {
+		if wantType == "" {
+			return "", nil, fmt.Errorf("%w: DeriveObjectOpts.Type on an object with no type yet", space.ErrTypeRequired)
+		}
+		setType = wantType
+	}
+	have := make(map[string]struct{}, len(current.Collections)+len(wantCollections))
+	for _, t := range current.Collections {
+		have[t] = struct{}{}
+	}
+	out := make([]string, 0, len(wantCollections))
+	for _, t := range wantCollections {
+		if _, dup := have[t]; dup {
+			continue
+		}
+		have[t] = struct{}{}
+		out = append(out, t)
+	}
+	return setType, out, nil
+}
+
+// attachMembers writes the membership the object lacks in one change:
+// a $set of the type when setType is non-empty, one $addToSet per
+// collection — the same ops SetType / AttachCollection use, so
+// concurrent attaches merge instead of last-write-wins.
+func (o *objectService) attachMembers(ctx context.Context, objectId, setType string, collections []string) error {
+	// Membership alone carries no values, so it stamps no schema
+	// constraint: a peer behind on the owners' definitions applies it
+	// rather than parking the object typeless.
+	obj, err := o.parent.store.Get(ctx, objectId)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	ops := make([]crdt.Op, 0, 1+len(collections))
+	if setType != "" {
+		ops = append(ops, crdt.Op{
+			Type:    crdt.OpSet,
+			Path:    []string{anytype.TypeId, anytype.FieldType},
+			Payload: arena.NewString(setType),
+		})
+	}
+	for _, t := range collections {
+		ops = append(ops, crdt.Op{
+			Type:    crdt.OpAddToSet,
+			Path:    []string{anytype.TypeId, anytype.FieldCollections},
+			Payload: arena.NewString(t),
+		})
+	}
+	_, err = obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: properties.HandlerVersion,
+		Records: []crdt.RecordChange{{
+			Id:     objectId,
+			Upsert: true,
+			Ops:    ops,
+		}},
+	})
+	return wrapSlotErr(err)
+}
+
+// Delete records the deletion in the any-sync settings tree — the
+// authoritative, synced deletion record — and reclaims the object's local
+// state.
 //
-// The CRDT `delete` op below runs first, while the tree is still
-// live: the apply pipeline tombstones the object's `objects` record
-// (Query's tombstone filter then hides it) and fires the Deleted
-// subscription event via afterApply. The any-sync settings-tree write
-// then fans the deletion out to peers; the local any-store tombstone
-// row stays until a future cleanup pass — Query skips it, and ids are
-// content-addressable so reuse can't happen.
+// The settings-tree write propagates the deletion to every device and
+// cascades to any bound children; each device's DeleteTree/MarkTreeDeleted
+// callback then purges its own local projection. We also reclaim locally
+// and synchronously so the object leaves local queries immediately: the
+// store.DeleteTree call tombstones the object's own tree FIRST (so any-sync
+// rejects any further apply and no concurrent inbound change can
+// re-materialize the row) and then purges. It is best-effort — the async
+// settings-tree cascade is authoritative and re-runs it (a no-op once the
+// tree is deleted). No CRDT tombstone is written; any-sync's head storage
+// is the durable, cross-device record that the tree is deleted.
 func (o *objectService) Delete(ctx context.Context, objectId string) error {
 	if objectId == "" {
 		return errors.New("spaceimpl: Objects.Delete requires objectId")
 	}
-	obj, err := o.parent.store.Get(ctx, objectId)
-	if err != nil {
-		return fmt.Errorf("spaceimpl: get object %s: %w", objectId, err)
+	if err := o.parent.writeGate(ctx); err != nil {
+		return err
 	}
-	if _, err := obj.LocalWrite(ctx, crdt.Change{
-		Dataset:     properties.Dataset,
-		DataVersion: properties.HandlerVersion,
-		Records: []crdt.RecordChange{
-			{Id: objectId, Ops: []crdt.Op{{Type: crdt.OpDelete}}},
-		},
-	}); err != nil {
-		return fmt.Errorf("spaceimpl: tombstone %s: %w", objectId, err)
-	}
-
 	handle, err := o.parent.app.GetSpace(ctx, o.parent.id)
 	if err != nil {
 		return fmt.Errorf("spaceimpl: get space: %w", err)
 	}
 	if err := handle.Inner().DeleteTree(ctx, objectId); err != nil {
+		if errors.Is(err, settings.ErrAlreadyDeleted) {
+			return fmt.Errorf("spaceimpl: DeleteTree %s: %w: %w", objectId, space.ErrObjectDeleted, err)
+		}
 		return fmt.Errorf("spaceimpl: DeleteTree %s: %w", objectId, err)
 	}
-	o.parent.store.Drop(objectId)
+	// Local reclaim, so the object leaves local reads before Delete
+	// returns. The async cascade runs DeleteTree as well and retries a
+	// failure here; the tree is never purged without its tombstone, or a
+	// reload of the live tree would bring the rows back.
+	if err := o.parent.store.DeleteTree(ctx, objectId); err != nil {
+		objectLog.Warn("delete: local reclaim failed; the deletion cascade retries it",
+			zap.String("spaceId", o.parent.id), zap.String("objectId", objectId), zap.Error(err))
+	}
 	return nil
 }
 
 // needsBootstrap returns true when CreateObjectOpts carries any
 // caller-supplied initial state.
 func needsBootstrap(opts space.CreateObjectOpts) bool {
-	if len(opts.Types) > 0 {
+	if opts.Type != "" || len(opts.Collections) > 0 {
 		return true
 	}
 	for _, props := range opts.InitialProperties {
@@ -173,37 +410,73 @@ func needsBootstrap(opts space.CreateObjectOpts) bool {
 	return false
 }
 
-// bootstrap writes the post-create initial state (any.types +
-// per-type property values) into the object's `properties` dataset.
-// One Modify call regardless of how many types / properties are
-// being seeded — keeps the DAG clean.
+// bootstrap writes the post-create initial state (membership +
+// per-owner property values) into the object's `properties` dataset.
+// One change regardless of how many owners / properties are being
+// seeded — keeps the DAG clean — carrying one multi-field op for the
+// membership and one per owner's values, with the template stamp on
+// its own: a peer that does not know a field sheds that key, one that
+// does not know an owner drops the op that carries it, and the rest of
+// the row lands, so an object stays typed and named everywhere.
 func (o *objectService) bootstrap(ctx context.Context, objectId string, opts space.CreateObjectOpts) (space.ModifyResult, error) {
 	arena := &anyenc.Arena{}
-	multi := arena.NewObject()
+	var ops []crdt.Op
 
-	if len(opts.Types) > 0 {
+	membership := arena.NewObject()
+	if opts.Type != "" {
+		membership.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(opts.Type))
+	}
+	if len(opts.Collections) > 0 {
 		arr := arena.NewArray()
-		for i, t := range opts.Types {
+		for i, t := range opts.Collections {
 			arr.SetArrayItem(i, arena.NewString(t))
 		}
-		multi.Set("any.types", arr)
+		membership.Set(anytype.TypeId+"."+anytype.FieldCollections, arr)
 	}
-	for typeId, kv := range opts.InitialProperties {
+	if opts.Type != "" || len(opts.Collections) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: membership})
+	}
+	for _, typeId := range uniqueOwners(opts) {
+		kv := opts.InitialProperties[typeId]
+		if len(kv) == 0 {
+			continue
+		}
+		group := arena.NewObject()
+		var stamp *anyenc.Value
+		n := 0
 		for propId, val := range kv {
+			if typeId == anytype.TypeId && (propId == anytype.FieldType || propId == anytype.FieldCollections) {
+				// Membership has one source, Type / Collections: a value
+				// here would make the pre-flight check one type and the
+				// apply write another.
+				continue
+			}
 			v, err := goToAnyenc(arena, val)
 			if err != nil {
 				return space.ModifyResult{}, fmt.Errorf("InitialProperties[%s.%s]: %w", typeId, propId, err)
 			}
-			multi.Set(typeId+"."+propId, v)
+			if typeId == anytype.TypeId && propId == anytype.FieldTemplate {
+				stamp = v
+				continue
+			}
+			group.Set(typeId+"."+propId, v)
+			n++
+		}
+		if n > 0 {
+			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: group})
+		}
+		if stamp != nil {
+			only := arena.NewObject()
+			only.Set(anytype.TypeId+"."+anytype.FieldTemplate, stamp)
+			ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: only})
 		}
 	}
 
-	// Compute DataVersion across every type touched: opts.Types
-	// (binding side-effect) and the keys of opts.InitialProperties
-	// (value writes). Each contributes one (typeId, latestShortId)
-	// pair if available.
-	touched := uniqueTypes(opts)
-	dataVersion, err := dataVersionForTypes(ctx, o.parent.store.Registry(), touched)
+	// Compute DataVersion across every owner touched: the type, the
+	// collections and the keys of opts.InitialProperties. Each
+	// contributes one (ownerId, latestShortId) pair if available.
+	touched := uniqueOwners(opts)
+	dataVersion, err := dataVersionForOwners(ctx, o.parent.store.Registry(), touched)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
@@ -218,12 +491,12 @@ func (o *objectService) bootstrap(ctx context.Context, objectId string, opts spa
 			{
 				Id:     objectId,
 				Upsert: true,
-				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
+				Ops:    ops,
 			},
 		},
 	})
 	if err != nil {
-		return space.ModifyResult{}, err
+		return space.ModifyResult{}, wrapSlotErr(err)
 	}
 	return modifyResultFromWrite(res), nil
 }

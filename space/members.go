@@ -1,6 +1,10 @@
 package space
 
-import "context"
+import (
+	"context"
+
+	"github.com/anyproto/any-sync/util/crypto"
+)
 
 // MembersAPI is the read-side facade over a space's ACL state. Reads
 // are point-in-time snapshots derived from the locally replicated ACL
@@ -95,7 +99,7 @@ type Member struct {
 // MemberStatus is the membership lifecycle stage. Mirrors any-sync's
 // list.AclStatus, plus MemberStatusJoining for pending join requests
 // (which any-sync tracks in a separate map but the SDK surfaces as
-// part of the same members view — see docs/03-space.md § "Members as
+// part of the same members view — see docs/space.md § "Members as
 // a collection").
 type MemberStatus uint8
 
@@ -108,6 +112,30 @@ const (
 	MemberStatusRemoving
 	MemberStatusCanceled
 )
+
+// String returns the canonical wire label for the status — "unknown" /
+// "joining" / "active" / "removed" / "declined" / "removing" /
+// "canceled". Also the on-disk representation in the members
+// collection (see MembersAPI.Query). Unknown values stringify as
+// "unknown".
+func (s MemberStatus) String() string {
+	switch s {
+	case MemberStatusJoining:
+		return "joining"
+	case MemberStatusActive:
+		return "active"
+	case MemberStatusRemoved:
+		return "removed"
+	case MemberStatusDeclined:
+		return "declined"
+	case MemberStatusRemoving:
+		return "removing"
+	case MemberStatusCanceled:
+		return "canceled"
+	default:
+		return "unknown"
+	}
+}
 
 // MemberEvent is one delivery on a Subscribe firehose. Kind tells the
 // subscriber what changed; Member carries the post-event state;
@@ -160,4 +188,14 @@ type InviteInfo struct {
 	// RequestToJoin path it is set at accept time. Always
 	// PermissionNone here in v1.
 	Permission Permission
+	// Key is the invite private key when THIS account minted the
+	// invite: recovered from the account's synced issued-key custody
+	// (the ACL record carries only the public key), so it is present
+	// on every device of the minting account and nil everywhere else —
+	// other members', even admins', devices never held it. Also nil
+	// for invites minted before custody shipped (re-mint once to make
+	// them recoverable) and for custody gone stale (invite replaced /
+	// revoked elsewhere). Non-nil Key re-encodes to the original share
+	// token via EncodeInvite(Invite{SpaceId, InviteKey: Key}).
+	Key crypto.PrivKey
 }

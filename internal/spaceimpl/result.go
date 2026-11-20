@@ -17,6 +17,7 @@ func modifyResultFromWrite(w object.WriteResult) space.ModifyResult {
 		ChangeId:   w.ChangeId,
 		RecordIds:  w.RecordIds,
 		Rejections: convertRejections(w.Rejections),
+		ApplySeq:   w.ApplySeq,
 	}
 }
 

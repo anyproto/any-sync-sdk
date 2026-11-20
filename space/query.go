@@ -21,6 +21,10 @@ type Query interface {
 	// mongo-style operators ($eq, $gt, $in, $and, $or, …). The
 	// argument is parsed eagerly; a malformed filter surfaces on the
 	// first terminal call (Iter / All / One / Count), not silently.
+	// A map literal is converted like a record value (see Op.Value):
+	// a time.Time or []byte in it is typed, and a {"$date": …}
+	// literal is an instant, so a datetime field is filtered by either
+	// spelling.
 	Filter(filter any) Query
 
 	// Sort orders results by the given keys. Anything query.ParseSort
@@ -66,9 +70,12 @@ type Query interface {
 	// chained filter / sort / limit; offset applies to the initial
 	// snapshot only.
 	//
-	// Sub closes with ErrSubscriptionOverflow when its mailbox fills,
-	// or ErrSubscriptionDrifted when too many in-window records leave
-	// without replacements. Both signal "resubscribe to recover".
+	// A window at offset 0 refills from storage when rows leave it, so
+	// it stays equal to a fresh query; a refill's rows arrive in an
+	// event of their own, with no VersionId. Sub closes with
+	// ErrSubscriptionOverflow when its mailbox fills, or
+	// ErrSubscriptionDrifted when the window cannot be kept equal to
+	// storage (see QueryOpts.DriftBudgetPercent); both mean resubscribe.
 	Subscribe(ctx context.Context, opts QueryOpts) (*QueryResult, error)
 }
 
@@ -78,27 +85,34 @@ type Query interface {
 type QueryOpts struct {
 	// IncludeTotal asks for a one-shot count of filter-matching records
 	// (independent of limit/offset), returned in QueryResult.Total, and
-	// derives QueryResult.HasNext from it. No live total events are
-	// emitted by Subscribe; callers who need a refreshed count call
-	// Snapshot again. When false, Total is -1 and HasNext is false.
+	// derives QueryResult.HasNext from it. Space.Query, QueryObjects
+	// and QueryDataset take the count in the same read as Initial, so
+	// Total and HasNext describe exactly the returned rows. No live
+	// total events are emitted by Subscribe; callers who need a
+	// refreshed count call Snapshot again. When false, Total is -1 and
+	// HasNext is false.
 	IncludeTotal bool
 
 	// MailboxCapacity bounds the per-subscription event queue. Default
 	// 256, minimum 16. On overflow the subscription closes; Wait
 	// returns mb.ErrClosed and Err() returns ErrSubscriptionOverflow.
-	// Subscribe-only.
+	// A refill's event takes a slot of its own. Subscribe-only.
 	MailboxCapacity int
 
-	// DriftBudgetPercent: when more than this fraction of Limit
-	// records leave the held window without replacements, the
-	// subscription closes with ErrSubscriptionDrifted. Default 30.
-	// Ignored when Limit == 0. Subscribe-only.
+	// DriftBudgetPercent: the subscription closes with
+	// ErrSubscriptionDrifted once this fraction of Limit rows is lost.
+	// Default 30. A window at offset 0 refills from storage, so losses
+	// accrue only while refills fail; a window past an offset counts
+	// every departure. Ignored when Limit == 0. Subscribe-only.
 	DriftBudgetPercent int
 }
 
 // QueryResult is what Snapshot and Subscribe return. Sub is nil for
 // Snapshot, non-nil for Subscribe. Initial is always the materialised
-// point-in-time view bounded by the chained limit/offset.
+// point-in-time view bounded by the chained limit/offset. It belongs
+// to the caller: Sub keeps no reference to it, so a consumer that holds
+// the result for the subscription's lifetime drops Initial once it is
+// rendered — with limit 0 it is the whole result set.
 type QueryResult struct {
 	Initial []*anyenc.Value
 	Total   int               // -1 unless QueryOpts.IncludeTotal=true
@@ -114,6 +128,9 @@ type QueryResult struct {
 //	    doc, err := it.Doc()
 //	    ...
 //	}
+//	if err := it.Err(); err != nil {
+//	    ...
+//	}
 type Iterator interface {
 	Next() bool
 	Doc() (*anyenc.Value, error)
@@ -126,12 +143,17 @@ type Iterator interface {
 // caller-facing by contract (clients reconcile optimistic state per
 // field against it; see the CRDT spec §3).
 type ProjectionOpts struct {
-	// IncludeDeleted returns tombstone rows (id, _deletedAt, _ver,
-	// _traces, _addSeq; content wiped) instead of skipping them.
-	// Honored by the find path (Iter / All / One / Count);
-	// Snapshot/Subscribe keep skipping tombstones (the windowed live
-	// view is unchanged). Use it to stream deletions for incremental
-	// re-indexing — a tombstone surfaced this way carries the delete's
-	// _addSeq, so it shows up in a changed-since scan past the cursor.
+	// IncludeDeleted returns record-level tombstone rows (id, _deletedAt,
+	// _ver, _traces, _addSeq; content wiped) instead of skipping them —
+	// e.g. a deleted record inside a still-live object's dataset. Honored
+	// by the find path (Iter / All / One / Count); Snapshot/Subscribe keep
+	// skipping tombstones (the windowed live view is unchanged).
+	//
+	// Note: a deleted OBJECT is NOT a tombstone. Its whole local
+	// projection is purged (any-sync's head storage is the durable,
+	// cross-device delete record), so IncludeDeleted surfaces nothing for
+	// it on QueryObjects. Observe object deletions via
+	// QueryObjects().Subscribe (a Removed{RemoveDeleted} event), or by
+	// reconciling against any-sync's deleted-tree set.
 	IncludeDeleted bool
 }

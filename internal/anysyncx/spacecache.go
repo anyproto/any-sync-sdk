@@ -4,12 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
+	"github.com/anyproto/any-sync/app/logger"
 	"github.com/anyproto/any-sync/app/ocache"
 	"github.com/anyproto/any-sync/commonspace"
+	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
+	"go.uber.org/zap"
 )
+
+var cacheLog = logger.NewNamed("anysyncx.spacecache")
 
 // Space cache TTL is disabled: once a commonspace.Space is loaded it
 // stays loaded for the SDK lifetime. Loaded spaces own only headsync
@@ -52,8 +58,8 @@ type spaceWrapper struct {
 	app *App
 }
 
-func (s *spaceWrapper) Id() string                  { return s.id }
-func (s *spaceWrapper) Inner() commonspace.Space    { return s.cs }
+func (s *spaceWrapper) Id() string               { return s.id }
+func (s *spaceWrapper) Inner() commonspace.Space { return s.cs }
 
 func (s *spaceWrapper) SyncHeads(ctx context.Context) error { return s.cs.SyncHeads(ctx) }
 
@@ -62,6 +68,9 @@ func (s *spaceWrapper) SyncHeads(ctx context.Context) error { return s.cs.SyncHe
 // after a successful TryClose.
 func (s *spaceWrapper) Close() error {
 	s.app.sync.UnregisterSpace(s.id)
+	if s.app.global != nil {
+		s.app.global.SpaceUnloaded(s.id)
+	}
 	return s.cs.Close()
 }
 
@@ -71,19 +80,28 @@ func (s *spaceWrapper) TryClose(ttl time.Duration) (bool, error) {
 	closed, err := s.cs.TryClose(ttl)
 	if closed {
 		s.app.sync.UnregisterSpace(s.id)
+		if s.app.global != nil {
+			s.app.global.SpaceUnloaded(s.id)
+		}
 	}
 	return closed, err
+}
+
+// spaceCache is the ocache plus its non-blocking Peek.
+type spaceCache interface {
+	ocache.OCache
+	ocache.Peeker
 }
 
 // newSpaceCache builds the cache. The loader fully wires a space —
 // NewSpace, Init, register — so callers reach a ready Space straight
 // from Get.
-func (a *App) newSpaceCache() ocache.OCache {
+func (a *App) newSpaceCache() spaceCache {
 	return ocache.New(
 		a.loadSpaceForCache,
 		ocache.WithTTL(spaceLoaderTTL),
 		ocache.WithGCPeriod(spaceLoaderGC),
-	)
+	).(spaceCache)
 }
 
 // loadSpaceForCache is the ocache LoadFunc. Independent of "is this a
@@ -91,24 +109,63 @@ func (a *App) newSpaceCache() ocache.OCache {
 // must already exist (caller is expected to Create / Derive first if
 // the space is new).
 func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, error) {
+	if tok, ok := ctx.Value(loadTokenKey{}).(*loadToken); ok {
+		tok.ran.Store(true)
+	}
 	// The Tracker is constructed lazily and reused across reloads of
 	// the same spaceId; we wire it as commonspace.Deps.SyncStatus so
 	// any-sync dispatches HeadsChange / ObjectReceive / HeadsApply
 	// straight into it.
 	tracker := a.syncStatus.For(id)
 
-	cs, err := a.spaceService.NewSpace(ctx, id, commonspace.Deps{
+	deps := commonspace.Deps{
 		SyncStatus: tracker,
 		TreeSyncer: a.newTreeSyncerForSpace(id),
-	})
+		Indexer:    a.newKVDispatcher(id),
+	}
+	// Guest-mode space: override the space app's account service so the
+	// commonspace signs (and resolves ACL keys) as the shared guest
+	// identity instead of this account. The device peer key stays real —
+	// network auth is peer-level; space-level identity is what the ACL
+	// checks. commonspace registers Deps.AccountService into the
+	// per-space app when set.
+	if guestKey := a.guestKeyFor(id); guestKey != nil {
+		deps.AccountService = newAccount(accountdata.New(a.keys.PeerKey, guestKey))
+	}
+	ctx, storeRefs := withLoadScope(ctx)
+	cs, err := a.spaceService.NewSpace(ctx, id, deps)
 	if err != nil {
+		storeRefs.releaseExcept(ctx, nil)
 		if errors.Is(err, spacestorage.ErrSpaceStorageMissing) {
 			return nil, fmt.Errorf("anysyncx: space %s not found locally: %w", id, err)
 		}
 		return nil, fmt.Errorf("anysyncx: NewSpace %s: %w", id, err)
 	}
+	// The space owns its storage reference; nothing else the load took
+	// has an owner.
+	storeRefs.releaseExcept(ctx, cs.Storage())
 	if err := cs.Init(ctx); err != nil {
-		_ = cs.Close()
+		// Bounded cleanup: the space app's Close can wedge under
+		// unreachable nodes — its deletion loop joins an in-flight
+		// delete call that ignores ctx (any-sync bug; pre-existing at
+		// shutdown, but Close now routinely cancels in-flight loads,
+		// which lands exactly here). A synchronous Close would then
+		// wedge the loader's caller — the bootstrap goroutine, and
+		// through it SDK.Close — until any-sync's close watchdog
+		// panics the process. Wait a bound, then log and LEAK the
+		// close goroutine instead (the process is usually shutting
+		// down anyway) — the watchdog's philosophy, minus the panic.
+		closeErrored := make(chan struct{})
+		go func() {
+			defer close(closeErrored)
+			_ = cs.Close()
+		}()
+		select {
+		case <-closeErrored:
+		case <-time.After(10 * time.Second):
+			cacheLog.Warn("init-error cleanup: space close timed out; leaking close goroutine",
+				zap.String("spaceId", id))
+		}
 		return nil, fmt.Errorf("anysyncx: Init %s: %w", id, err)
 	}
 	a.sync.RegisterSpace(id, cs)
@@ -138,6 +195,13 @@ func (a *App) loadSpaceForCache(ctx context.Context, id string) (ocache.Object, 
 	}
 	cs.Storage().StateStorage().SetObserver(a.headCache.observerFor(id))
 
+	// Global p2p follows the space's key-value records and publishes
+	// this device's own. Local-only spaces never reach the network and
+	// guest-mode spaces sign as a shared identity, so neither takes part.
+	if a.global != nil && !a.localOnly.has(id) && a.guestKeyFor(id) == nil {
+		a.global.SpaceLoaded(id, globalSpaceKV{cs: cs})
+	}
+
 	return &spaceWrapper{id: id, cs: cs, app: a}, nil
 }
 
@@ -155,6 +219,37 @@ func (a *App) GetSpace(ctx context.Context, id string) (SpaceHandle, error) {
 	return v.(SpaceHandle), nil
 }
 
+// createLoadAttempts bounds the loads GetSpaceCreating runs.
+const createLoadAttempts = 3
+
+// loadToken tells a GetSpaceCreating call whether the space cache ran
+// the load on its ctx: the cache runs one load per id, on the ctx of the
+// caller that started it, and hands the result to every caller.
+type loadToken struct{ ran atomic.Bool }
+
+type loadTokenKey struct{}
+
+// GetSpaceCreating is GetSpace for a caller whose ctx carries the
+// space's create description (commonspace's AddSpaceCtxKey): Derive and
+// OneToOne, whose load builds missing storage locally and never asks the
+// nodes. Such a caller can join a load another caller started without
+// the description — the index follower pulling a space another device
+// of the account has just derived — and get that load's failure: "space
+// is missing" while the nodes lack the space, a network error while
+// they are unreachable. A failure of a load it did not run is retried,
+// up to createLoadAttempts loads; the failed load has left the cache, so
+// the next one is likely its own. A failure of its own load, or a
+// closed cache, is final.
+func (a *App) GetSpaceCreating(ctx context.Context, id string) (SpaceHandle, error) {
+	for attempt := 1; ; attempt++ {
+		tok := &loadToken{}
+		h, err := a.GetSpace(context.WithValue(ctx, loadTokenKey{}, tok), id)
+		if err == nil || tok.ran.Load() || attempt == createLoadAttempts || errors.Is(err, ocache.ErrClosed) || ctx.Err() != nil {
+			return h, err
+		}
+	}
+}
+
 // PickSpace returns a handle only if the space is already resident in
 // the cache; it never triggers a load (ocache.Pick does not call the
 // LoadFunc). ok is false when the space is not loaded. Cheap read
@@ -168,6 +263,21 @@ func (a *App) PickSpace(ctx context.Context, id string) (SpaceHandle, bool) {
 	}
 	v, err := a.spaceCache.Pick(ctx, id)
 	if err != nil {
+		return nil, false
+	}
+	return v.(SpaceHandle), true
+}
+
+// PeekSpace returns the handle of a loaded space without loading or
+// waiting: ok is false while the space is absent, still loading or
+// closing. PickSpace waits on a load in flight; this never does, so a
+// caller holding a lock can use it.
+func (a *App) PeekSpace(id string) (SpaceHandle, bool) {
+	if a.spaceCache == nil {
+		return nil, false
+	}
+	v, state := a.spaceCache.Peek(id, false)
+	if state != ocache.PeekHit {
 		return nil, false
 	}
 	return v.(SpaceHandle), true

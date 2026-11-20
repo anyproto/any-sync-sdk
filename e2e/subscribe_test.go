@@ -76,6 +76,7 @@ func subRecordFor(ev space.SubscriptionEvent, id string) (*space.SubRecord, stri
 // mismatched (wrong object, wrong dataset) subscriptions stay silent;
 // closing one subscription leaves the others working.
 func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -98,7 +99,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 	typeId, titleProp := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 
@@ -179,6 +180,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 // between user-supplied and auto fields — same wire — so a fresh row
 // reconstructs in one event.
 func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -207,7 +209,7 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	t.Cleanup(func() { _ = res.Sub.Close() })
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 
@@ -226,6 +228,8 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 		"create Doc missing createdAt — viewer can't sort/display creation time")
 	assert.NotNil(t, rec.Doc.Get("spaceId"),
 		"create Doc missing spaceId — viewer can't route across spaces")
+	assert.NotNil(t, rec.Doc.Get("modifiedAt"),
+		"create Doc missing modifiedAt — viewer can't sort by recency")
 
 	// VersionId on the wire carries the per-change DAG order; required
 	// for fence-and-replay consumers.
@@ -246,13 +250,20 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 	assertTitle(t, urec, typeId, titleProp, "Casablanca")
 
 	// Auto stamps must still be present on the Updated Doc (they're
-	// persisted on the row), but they should NOT appear in Ops (no
-	// re-stamp on update).
+	// persisted on the row), but the create-only ones should NOT appear
+	// in Ops (no re-stamp on update). modifiedAt is the exception: it
+	// re-stamps on every modify — and exactly once per record, not once
+	// per user op (Sink.DeriveOnce).
 	assert.NotNil(t, urec.Doc.Get("author"))
+	modifiedAtOps := 0
 	for _, op := range urec.Ops {
 		assert.NotEqual(t, []string{"author"}, op.Path, "update must not re-emit author op")
 		assert.NotEqual(t, []string{"createdAt"}, op.Path, "update must not re-emit createdAt op")
+		if len(op.Path) == 1 && op.Path[0] == "modifiedAt" {
+			modifiedAtOps++
+		}
 	}
+	assert.Equal(t, 1, modifiedAtOps, "update must re-emit exactly one modifiedAt op")
 }
 
 // TestSDK_QuerySubscribe_DeleteEmitsRemoved covers object deletion end
@@ -261,6 +272,7 @@ func TestSDK_QuerySubscribe_CreateEmitsAutoFields(t *testing.T) {
 // see a Removed entry for the row, and a follow-up QueryObjects no
 // longer returns it.
 func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -283,7 +295,7 @@ func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	typeId, _ := setupMovieType(t, ctx, sp)
 
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 
@@ -303,8 +315,8 @@ func TestSDK_QuerySubscribe_DeleteEmitsRemoved(t *testing.T) {
 	assert.Empty(t, ev.Added)
 	assert.Empty(t, ev.Updated)
 
-	// The deleted object is gone from QueryObjects too — its row is now
-	// a tombstone, which queryIterator.Next skips.
+	// The deleted object is gone from QueryObjects too — its row was
+	// purged from local state (no tombstone is retained).
 	rows, err := sp.QueryObjects().All(ctx)
 	require.NoError(t, err)
 	for _, row := range rows {

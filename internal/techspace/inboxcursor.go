@@ -22,7 +22,7 @@ import (
 //
 // Re-processing is idempotent (the 1-1 row is the handled-marker), so a
 // momentary cross-device regression of this value just causes a harmless,
-// deduplicated re-fetch — never loss. (See docs/13 § "Heart bugs we fix"
+// deduplicated re-fetch — never loss. (See docs/one-to-one-spaces.md § "Heart bugs we fix"
 // #3: idempotent receive is what makes the synced cursor safe.)
 
 const (
@@ -44,7 +44,8 @@ const (
 // InboxCursorSchema declares the single synced offset field.
 func InboxCursorSchema() schema.Dataset {
 	return schema.Dataset{Fields: []schema.Field{
-		{Id: FieldInboxCursorOffset, Name: "Offset", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced},
+		{Id: FieldInboxCursorOffset, Name: "Offset", Schema: schema.Leaf(schema.KindString), Scope: schema.ScopeSynced,
+			Description: "Coordinator inbox offset the account has consumed up to."},
 	}}
 }
 

@@ -41,6 +41,7 @@ func (p *fixedSeedProvider) DeviceKey(_ context.Context) ([]byte, error)  { retu
 // Network reachability is NOT required: CreateSpace writes locally
 // first; coordinator push happens lazily and is best-effort here.
 func TestSDK_OpenCreateList(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -63,17 +64,25 @@ func TestSDK_OpenCreateList(t *testing.T) {
 
 	require.NotEmpty(t, sdk.Account().Id(), "account id should resolve")
 
-	// Empty index initially.
+	// Empty index initially — local reads are safe right after Open,
+	// with the bootstrap pass still (possibly) running.
 	list, err := sdk.Spaces().List(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, list)
+
+	// The bootstrap pass completes on its own (fresh account — nothing
+	// to catch up, so this is near-immediate).
+	select {
+	case <-sdk.BootstrapDone():
+	case <-ctx.Done():
+		t.Fatal("bootstrap pass did not complete")
+	}
 
 	// Create a space — round-trips through any-sync (local create) and
 	// writes the space-index entry.
 	sp, err := sdk.Spaces().Create(ctx, space.CreateRequest{
 		Name:        "Demo",
 		Description: "test space",
-		SpaceType:   space.SpaceTypeRegular,
 	})
 	require.NoError(t, err)
 	require.NotNil(t, sp)
@@ -96,7 +105,7 @@ func TestSDK_OpenCreateList(t *testing.T) {
 	got := findSpace(list, sp.Id())
 	require.NotNil(t, got, "first created space missing from List")
 	assert.Equal(t, "Demo", got.Name)
-	assert.Equal(t, space.SpaceTypeRegular, got.Type)
+	assert.Equal(t, space.SpaceTypeAny, got.Type, "empty SpaceType defaults to any.space")
 	assert.Equal(t, space.StatusActive, got.Status)
 
 	// Soft-delete the first space — Status flips to Deleted, row
@@ -137,6 +146,7 @@ func findSpace(infos []space.SpaceInfo, id string) *space.SpaceInfo {
 // the same DataDir, the tech space and its space-index rehydrate via
 // cold-restore: the previously created space shows up in List.
 func TestSDK_OpenSurvivesRestart(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -187,8 +197,9 @@ func TestSDK_OpenSurvivesRestart(t *testing.T) {
 // All writes are local (no network). Asserts both the user-observable
 // state (the value lands and reads back) and the SDK-internal
 // invariants (auto-derived propId equals shortId(changeId), bind
-// shows up in any.types).
+// shows up in any.type).
 func TestSDK_TypesAndProperties(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -213,6 +224,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	typeId, err := sp.Types().Create(ctx, space.TypeCreateParams{
 		Name:        "Movie",
 		Description: "A film",
+		XKey:        "movie",
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, typeId)
@@ -248,7 +260,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 
 	// 4. Object — bind type at birth via InitialProperties.
 	objectId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 	require.NotEmpty(t, objectId)
@@ -269,35 +281,75 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	got := rec.GetString(typeId, titleProp)
 	assert.Equal(t, "Casablanca", got)
 
-	// Bind side-effect: any.types should include the typeId we passed
-	// in CreateObjectOpts.
-	types := rec.GetArray("any", "types")
-	require.NotEmpty(t, types)
-	var saw bool
-	for _, v := range types {
-		if string(v.GetStringBytes()) == typeId {
-			saw = true
-			break
-		}
-	}
-	assert.True(t, saw, "any.types must contain %s", typeId)
+	// Bind side-effect: any.type holds the typeId we passed in
+	// CreateObjectOpts, and nothing lands in any.collections.
+	assert.Equal(t, typeId, rec.GetString("any", "type"), "any.type must be %s", typeId)
+	assert.Empty(t, rec.GetArray("any", "collections"))
 
-	// Types.List returns the two synthetic built-ins (`any`,
-	// `spaceIndex`) plus the user-created Movie type, in that order.
+	// Types.List returns the four synthetic built-ins (`any`,
+	// `spaceIndex`, `type`, `collection`) plus the user-created Movie
+	// type, in that order.
 	typeList, err := sp.Types().List(ctx)
 	require.NoError(t, err)
-	require.Len(t, typeList, 3)
+	require.Len(t, typeList, 5)
 	assert.Equal(t, "any", typeList[0].Id)
 	assert.True(t, typeList[0].BuiltIn)
 	assert.Equal(t, "spaceIndex", typeList[1].Id)
 	assert.True(t, typeList[1].BuiltIn)
-	assert.Equal(t, typeId, typeList[2].Id)
-	assert.Equal(t, "Movie", typeList[2].Name)
+	assert.Equal(t, "type", typeList[2].Id)
+	assert.True(t, typeList[2].BuiltIn)
+	assert.Equal(t, "collection", typeList[3].Id)
+	assert.True(t, typeList[3].BuiltIn)
+	assert.Equal(t, typeId, typeList[4].Id)
+	assert.Equal(t, "Movie", typeList[4].Name)
+	assert.Equal(t, "movie", typeList[4].XKey)
 
-	// Types.Get on the typeId returns the user-created row.
+	// Types.Get on the typeId returns the user-created row. XKey lives
+	// in the meta-type namespace (`type.xkey`) and round-trips.
 	tinfo, err := sp.Types().Get(ctx, typeId)
 	require.NoError(t, err)
 	assert.Equal(t, "Movie", tinfo.Name)
+	assert.Equal(t, "movie", tinfo.XKey)
+
+	// A type object is an ordinary row in the shared objects
+	// collection, so its own storage is readable — xkey sits in the
+	// meta-type namespace, name stays universal.
+	typeRec, err := sp.Properties().Get(ctx, typeId)
+	require.NoError(t, err)
+	require.NotNil(t, typeRec)
+	assert.Equal(t, "movie", typeRec.GetString("type", "xkey"))
+	assert.Empty(t, typeRec.GetString("any", "xkey"))
+	assert.Equal(t, "Movie", typeRec.GetString("any", "name"))
+
+	// The meta-type is introspectable like any other built-in: its
+	// property list is what a type object carries in its own namespace
+	// — the handle plus the rendering and listing slice.
+	metaProps, err := sp.Types().Properties(ctx, "type")
+	require.NoError(t, err)
+	metaKinds := map[string]space.PropertyKind{}
+	for _, p := range metaProps {
+		metaKinds[p.Id] = p.Kind
+	}
+	assert.Equal(t, map[string]space.PropertyKind{
+		"xkey":   space.PropertyKindString,
+		"layout": space.PropertyKindObject,
+		"hidden": space.PropertyKindBoolean,
+		"meta":   space.PropertyKindObject,
+	}, metaKinds)
+
+	// The `collection` meta-type carries the same slice minus layout —
+	// a collection describes a definition, not how objects render.
+	collProps, err := sp.Collections().Properties(ctx, "collection")
+	require.NoError(t, err)
+	collKinds := map[string]space.PropertyKind{}
+	for _, p := range collProps {
+		collKinds[p.Id] = p.Kind
+	}
+	assert.Equal(t, map[string]space.PropertyKind{
+		"xkey":   space.PropertyKindString,
+		"hidden": space.PropertyKindBoolean,
+		"meta":   space.PropertyKindObject,
+	}, collKinds)
 
 	// Types.Get("any") returns the built-in.
 	anyInfo, err := sp.Types().Get(ctx, "any")
@@ -316,7 +368,8 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	assert.Equal(t, space.PropertyKindString, gotProps["name"])
 	assert.Equal(t, space.PropertyKindString, gotProps["description"])
 	assert.Equal(t, space.PropertyKindString, gotProps["icon"])
-	assert.Equal(t, space.PropertyKindArray, gotProps["types"])
+	assert.Equal(t, space.PropertyKindString, gotProps["type"])
+	assert.Equal(t, space.PropertyKindArray, gotProps["collections"])
 
 	// User-type properties: the Title + Year we added show up via the
 	// type's `defs` dataset.
@@ -362,7 +415,7 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	// confirm both rows show up in the per-space collection and a
 	// filter narrows correctly.
 	objectId2, err := sp.Objects().Create(ctx, space.CreateObjectOpts{
-		Types: []string{typeId},
+		Type: typeId,
 	})
 	require.NoError(t, err)
 	_, err = sp.Properties().Set(ctx, objectId2, typeId, map[string]any{
@@ -470,8 +523,26 @@ func TestSDK_TypesAndProperties(t *testing.T) {
 	})
 	require.Error(t, err)
 
+	// Objects.Get reads the row; an unknown id is not found.
+	row, err := sp.Objects().Get(ctx, objectId)
+	require.NoError(t, err)
+	require.Equal(t, objectId, row.GetString("id"))
+	_, err = sp.Objects().Get(ctx, "bafy-no-such-object")
+	require.ErrorIs(t, err, space.ErrNotFound)
+
 	// Objects.Delete: marks the tree deleted via settings tree, drops
-	// our cached state. After this, Get on the deleted id returns an
-	// any-sync deletion error.
+	// our cached state. After this, Get on the deleted id reports the
+	// deletion, distinct from an unknown id.
 	require.NoError(t, sp.Objects().Delete(ctx, objectId))
+	_, err = sp.Objects().Get(ctx, objectId)
+	require.ErrorIs(t, err, space.ErrObjectDeleted)
+	require.ErrorIs(t, sp.Objects().Delete(ctx, objectId), space.ErrObjectDeleted, "a second delete reports the deletion")
+
+	// A per-object op has to open the tree, and the deleted object has
+	// none: ErrObjectNotFound, so a consumer answers "not found"
+	// without matching any-sync storage errors. (An id never seen here
+	// is fetched from peers first, so its failure mode is a transport
+	// error, not a local missing-tree one.)
+	_, err = sp.Query(objectId, "objects").Count(ctx)
+	require.ErrorIs(t, err, space.ErrObjectNotFound)
 }

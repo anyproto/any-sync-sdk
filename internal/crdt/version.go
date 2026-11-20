@@ -35,8 +35,8 @@ func NextVersion(v VersionId) VersionId {
 //     value in one peer's `_ver` map is meaningless to another peer.
 //   - Used in this package for two things: (1) gating in the CRDT apply
 //     algorithm, which is always a LOCAL comparison within one peer's
-//     Controller, and (2) as the ordered index key for efficient change
-//     queries against the local store (Phase 2).
+//     Controller, and (2) as an ordered index key for queries against the
+//     local store (e.g. `_ver.id` creation order).
 //
 // Peer-local convergence: each Controller applies the changes delivered by
 // its local any-sync, gating against its own (locally-consistent) versionIds.

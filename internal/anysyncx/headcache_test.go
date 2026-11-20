@@ -29,11 +29,11 @@ func TestHeadCache_GetSetDelete(t *testing.T) {
 func TestHeadCache_ObserverUpdates(t *testing.T) {
 	c := newHeadCache()
 	obs := c.observerFor("space-A")
-	obs.OnHashChange("o1", "n1")
+	obs.OnHashChange("n1")
 	got, ok := c.Get("space-A")
 	require.True(t, ok)
 	assert.Equal(t, "n1", got)
-	obs.OnHashChange("n1", "n2")
+	obs.OnHashChange("n2")
 	got, _ = c.Get("space-A")
 	assert.Equal(t, "n2", got)
 }

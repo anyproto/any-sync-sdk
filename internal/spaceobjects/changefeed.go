@@ -2,11 +2,11 @@ package spaceobjects
 
 import (
 	"context"
-	"sync"
 
 	anystore "github.com/anyproto/any-store/v2"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
 )
 
 // ObjectChange is the payload of the change-index live feed: an object
@@ -14,66 +14,14 @@ import (
 // watermark. Consumers use it to mark the object dirty for re-indexing.
 // ApplySeq covers every apply source — DAG changes, the account
 // mirror's injected applies, device-local writes.
+//
+// Deleted is true when the object was purged (object deletion): the entry
+// carries a fresh applySeq strictly greater than the object's last content
+// change, so the consumer evicts it in the same ordered stream as edits.
 type ObjectChange struct {
 	ObjectId string
 	ApplySeq uint64
-}
-
-// changeRegistry is the synchronous callback firehose backing the
-// change-index feed. It mirrors internal/syncstatus' registry: cb runs
-// under the registry lock, on the apply path, so callers must keep cb
-// cheap or hand work off to their own goroutine. A cb must not call
-// add / remove on the same registry (would deadlock).
-type changeRegistry struct {
-	mu   sync.Mutex
-	next uint64
-	subs map[uint64]func(ObjectChange)
-}
-
-func newChangeRegistry() *changeRegistry {
-	return &changeRegistry{subs: make(map[uint64]func(ObjectChange))}
-}
-
-// add registers cb and returns the id passed to remove. nil cb yields
-// id 0 (a no-op cancel).
-func (r *changeRegistry) add(cb func(ObjectChange)) uint64 {
-	if cb == nil {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.next++
-	id := r.next
-	r.subs[id] = cb
-	return id
-}
-
-// remove drops a subscription. Idempotent; safe with id 0.
-func (r *changeRegistry) remove(id uint64) {
-	if id == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.subs, id)
-}
-
-// hasSubscribers is the non-blocking gate the apply hook checks before
-// building an event, so a space with no change-index consumer pays
-// nothing on the hot path.
-func (r *changeRegistry) hasSubscribers() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.subs) > 0
-}
-
-// dispatch fans ev out to every live cb, synchronously under the lock.
-func (r *changeRegistry) dispatch(ev ObjectChange) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, cb := range r.subs {
-		cb(ev)
-	}
+	Deleted  bool
 }
 
 // SubscribeChanges registers cb on the change-index feed; it fires once
@@ -85,8 +33,7 @@ func (r *changeRegistry) dispatch(ev ObjectChange) {
 // consumer that misses events (crash, slow cb, was offline) recovers by
 // re-running ChangedObjects from its last persisted cursor.
 func (s *Store) SubscribeChanges(cb func(ObjectChange)) (cancel func()) {
-	id := s.changeSubs.add(cb)
-	return func() { s.changeSubs.remove(id) }
+	return s.changeSubs.Add(cb)
 }
 
 // ChangedObjects returns objects in this space whose persisted max
@@ -104,7 +51,7 @@ func (s *Store) ChangedObjects(ctx context.Context, since uint64, limit int) ([]
 	}
 	out := make([]ObjectChange, len(rows))
 	for i, r := range rows {
-		out[i] = ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq}
+		out[i] = ObjectChange{ObjectId: r.ObjectId, ApplySeq: r.ApplySeq, Deleted: r.Deleted}
 	}
 	return out, nil
 }
@@ -136,6 +83,69 @@ func (s *Store) applySeqMeta(ctx context.Context) (anystore.Collection, error) {
 	return coll, nil
 }
 
+// seedApplySeq is the per-space allocator's seed: the highest apply
+// sequence persisted anywhere in this space. Applies and purges persist
+// theirs as the object's _meta watermark; read marks persist theirs as
+// the object's read-state stateSeq and nowhere else, so both tables are
+// read — a seed below a persisted stateSeq would stamp later changes
+// under a consumer's read-state cursor.
+func (s *Store) seedApplySeq(ctx context.Context) (uint64, error) {
+	coll, err := s.applySeqMeta(ctx)
+	if err != nil {
+		return 0, err
+	}
+	seed, err := crdt.MaxObjectApplySeq(ctx, coll, s.spaceId)
+	if err != nil {
+		return 0, err
+	}
+	stateSeq, err := readstate.MaxStateSeq(ctx, s.db, s.spaceId)
+	if err != nil {
+		return 0, err
+	}
+	return max(seed, stateSeq), nil
+}
+
+// EnsureApplySeq forces the one-off applySeq backfill eagerly. The
+// backfill takes a WriteTx, and applySeqMeta runs it inside a sync.Once.
+// Two code paths reach that Once with opposite lock orders: an apply
+// (Controller.ApplyChangeWithResult) already holds any-store's write
+// mutex and then calls the allocator's seed → applySeqMeta (wants the
+// Once); the consumer feed (ChangedObjects) takes the Once and then the
+// backfill's WriteTx wants the write mutex. Concurrently that
+// writeMu<->Once inversion deadlocks. Running the backfill here — once,
+// single-threaded at store load, before any apply holds the write mutex
+// or the feed reads concurrently — drains the Once so neither runtime
+// path ever performs the backfill WriteTx under a held lock.
+func (s *Store) EnsureApplySeq(ctx context.Context) error {
+	coll, err := s.applySeqMeta(ctx)
+	if err != nil {
+		return err
+	}
+	// Drain the allocator seed now (single-threaded at store load) so the
+	// purge path can allocate a fresh applySeq inside its WriteTx without
+	// ever running seedFn (which would open collections / take locks) under
+	// a held write tx.
+	if err := s.applySeqs.Seed(ctx); err != nil {
+		return err
+	}
+	// Mint the per-space generation eagerly so `space:<id>.gen` exists before
+	// any consumer reads it and before the first purge.
+	_, err = crdt.LoadOrInitGeneration(ctx, coll, s.spaceId)
+	return err
+}
+
+// Generation returns the per-space rebuild epoch (minted at store load via
+// EnsureApplySeq). A consumer whose stored generation differs must reset its
+// cursor to 0 and full-reindex — an sdk.db rebuild renumbered the applySeq
+// axis, so deletions are re-established by absence from a live snapshot.
+func (s *Store) Generation(ctx context.Context) (string, error) {
+	coll, err := s.metaCollection(ctx)
+	if err != nil {
+		return "", err
+	}
+	return crdt.LoadOrInitGeneration(ctx, coll, s.spaceId)
+}
+
 // metaCollection opens the shared _meta collection the change-index
 // query reads. Same collection the per-object Controllers persist their
 // watermark into.
@@ -153,56 +163,9 @@ type RowEvent struct {
 	Deleted  bool
 }
 
-// rowEventRegistry mirrors changeRegistry for RowEvent callbacks —
-// synchronous, on the apply path, keep callbacks cheap.
-type rowEventRegistry struct {
-	mu   sync.Mutex
-	next uint64
-	subs map[uint64]func(RowEvent)
-}
-
-func newRowEventRegistry() *rowEventRegistry {
-	return &rowEventRegistry{subs: make(map[uint64]func(RowEvent))}
-}
-
-func (r *rowEventRegistry) add(cb func(RowEvent)) uint64 {
-	if cb == nil {
-		return 0
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.next++
-	r.subs[r.next] = cb
-	return r.next
-}
-
-func (r *rowEventRegistry) remove(id uint64) {
-	if id == 0 {
-		return
-	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.subs, id)
-}
-
-func (r *rowEventRegistry) hasSubscribers() bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.subs) > 0
-}
-
-func (r *rowEventRegistry) dispatch(ev RowEvent) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	for _, cb := range r.subs {
-		cb(ev)
-	}
-}
-
 // SubscribeRowEvents registers cb for objects-collection row
 // creations and deletions. cb runs synchronously on the apply path.
 // The returned cancel is idempotent.
 func (s *Store) SubscribeRowEvents(cb func(RowEvent)) (cancel func()) {
-	id := s.rowEvents.add(cb)
-	return func() { s.rowEvents.remove(id) }
+	return s.rowEvents.Add(cb)
 }

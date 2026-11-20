@@ -2,7 +2,9 @@ package schema
 
 import (
 	"encoding/json"
-	"fmt"
+	"sort"
+
+	"github.com/anyproto/any-store/v2/anyenc"
 )
 
 // Scope is the single write/sync taxonomy shared by dataset fields AND
@@ -53,7 +55,7 @@ func (s Scope) String() string {
 }
 
 // ParseScope parses a scope label. Returns (0, false) on an unknown
-// label — the runtime counterpart of MustScope for wire-read paths.
+// label.
 func ParseScope(label string) (Scope, bool) {
 	switch label {
 	case "synced":
@@ -68,6 +70,240 @@ func ParseScope(label string) (Scope, bool) {
 	return 0, false
 }
 
+// Mutability is a declared field's post-create write rule, enforced by
+// the generic schema handler. The zero value is write-once: the field
+// is writable ONLY in the record's creating change — there is no late
+// fill (a presence-based rule would diverge under concurrent fills).
+// Declare MutableBy for fields that must stay settable later.
+type Mutability uint8
+
+const (
+	// MutableNever: writable only in the record's creating change.
+	MutableNever Mutability = iota
+	// MutableByAuthor: only the record's creator (the StampCreator
+	// field) may rewrite; accepted writes bump the modifyTime stamp.
+	MutableByAuthor
+	// MutableByAnyone: any writer may rewrite; accepted writes bump the
+	// modifyTime stamp.
+	MutableByAnyone
+)
+
+func (m Mutability) String() string {
+	switch m {
+	case MutableByAuthor:
+		return "author"
+	case MutableByAnyone:
+		return "any"
+	}
+	return "never"
+}
+
+// ParseMutability parses a mutability label ("never"/"author"/"any").
+func ParseMutability(label string) (Mutability, bool) {
+	switch label {
+	case "never", "":
+		return MutableNever, true
+	case "author":
+		return MutableByAuthor, true
+	case "any":
+		return MutableByAnyone, true
+	}
+	return 0, false
+}
+
+// Stamp marks a field whose value the generic schema handler derives
+// from the change at apply time. A stamped field is ScopeDerived, so
+// client writes to it are rejected by the controller's scope
+// enforcement; the handler is its only writer.
+type Stamp uint8
+
+const (
+	StampNone Stamp = iota
+	// StampCreator: the creating change's signer identity, set once at
+	// create. The authorship fact author-gated rules check against.
+	StampCreator
+	// StampCreateTime: the creating change's timestamp, set once.
+	StampCreateTime
+	// StampModifyTime: the change timestamp, set at create and bumped
+	// on every accepted mutable write.
+	StampModifyTime
+)
+
+func (s Stamp) String() string {
+	switch s {
+	case StampCreator:
+		return "creator"
+	case StampCreateTime:
+		return "createTime"
+	case StampModifyTime:
+		return "modifyTime"
+	}
+	return "none"
+}
+
+// ParseStamp parses a stamp label ("creator"/"createTime"/"modifyTime").
+func ParseStamp(label string) (Stamp, bool) {
+	switch label {
+	case "", "none":
+		return StampNone, true
+	case "creator":
+		return StampCreator, true
+	case "createTime":
+		return StampCreateTime, true
+	case "modifyTime":
+		return StampModifyTime, true
+	}
+	return 0, false
+}
+
+// IdRule declares how the dataset's record ids are produced.
+type IdRule uint8
+
+const (
+	// IdAuto (zero): records are created with an empty id and the id is
+	// derived from the change (the existing empty-id upsert sugar);
+	// explicit caller ids are rejected at create.
+	IdAuto IdRule = iota
+	// IdUser: the caller supplies the id, constrained by
+	// IdPattern/IdMaxLen. The id doubles as the upsert idempotency
+	// key. Concurrent creates of one id merge per field unless the
+	// dataset declares write-once fields, stamps or author gates, which
+	// the first-applied create decides (docs/user-datasets.md).
+	IdUser
+)
+
+func (r IdRule) String() string {
+	if r == IdUser {
+		return "user"
+	}
+	return "auto"
+}
+
+// ParseIdRule parses an id-rule label ("auto"/"user").
+func ParseIdRule(label string) (IdRule, bool) {
+	switch label {
+	case "", "auto":
+		return IdAuto, true
+	case "user":
+		return IdUser, true
+	}
+	return 0, false
+}
+
+// DeletePolicy is the dataset-level record-delete gate.
+type DeletePolicy uint8
+
+const (
+	// DeleteByAnyone (zero): any writer may delete a record.
+	DeleteByAnyone DeletePolicy = iota
+	// DeleteByAuthor: only the record's creator (StampCreator field)
+	// may delete it.
+	DeleteByAuthor
+	// DeleteByNone: no writer may delete a record. The local pre-flight
+	// refuses the delete before a change exists and apply drops one
+	// written elsewhere, so the dataset never writes a tombstone and an
+	// id is never burned by a delete. Needs no creator stamp, so a dataset with
+	// caller ids stays convergent under concurrent same-id creates.
+	DeleteByNone
+)
+
+func (p DeletePolicy) String() string {
+	switch p {
+	case DeleteByAuthor:
+		return "author"
+	case DeleteByNone:
+		return "none"
+	}
+	return "anyone"
+}
+
+// ParseDeletePolicy parses a delete-policy label ("anyone"/"author"/"none").
+func ParseDeletePolicy(label string) (DeletePolicy, bool) {
+	switch label {
+	case "", "anyone":
+		return DeleteByAnyone, true
+	case "author":
+		return DeleteByAuthor, true
+	case "none":
+		return DeleteByNone, true
+	}
+	return 0, false
+}
+
+// SearchFields is the dataset's search-extraction annotation: which
+// field feeds the document title and which fields the body text, plus
+// the index scope the entries land under. Opaque to the SDK — surfaced
+// through discovery (`x-search`) for external indexers; Scope is a
+// free-form slug the indexer interprets (empty = the indexer's
+// default).
+//
+// Text holds one or more field keys; the indexer joins the
+// mapped values into one body. On the wire (`x-search` and the head
+// record's `search.text` leaf) a single key rides as a bare string and
+// multiple keys as an array — MarshalJSON canonicalizes, so
+// single-field declarations look exactly as they did before.
+type SearchFields struct {
+	Title string
+	Text  []string
+	Scope string
+}
+
+// SearchTextFromAnyenc parses the wire form of a search `text` leaf: a
+// bare string or an array of field keys. Empty/absent forms (nil, "",
+// []) return nil — "no text mapping", matching the empty-string
+// tolerance of the single-field era. Array elements ride verbatim
+// (non-strings become "") so ValidateSearchText can flag bad entries.
+func SearchTextFromAnyenc(v *anyenc.Value) []string {
+	if v == nil {
+		return nil
+	}
+	switch v.Type() {
+	case anyenc.TypeString:
+		s := string(v.GetStringBytes())
+		if s == "" {
+			return nil
+		}
+		return []string{s}
+	case anyenc.TypeArray:
+		arr, _ := v.Array()
+		if len(arr) == 0 {
+			return nil
+		}
+		keys := make([]string, 0, len(arr))
+		for _, e := range arr {
+			if e != nil && e.Type() == anyenc.TypeString {
+				keys = append(keys, string(e.GetStringBytes()))
+			} else {
+				keys = append(keys, "")
+			}
+		}
+		return keys
+	}
+	return nil
+}
+
+// SearchTextToAnyenc encodes a text mapping in the canonical wire
+// form: nil for no keys, the bare string for a single key, an array
+// otherwise — SearchTextFromAnyenc's inverse. Every anyenc writer of a
+// `search.text` leaf (the head-record encoder, the PatchDataset leaf
+// rewrite) goes through this one canonicalization so locally-authored
+// records and the x-search marshal (which applies the same rule in
+// JSON) can never disagree.
+func SearchTextToAnyenc(arena *anyenc.Arena, keys []string) *anyenc.Value {
+	switch len(keys) {
+	case 0:
+		return nil
+	case 1:
+		return arena.NewString(keys[0])
+	default:
+		arr := arena.NewArray()
+		for i, k := range keys {
+			arr.SetArrayItem(i, arena.NewString(k))
+		}
+		return arr
+	}
+}
+
 // Field is one declared dataset field: a JSON-Schema value shape plus its
 // class. Modeled like a type property (Id/Name + recursive Schema) so the
 // two share one representation.
@@ -76,6 +312,43 @@ type Field struct {
 	Name   string
 	Schema *Schema // value shape; nil means unconstrained
 	Scope  Scope
+
+	// Required: the field must be present in the create payload.
+	// Enforced by the generic schema handler; mutually exclusive with
+	// Stamp.
+	Required bool
+	// MutableBy: post-create write rule. Zero = write-once.
+	MutableBy Mutability
+	// Stamp: apply-time derived value. Non-zero forces ScopeDerived.
+	Stamp Stamp
+
+	// Additive marks a field that was not declared with its dataset:
+	// declared by a later change (AddDatasetField), by only some of the
+	// dataset's concurrent declarations, or differently by them. Rows
+	// may hold the key from before the declaration, and a change
+	// written then is valid under the schema its writer had, so the
+	// compiler drops Required on an additive field and, on a Dynamic
+	// dataset, makes it synced, unstamped and mutable by anyone: the
+	// apply path keeps treating the key as free keyspace (no shape
+	// check, no modifyTime bump) and the local pre-flight alone
+	// enforces the shape, on this device's writes. Every replica then
+	// takes the same verdict whether the declaration or the change
+	// arrived first. A non-Dynamic dataset rejects undeclared keys at
+	// write time, so its additive fields keep their shape, scope, stamp
+	// and mutability. The compiler sets it for runtime datasets; a
+	// compiled-in declaration may set it with the same meaning, and
+	// changing it on a shipped dataset changes apply verdicts like a
+	// handler version bump does. Enters the schema revision; rendered
+	// by discovery as `x-additive`.
+	Additive bool
+
+	// Description and XFormat are the field's descriptive slice: a
+	// display description and the opaque descriptor bag (semantic slug,
+	// icon, options, …). Neither is enforced by any handler and neither
+	// enters the schema revision — editing them never re-registers a
+	// dataset. Rendered by discovery as `description` / `x-format`.
+	Description string
+	XFormat     map[string]any
 }
 
 // Dataset is a dataset's required, JSON-Schema-compatible declaration.
@@ -86,6 +359,72 @@ type Field struct {
 type Dataset struct {
 	Fields  []Field
 	Dynamic bool
+
+	// DeleteBy: record-delete gate. Zero = anyone.
+	DeleteBy DeletePolicy
+	// IdRule: how record ids are produced. Zero = auto (derived).
+	IdRule IdRule
+	// IdPattern is an RE2 pattern user-supplied ids must match in full
+	// (IdUser only). Empty = DefaultIdPattern.
+	IdPattern string
+	// IdMaxLen caps user-supplied id length (IdUser only). 0 =
+	// DefaultIdMaxLen.
+	IdMaxLen int
+	// Search is the optional search-extraction annotation.
+	Search *SearchFields
+}
+
+// Defaults for IdUser constraints when the declaration leaves them zero.
+const (
+	DefaultIdPattern = `[A-Za-z0-9._:-]+`
+	DefaultIdMaxLen  = 128
+)
+
+// Normalized returns a copy with zero-value scopes resolved: stamped
+// fields are ScopeDerived (they are handler-written), everything else
+// defaults to ScopeSynced. Registration and discovery paths call this
+// once so enforcement never sees a zero scope; returns the receiver
+// unchanged when nothing needs resolving.
+func (d Dataset) Normalized() Dataset {
+	needs := false
+	for i := range d.Fields {
+		f := &d.Fields[i]
+		if f.Scope == 0 || (f.Stamp != StampNone && f.Scope != ScopeDerived) || timeStampNeedsKind(f) {
+			needs = true
+			break
+		}
+	}
+	if !needs {
+		return d
+	}
+	out := d
+	out.Fields = make([]Field, len(d.Fields))
+	copy(out.Fields, d.Fields)
+	for i := range out.Fields {
+		f := &out.Fields[i]
+		if f.Stamp != StampNone {
+			f.Scope = ScopeDerived
+		} else if f.Scope == 0 {
+			f.Scope = ScopeSynced
+		}
+		if timeStampNeedsKind(f) {
+			f.Schema = Leaf(KindDatetime)
+		}
+	}
+	return out
+}
+
+// timeStampNeedsKind reports whether a time-stamped field still carries
+// a shape other than datetime. The value is handler-produced — a
+// TypeDateTime instant — so the declared kind is not the caller's to
+// choose, and a declaration written before the type existed (or one that
+// simply guessed `number`) would otherwise reject every stamp.
+func timeStampNeedsKind(f *Field) bool {
+	switch f.Stamp {
+	case StampCreateTime, StampModifyTime:
+		return f.Schema == nil || f.Schema.Kind != KindDatetime
+	}
+	return false
 }
 
 // ScopeOf returns the declared class of field id and whether it's
@@ -103,24 +442,81 @@ func (d Dataset) ScopeOf(id string) (Scope, bool) {
 // MarshalJSON emits a standard JSON Schema object document:
 //
 //	{"type":"object","properties":{<id>:{<value schema>,"title":..,"x-scope":..}},
-//	 "additionalProperties":<Dynamic>}
+//	 "required":[..],"additionalProperties":<Dynamic>}
 //
 // The per-field class rides as the `x-scope` extension keyword (precedent:
-// the docs' x-refType). Cold path — discovery only; allocates freely.
+// the docs' x-refType); behavioral declarations ride as `x-mutable-by`,
+// `x-stamp`, `x-additive`, and the dataset-level `x-delete-by` / `x-id` /
+// `x-id-pattern` / `x-id-max-length` / `x-search` keywords. Defaults are
+// omitted. `required` is sorted by field id, so the document (and the
+// schema revision hashed from it) never depends on field order. Cold
+// path — discovery only; allocates freely.
 func (d Dataset) MarshalJSON() ([]byte, error) {
 	props := make(map[string]any, len(d.Fields))
+	var required []string
 	for _, f := range d.Fields {
 		node := schemaToJSON(f.Schema)
 		if f.Name != "" {
 			node["title"] = f.Name
 		}
+		if f.Description != "" {
+			node["description"] = f.Description
+		}
+		if len(f.XFormat) > 0 {
+			node["x-format"] = f.XFormat
+		}
 		node["x-scope"] = f.Scope.String()
+		if f.MutableBy != MutableNever {
+			node["x-mutable-by"] = f.MutableBy.String()
+		}
+		if f.Stamp != StampNone {
+			node["x-stamp"] = f.Stamp.String()
+		}
+		if f.Additive {
+			node["x-additive"] = true
+		}
+		if f.Required {
+			required = append(required, f.Id)
+		}
 		props[f.Id] = node
 	}
 	doc := map[string]any{
 		"type":                 "object",
 		"properties":           props,
 		"additionalProperties": d.Dynamic,
+	}
+	if len(required) > 0 {
+		sort.Strings(required)
+		doc["required"] = required
+	}
+	if d.DeleteBy != DeleteByAnyone {
+		doc["x-delete-by"] = d.DeleteBy.String()
+	}
+	if d.IdRule != IdAuto {
+		doc["x-id"] = d.IdRule.String()
+		if d.IdPattern != "" {
+			doc["x-id-pattern"] = d.IdPattern
+		}
+		if d.IdMaxLen > 0 {
+			doc["x-id-max-length"] = d.IdMaxLen
+		}
+	}
+	if d.Search != nil {
+		s := map[string]any{}
+		if d.Search.Title != "" {
+			s["title"] = d.Search.Title
+		}
+		switch len(d.Search.Text) {
+		case 0:
+		case 1:
+			s["text"] = d.Search.Text[0] // canonical bare string
+		default:
+			s["text"] = d.Search.Text
+		}
+		if d.Search.Scope != "" {
+			s["scope"] = d.Search.Scope
+		}
+		doc["x-search"] = s
 	}
 	return json.Marshal(doc)
 }
@@ -162,13 +558,3 @@ func schemaToJSON(s *Schema) map[string]any {
 // Leaf builds a scalar/leaf value Schema for a Kind (no items/properties).
 // Convenience for declaring simple dataset fields.
 func Leaf(k Kind) *Schema { return &Schema{Kind: k} }
-
-// MustScope parses a scope label, panicking on an unknown one. For static
-// declarations where the value is a compile-time constant.
-func MustScope(label string) Scope {
-	s, ok := ParseScope(label)
-	if !ok {
-		panic(fmt.Sprintf("schema: unknown scope %q", label))
-	}
-	return s
-}

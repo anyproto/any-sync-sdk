@@ -27,6 +27,7 @@ import (
 //
 // Skips when no any-sync network is reachable.
 func TestE2E_InviteDeclineAutonomous(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)

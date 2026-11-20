@@ -23,6 +23,7 @@ import (
 // local. (The signed coordinator SpaceDelete is driven asynchronously by
 // the deletion reconciler; its classification logic is unit-tested.)
 func TestSDK_SpaceDelete_OffloadsLocally(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -52,7 +53,7 @@ func TestSDK_SpaceDelete_OffloadsLocally(t *testing.T) {
 
 	// Seed an object + record so the space has real per-object state on
 	// disk to offload.
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err)
 	_, err = sp.Modify(ctx, space.ModifyBatch{
 		ObjectId: objId,
@@ -93,6 +94,7 @@ func TestSDK_SpaceDelete_OffloadsLocally(t *testing.T) {
 // deleted". After Delete + reopen, the space's DB file must stay gone
 // and the row must remain a tombstone.
 func TestSDK_SpaceDelete_NotReloadedAfterRestart(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("staging config not available at %s: %v", confPath, err)
@@ -134,6 +136,14 @@ func TestSDK_SpaceDelete_NotReloadedAfterRestart(t *testing.T) {
 	sdk2, err := anysyncsdk.Open(ctx, cfg, seed)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = sdk2.Close() })
+
+	// The eager loop runs on the background bootstrap pass — wait for
+	// it so the no-reload assertion below actually covers it.
+	select {
+	case <-sdk2.BootstrapDone():
+	case <-ctx.Done():
+		t.Fatal("bootstrap pass did not complete after reboot")
+	}
 
 	// The eager-loader must NOT have reloaded the tombstone — no DB file.
 	_, statErr = os.Stat(dbPath)

@@ -12,6 +12,8 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/tree/objecttree"
 	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/util/crypto"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
@@ -19,6 +21,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/subscribe"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -47,27 +50,50 @@ type Service struct {
 	avMu  sync.Mutex
 	avIds map[string]string
 
-	// store backs the single index object. It is a "raw" spaceobjects
-	// Store (custom handlers, gate disabled) so the index inherits the
-	// regular-space sync + subscription machinery — ocache-resident
-	// object, SetDeferredUpdater(true), ColdRestore-on-load, and the
-	// subscribe.Engine — without the type/properties model. The index
-	// object's spaces/profile datasets live at <indexId>_spaces /
-	// <indexId>_profile, exactly as the previous bespoke controller
-	// wrote them.
+	// claimSem (one slot) serializes ClaimActive's
+	// read-registry-then-write, so overlapping claims from this device
+	// mint increasing seqs; a waiter leaves when its ctx is done.
+	claimSem chan struct{}
+
+	// store is a regular spaceobjects Store (type/properties model,
+	// runtime dataset catalog, schema gate) with the tech datasets
+	// registered as system built-ins — see SystemDatasets. The index
+	// object and the account-values carriers carry no `objects` row;
+	// their datasets live at <indexId>_spaces, <indexId>_profile, …
+	// History indexing is off: the tech space has no history surface.
 	store *spaceobjects.Store
+
+	// crdtVersionSeen is the highest CRDT version mark this replica has
+	// applied (crdtversion.go); above space.CRDTVersion the account is
+	// read-only.
+	crdtVersionSeen atomic.Int64
 }
 
 // TechSpaceType is the on-the-wire SpaceType stamped into the
-// tech-space's space header. Mirrors anytype-heart's
-// spacedomain.SpaceTypeTech and is the value the any-sync-coordinator
-// recognises for tech spaces (see any-sync-coordinator
-// spacestatus/changeverifier.go).
-const TechSpaceType = "anytype.techspace"
+// tech-space's space header. The `any` product's own value — distinct
+// from anytype-heart's "anytype.techspace", so an SDK account never
+// shares a tech space with a heart client, whatever its derivation
+// index. Headers carrying it declare fileproto v2 (coordinator-
+// enforced; see spacestatus/changeverifier.go there).
+const TechSpaceType = "any.techspace"
+
+// deriveCfg builds the tech-space derive payload. The type and
+// fileproto version feed the derived space id (pinned by
+// TestDeriveCfg_Stable). The library default
+// spacepayloads.SpaceReserved ("any-sync.space") is rejected by the
+// coordinator.
+func deriveCfg(signKey crypto.PrivKey) spacepayloads.SpaceDerivePayload {
+	return spacepayloads.SpaceDerivePayload{
+		SigningKey:       signKey,
+		MasterKey:        signKey,
+		SpaceType:        TechSpaceType,
+		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+	}
+}
 
 // New returns a Service ready for Open.
 func New(app *anysyncx.App, db anystore.DB) *Service {
-	return &Service{app: app, db: db}
+	return &Service{app: app, db: db, claimSem: make(chan struct{}, 1)}
 }
 
 // SyncHeads forces an immediate head-sync round on the tech space, so
@@ -94,22 +120,27 @@ func (s *Service) Open(ctx context.Context) error {
 		return errors.New("techspace: anysyncx app has no account keys")
 	}
 
-	// SpaceType for the tech space matches the any-sync-coordinator's
-	// allow-list (see spacestatus/changeverifier.go in
-	// any-sync-coordinator). The library default
-	// spacepayloads.SpaceReserved ("any-sync.space") is rejected by
-	// the coordinator — it only knows the anytype.* family.
-	spaceCfg := spacepayloads.SpaceDerivePayload{
-		SigningKey: keys.SignKey,
-		MasterKey:  keys.SignKey,
-		SpaceType:  TechSpaceType,
-	}
+	spaceCfg := deriveCfg(keys.SignKey)
 	spaceId, err := s.app.SpaceService().DeriveId(ctx, spaceCfg)
 	if err != nil {
 		return fmt.Errorf("techspace: derive id: %w", err)
 	}
 	s.spaceId = spaceId
 
+	// Headless: the tech space is a private registry of tracked foreign
+	// spaces, strictly local to this device — never announced to sync
+	// nodes, never pushed, never coordinator-signed. Marked BEFORE the
+	// first load below (the peer manager is chosen at NewSpace time).
+	if s.app.Headless() {
+		s.app.MarkSpaceLocalOnly(spaceId)
+	}
+
+	// Boot-serial only (sdk.Open, before any API is exposed), so this
+	// exists-check + out-of-band create cannot race itself. Do NOT copy
+	// this shape into a concurrent context: CreateSpaceStorage is
+	// concurrency-safe only under the space cache's per-id load — a
+	// concurrent deterministic-id create must ride the cache load
+	// instead (see spaceimpl's ctxWithCreatePayload).
 	if !s.app.SpaceExists(spaceId) {
 		if _, err := s.app.SpaceService().DeriveSpace(ctx, spaceCfg); err != nil {
 			return fmt.Errorf("techspace: derive: %w", err)
@@ -117,28 +148,22 @@ func (s *Service) Open(ctx context.Context) error {
 	}
 
 	s.store = spaceobjects.NewStoreWithConfig(spaceobjects.StoreConfig{
-		App:     s.app,
-		DB:      s.db,
-		SignKey: keys.SignKey,
-		SpaceId: s.spaceId,
-		Alloc:   object.NewVersionAllocator(""),
-		Handlers: []crdt.HandlerReg{
-			{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema()},
-			{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()},
-			{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()},
-			// Account-values carrier (one derived object per target
-			// space) — see accountvalues.go. Dynamic: carrier records
-			// carry free-form typeId heads at the target rows' paths.
-			{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()},
-		},
-		DisableGate: true,
-		DataVersions: map[string]string{
-			SpaceIndexDataset:     HandlerVersion,
-			ProfileDataset:        ProfileHandlerVersion,
-			InboxCursorDataset:    InboxCursorHandlerVersion,
-			accountvalues.Dataset: accountvalues.HandlerVersion,
-		},
+		App:            s.app,
+		DB:             s.db,
+		SignKey:        keys.SignKey,
+		SpaceId:        s.spaceId,
+		Alloc:          object.NewVersionAllocator(""),
+		SystemDatasets: s.systemDatasets(),
+		DisableHistory: true,
 	})
+	// The CRDT version mark gates every user-authored synced write on
+	// this store too — the same account-wide gate spaceimpl installs
+	// on the regular spaces (WriteGate).
+	s.store.SetGlobalGate(s.WriteGate)
+	// Gate is on: rows parked for a dataset that registers later (a
+	// bundle root's declarations) drain on first touch after restart.
+	s.store.NotifyDrainer(types.DataVersionPair{})
+	s.store.StartIndexSync()
 
 	// Derive the single index object through the Store. Store.Derive
 	// computes the deterministic id, then runs PutTree (first boot) /
@@ -154,6 +179,38 @@ func (s *Service) Open(ctx context.Context) error {
 
 	s.open.Store(true)
 	return nil
+}
+
+// SystemDatasets lists the tech-space datasets registered on every
+// controller of the tech Store as ungated built-ins, with the
+// DataVersion stamp their typed writers use. Also the set the public
+// write surface of the tech-space handle refuses. The CRDT version
+// handler here carries no service hook; a live service registers its
+// own through systemDatasets.
+func SystemDatasets() []spaceobjects.SystemDataset {
+	return systemDatasetsWith(CRDTVersionHandler{})
+}
+
+// systemDatasets is SystemDatasets with this service's CRDT version
+// hook wired in.
+func (s *Service) systemDatasets() []spaceobjects.SystemDataset {
+	return systemDatasetsWith(s.crdtVersionHandler())
+}
+
+func systemDatasetsWith(crdtVersion CRDTVersionHandler) []spaceobjects.SystemDataset {
+	return []spaceobjects.SystemDataset{
+		// The CRDT version mark — see crdtversion.go.
+		{Reg: crdt.HandlerReg{Name: CRDTVersionDataset, Handler: crdtVersion, Schema: CRDTVersionSchema()}, DataVersion: CRDTVersionHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: SpaceIndexDataset, Handler: SpaceIndexHandler{}, Schema: SpaceIndexSchema(), Version: SpaceIndexLocalVersion}, DataVersion: HandlerVersion},
+		{Reg: crdt.HandlerReg{Name: ProfileDataset, Handler: ProfileHandler{}, Schema: ProfileSchema()}, DataVersion: ProfileHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: InboxCursorDataset, Handler: InboxCursorHandler{}, Schema: InboxCursorSchema()}, DataVersion: InboxCursorHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: IdentitiesDataset, Handler: IdentitiesHandler{}, Schema: IdentitiesSchema(), Indexes: IdentitiesIndexes()}, DataVersion: IdentitiesHandlerVersion},
+		{Reg: crdt.HandlerReg{Name: DevicesDataset, Handler: DevicesHandler{}, Schema: DevicesSchema()}, DataVersion: DevicesHandlerVersion},
+		// Account-values carrier (one derived object per target
+		// space) — see accountvalues.go. Dynamic: carrier records
+		// carry free-form typeId heads at the target rows' paths.
+		{Reg: crdt.HandlerReg{Name: accountvalues.Dataset, Handler: crdt.DefaultHandler{}, Schema: accountvalues.Schema()}, DataVersion: accountvalues.HandlerVersion},
+	}
 }
 
 // indexObj returns the resident index *object.Object via the Store's
@@ -248,11 +305,11 @@ func (s *Service) SetSpaceMetadata(ctx context.Context, spaceId, name, descripti
 	return obj.LocalWrite(ctx, change)
 }
 
-// SetLocalStatus updates the device-local localStatus field via the
-// local-set path: it does NOT enter the DAG and never syncs to other
-// devices (each device owns its own value). Use for per-device
-// lifecycle — active / joining / offloaded.
-func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+// setRowField is the shared scaffold behind the per-field setters:
+// one OpSet at [field] on spaceId's row, payload built on a fresh
+// arena. local selects LocalSet (device-local, never enters the DAG)
+// vs LocalWrite (synced, account-wide).
+func (s *Service) setRowField(ctx context.Context, spaceId, field string, local bool, payload func(a *anyenc.Arena) *anyenc.Value) (object.WriteResult, error) {
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
@@ -260,52 +317,103 @@ func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (o
 	if err != nil {
 		return object.WriteResult{}, err
 	}
-
 	arena := &anyenc.Arena{}
 	change := crdt.Change{
 		Dataset:     SpaceIndexDataset,
 		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldLocalStatus},
-					Payload: arena.NewString(status),
-				}},
-			},
-		},
+		Records: []crdt.RecordChange{{
+			Id: spaceId,
+			Ops: []crdt.Op{{
+				Type:    crdt.OpSet,
+				Path:    []string{field},
+				Payload: payload(arena),
+			}},
+		}},
 	}
-	return obj.LocalSet(ctx, change)
+	if local {
+		return obj.LocalSet(ctx, change)
+	}
+	return obj.LocalWrite(ctx, change)
+}
+
+// SetLocalStatus updates the device-local localStatus field via the
+// local-set path: it does NOT enter the DAG and never syncs to other
+// devices (each device owns its own value). Use for per-device
+// lifecycle — active / joining / offloaded.
+func (s *Service) SetLocalStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldLocalStatus, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(status)
+	})
+}
+
+// SetType backfills the on-wire header type onto a row created with an
+// unknown type (join/track register rows before the space's header is
+// readable). Synced write; the handler's set-once rule makes it a no-op
+// race loser everywhere the value is already non-empty.
+func (s *Service) SetType(ctx context.Context, spaceId, typ string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldType, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(typ)
+	})
+}
+
+// SetDerived flags a row as seed-derived (FieldDerived, synced) — the
+// heal path for rows that predate the flag (Derive stamps it at row
+// create otherwise). Set-once: the handler pins it after the first
+// true write.
+func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldDerived, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewTrue()
+	})
+}
+
+// SetP2PAdvertise writes the per-space p2p advertising switch
+// (FieldP2PAdvertise, synced account-wide).
+func (s *Service) SetP2PAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldP2PAdvertise, false, func(a *anyenc.Arena) *anyenc.Value {
+		if on {
+			return a.NewTrue()
+		}
+		return a.NewFalse()
+	})
+}
+
+// SetPushKeys mirrors the space's derived push-notification key
+// material onto its row via the local-set path (FieldPushKeys,
+// device-local; never enters the DAG — every device derives the same
+// values from the same converged ACL). The whole `push` object is
+// replaced in one op: encKey/encKeyId always rotate together and
+// spaceKey never changes, so per-subfield merging buys nothing.
+// Caller (the ACL mirror watcher) is responsible for the row-exists
+// check and for skipping no-op writes.
+func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.PushKeys) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldPushKeys, true, func(a *anyenc.Arena) *anyenc.Value {
+		payload := a.NewObject()
+		payload.Set(PushKeySpaceKey, a.NewString(keys.SpaceKey))
+		payload.Set(PushKeyEncKey, a.NewString(keys.EncKey))
+		payload.Set(PushKeyEncKeyId, a.NewString(keys.EncKeyId))
+		return payload
+	})
+}
+
+// SetOwnRole mirrors this account's own ACL permission onto the
+// space's row via the local-set path (FieldOwnRole, device-local;
+// never enters the DAG — every device derives the same role from the
+// same converged ACL). Stored as the canonical wire label
+// (space.Permission.String). Caller (the ACL mirror watcher) is
+// responsible for the row-exists check and for skipping no-op writes.
+func (s *Service) SetOwnRole(ctx context.Context, spaceId string, role space.Permission) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldOwnRole, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(role.String())
+	})
 }
 
 // SetAclHeadId records the ACL head id from RequestJoin on the joining
 // row via the local-set path (device-local; never enters the DAG). Read
 // back by the joiner-side post-acceptance waiter to detect a decline.
 func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (object.WriteResult, error) {
-	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
-	}
-	obj, err := s.indexObj(ctx)
-	if err != nil {
-		return object.WriteResult{}, err
-	}
-	arena := &anyenc.Arena{}
-	change := crdt.Change{
-		Dataset:     SpaceIndexDataset,
-		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldAclHeadId},
-					Payload: arena.NewString(aclHeadId),
-				}},
-			},
-		},
-	}
-	return obj.LocalSet(ctx, change)
+	return s.setRowField(ctx, spaceId, FieldAclHeadId, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(aclHeadId)
+	})
 }
 
 // SetOneToOneInviteState writes the device-local 1-1 invite-send marker
@@ -313,35 +421,77 @@ func (s *Service) SetAclHeadId(ctx context.Context, spaceId, aclHeadId string) (
 // DAG. Pass "toSend" to flag a pending notification, "" to clear it once
 // the coordinator confirms delivery.
 func (s *Service) SetOneToOneInviteState(ctx context.Context, spaceId, state string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldOneToOneInviteState, true, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(state)
+	})
+}
+
+// AddInviteNotify queues identity into the device-local direct-add send
+// outbox on spaceId's row ($addToSet on FieldInviteNotifyPending; no-op
+// when already queued). Local-set path — never enters the DAG.
+func (s *Service) AddInviteNotify(ctx context.Context, spaceId, identity string) error {
+	if spaceId == "" || identity == "" {
+		return nil
+	}
+	if rec, ok := s.Get(ctx, spaceId); ok {
+		for _, id := range rec.InviteNotifyPending {
+			if id == identity {
+				return nil
+			}
+		}
+	}
+	return s.inviteNotifyOp(ctx, spaceId, identity, crdt.OpAddToSet)
+}
+
+// ClearInviteNotify removes identity from spaceId's send outbox ($pull)
+// once the coordinator confirms delivery — or when the entry is
+// permanently undeliverable. Local-set path.
+func (s *Service) ClearInviteNotify(ctx context.Context, spaceId, identity string) error {
+	if spaceId == "" || identity == "" {
+		return nil
+	}
+	return s.inviteNotifyOp(ctx, spaceId, identity, crdt.OpPull)
+}
+
+func (s *Service) inviteNotifyOp(ctx context.Context, spaceId, identity string, op crdt.OpType) error {
 	if !s.open.Load() {
-		return object.WriteResult{}, errors.New("techspace: service not open")
+		return errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return object.WriteResult{}, err
+		return err
 	}
 	arena := &anyenc.Arena{}
 	change := crdt.Change{
 		Dataset:     SpaceIndexDataset,
 		DataVersion: HandlerVersion,
 		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldOneToOneInviteState},
-					Payload: arena.NewString(state),
-				}},
-			},
+			{Id: spaceId, Ops: []crdt.Op{{Type: op, Path: []string{FieldInviteNotifyPending}, Payload: arena.NewString(identity)}}},
 		},
 	}
-	return obj.LocalSet(ctx, change)
+	_, err = obj.LocalSet(ctx, change)
+	return err
 }
 
 // SetRemoteStatus updates the SYNCED remoteStatus field — account-wide
 // state that propagates to every device. Used for account-wide delete
 // (status=StatusDeleted); the handler keeps deleted terminal.
 func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldRemoteStatus, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(status)
+	})
+}
+
+// SetIssuedInviteKey writes (or clears, with "") the SYNCED custody of
+// one issued invite key kind (IssuedKeyMember / IssuedKeyGuest) at
+// [issuedInviteKeys, kind] — every device of the issuing account can
+// then re-show or revoke the same invite. Per-path so kinds written on
+// different devices merge instead of clobbering. Written / cleared by
+// the ACL invite mint and revoke paths.
+func (s *Service) SetIssuedInviteKey(ctx context.Context, spaceId, kind, encodedKey string) (object.WriteResult, error) {
+	if kind != IssuedKeyMember && kind != IssuedKeyGuest {
+		return object.WriteResult{}, fmt.Errorf("techspace: unknown issued-key kind %q", kind)
+	}
 	if !s.open.Load() {
 		return object.WriteResult{}, errors.New("techspace: service not open")
 	}
@@ -350,21 +500,25 @@ func (s *Service) SetRemoteStatus(ctx context.Context, spaceId, status string) (
 		return object.WriteResult{}, err
 	}
 	arena := &anyenc.Arena{}
+	op := crdt.Op{Type: crdt.OpUnset, Path: []string{FieldIssuedInviteKeys, kind}}
+	if encodedKey != "" {
+		op = crdt.Op{Type: crdt.OpSet, Path: op.Path, Payload: arena.NewString(encodedKey)}
+	}
 	change := crdt.Change{
 		Dataset:     SpaceIndexDataset,
 		DataVersion: HandlerVersion,
-		Records: []crdt.RecordChange{
-			{
-				Id: spaceId,
-				Ops: []crdt.Op{{
-					Type:    crdt.OpSet,
-					Path:    []string{FieldRemoteStatus},
-					Payload: arena.NewString(status),
-				}},
-			},
-		},
+		Records:     []crdt.RecordChange{{Id: spaceId, Ops: []crdt.Op{op}}},
 	}
 	return obj.LocalWrite(ctx, change)
+}
+
+// SetGuestKey updates the SYNCED guest-mode key on an existing row —
+// the re-join path after the owner rotated the guest key (JoinGuest
+// with a fresh invite). Row creation writes the field via EncodeCreate.
+func (s *Service) SetGuestKey(ctx context.Context, spaceId, encodedKey string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldGuestKey, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(encodedKey)
+	})
 }
 
 // Get returns the current state of one space-index record. Reads off
@@ -387,22 +541,26 @@ func (s *Service) Get(ctx context.Context, spaceId string) (SpaceIndexRecord, bo
 
 // List returns every live space-index record. Inbound head-sync
 // changes are projected live by the resident index object's
-// deferred-updater listener, so a plain controller read is current —
-// the old read-time drain is gone.
-func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
+// deferred-updater listener, so a plain controller read is current.
+// Unavailability (service not open, index object not loadable, a scan
+// the context ended) is an error, never an empty list.
+func (s *Service) List(ctx context.Context) ([]SpaceIndexRecord, error) {
 	if !s.open.Load() {
-		return nil
+		return nil, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return nil
+		return nil, err
 	}
-	rows := obj.Controller().Records(ctx, SpaceIndexDataset)
+	rows, err := obj.Controller().ListRecords(ctx, SpaceIndexDataset)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]SpaceIndexRecord, 0, len(rows))
 	for _, v := range rows {
 		out = append(out, DecodeSpaceIndexRecord(v))
 	}
-	return out
+	return out, nil
 }
 
 // GetProfile returns the locally-stored profile (the source-of-truth
@@ -410,25 +568,232 @@ func (s *Service) List(ctx context.Context) []SpaceIndexRecord {
 // when a profile has ever been written; false on a fresh device that
 // hasn't seen UpdateMetadata yet.
 func (s *Service) GetProfile(ctx context.Context) (ProfileRecord, bool) {
+	rec, present, err := s.GetProfileState(ctx)
+	return rec, err == nil && present
+}
+
+// GetProfileState is GetProfile for callers that must tell a row that
+// is absent from a read that failed (a closed service, an index object
+// that could not be loaded): the former is final, the latter is
+// retried.
+func (s *Service) GetProfileState(ctx context.Context) (rec ProfileRecord, present bool, err error) {
 	if !s.open.Load() {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, errors.New("techspace: service not open")
 	}
 	obj, err := s.indexObj(ctx)
 	if err != nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, err
 	}
-	v := obj.Controller().Get(ctx, ProfileDataset, ProfileSelfId)
+	v, err := obj.Controller().Lookup(ctx, ProfileDataset, ProfileSelfId)
+	if err != nil {
+		return ProfileRecord{}, false, err
+	}
 	if v == nil {
-		return ProfileRecord{}, false
+		return ProfileRecord{}, false, nil
 	}
-	return DecodeProfileRecord(v), true
+	return DecodeProfileRecord(v), true, nil
 }
 
-// SetProfile writes (or replaces) the local profile row. Called by
-// Account.UpdateMetadata to persist the value before pushing it to
-// identityRepo, so a subsequent boot can republish without the user
-// re-calling UpdateMetadata.
-func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
+// SetProfileMetadata writes the name and description of the profile
+// row, leaving the avatar fields to SetProfileIcon: each writer owns
+// its fields, so devices editing different parts of the profile
+// converge per field instead of the last full-row write winning.
+func (s *Service) SetProfileMetadata(ctx context.Context, name, description string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileName, name},
+		{FieldProfileDescription, description},
+	})
+}
+
+// SetProfileIcon writes the avatar fields of the profile row: the
+// content address and the tech-space file row behind it, both empty
+// to clear. The published mark is cleared with them: it names a file,
+// and a new avatar has not been pushed yet.
+func (s *Service) SetProfileIcon(ctx context.Context, iconCID, iconFileId string) error {
+	return s.setProfileFields(ctx, [][2]string{
+		{FieldProfileIcon, iconCID},
+		{FieldProfileIconFileId, iconFileId},
+		{FieldProfileIconPublished, ""},
+	})
+}
+
+// SetProfileIconPublished records that the reference of the avatar
+// file fileId reached identityRepo. Tied to the file: a mark written
+// for one avatar never vouches for the next.
+func (s *Service) SetProfileIconPublished(ctx context.Context, fileId string) error {
+	return s.setProfileFields(ctx, [][2]string{{FieldProfileIconPublished, fileId}})
+}
+
+// setProfileFields upserts the profile row with one $set per field.
+func (s *Service) setProfileFields(ctx context.Context, fields [][2]string) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	ops := make([]crdt.Op, 0, len(fields))
+	for _, f := range fields {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Path: []string{f[0]}, Payload: arena.NewString(f[1])})
+	}
+	change := crdt.Change{
+		Dataset:     ProfileDataset,
+		DataVersion: ProfileHandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: ProfileSelfId, Upsert: true, Ops: ops},
+		},
+	}
+	_, err = obj.LocalWrite(ctx, change)
+	return err
+}
+
+// GetIdentity returns the full identities-directory record for an
+// account identity, or (zero, false) when we've never encountered it.
+func (s *Service) GetIdentity(ctx context.Context, identity string) (IdentityRecord, bool) {
+	if !s.open.Load() || identity == "" {
+		return IdentityRecord{}, false
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return IdentityRecord{}, false
+	}
+	v := obj.Controller().Get(ctx, IdentitiesDataset, identity)
+	if v == nil {
+		return IdentityRecord{}, false
+	}
+	return DecodeIdentityRecord(v), true
+}
+
+// ListIdentities returns every identities-directory row. Unavailability
+// is an error, never an empty list, as for List.
+func (s *Service) ListIdentities(ctx context.Context) ([]IdentityRecord, error) {
+	if !s.open.Load() {
+		return nil, errors.New("techspace: service not open")
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err := obj.Controller().ListRecords(ctx, IdentitiesDataset)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IdentityRecord, 0, len(rows))
+	for _, v := range rows {
+		out = append(out, DecodeIdentityRecord(v))
+	}
+	return out, nil
+}
+
+// GetIdentityMetaKey returns the cached metadata symkey (string form, per
+// space.MarshalSymKey) for a contact identity, or "" + false when this
+// account has never received it. Account-scoped and SYNCED, so a key
+// learned on any device or in any space is available here.
+func (s *Service) GetIdentityMetaKey(ctx context.Context, identity string) (string, bool) {
+	rec, ok := s.GetIdentity(ctx, identity)
+	if !ok || rec.SymKey == "" {
+		return "", false
+	}
+	return rec.SymKey, true
+}
+
+// SetIdentityMetaKey caches a contact's metadata symkey (string form).
+// SYNCED (LocalWrite → DAG) so the account's other devices can decrypt
+// that contact's profile too. Write-once in practice (the contact's
+// deterministic key never changes); a no-op when already stored.
+func (s *Service) SetIdentityMetaKey(ctx context.Context, identity, symKey string) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	if identity == "" || symKey == "" {
+		return nil
+	}
+	if cur, ok := s.GetIdentityMetaKey(ctx, identity); ok && cur == symKey {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	change := crdt.Change{
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
+		Records: []crdt.RecordChange{
+			{
+				Id:     identity,
+				Upsert: true,
+				Ops:    []crdt.Op{{Type: crdt.OpSet, Path: []string{FieldIdentitySymKey}, Payload: arena.NewString(symKey)}},
+			},
+		},
+	}
+	_, err = obj.LocalWrite(ctx, change)
+	return err
+}
+
+// SetIdentityProfile caches a contact's resolved identityRepo profile.
+// DEVICE-LOCAL (LocalSet → never synced): each device re-resolves from
+// the synced symkey + identityRepo. No-op when unchanged.
+func (s *Service) SetIdentityProfile(ctx context.Context, identity string, p IdentityProfile) error {
+	if !s.open.Load() {
+		return errors.New("techspace: service not open")
+	}
+	if identity == "" {
+		return nil
+	}
+	if rec, ok := s.GetIdentity(ctx, identity); ok && rec.IdentityProfile == p {
+		return nil
+	}
+	obj, err := s.indexObj(ctx)
+	if err != nil {
+		return err
+	}
+	arena := &anyenc.Arena{}
+	payload := arena.NewObject()
+	payload.Set(FieldIdentityName, arena.NewString(p.Name))
+	payload.Set(FieldIdentityDescription, arena.NewString(p.Description))
+	payload.Set(FieldIdentityIcon, arena.NewString(p.IconCID))
+	payload.Set(FieldIdentityIconSpaceId, arena.NewString(p.IconSpaceId))
+	payload.Set(FieldIdentityIconKey, arena.NewString(p.IconKey))
+	change := crdt.Change{
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
+		Records: []crdt.RecordChange{
+			{Id: identity, Upsert: true, Ops: []crdt.Op{{Type: crdt.OpSet, Payload: payload}}},
+		},
+	}
+	_, err = obj.LocalSet(ctx, change)
+	return err
+}
+
+// AddIdentitySpace records that we've seen identity in spaceId.
+// DEVICE-LOCAL ($addToSet on the spaceIds set). No-op if already present.
+func (s *Service) AddIdentitySpace(ctx context.Context, identity, spaceId string) error {
+	if identity == "" || spaceId == "" {
+		return nil
+	}
+	if rec, ok := s.GetIdentity(ctx, identity); ok {
+		for _, id := range rec.SpaceIds {
+			if id == spaceId {
+				return nil
+			}
+		}
+	}
+	return s.identitySpaceOp(ctx, identity, spaceId, crdt.OpAddToSet)
+}
+
+// RemoveIdentitySpace drops spaceId from identity's sightings ($pull).
+// DEVICE-LOCAL. Used when a single member leaves a space.
+func (s *Service) RemoveIdentitySpace(ctx context.Context, identity, spaceId string) error {
+	if identity == "" || spaceId == "" {
+		return nil
+	}
+	return s.identitySpaceOp(ctx, identity, spaceId, crdt.OpPull)
+}
+
+func (s *Service) identitySpaceOp(ctx context.Context, identity, spaceId string, op crdt.OpType) error {
 	if !s.open.Load() {
 		return errors.New("techspace: service not open")
 	}
@@ -438,18 +803,36 @@ func (s *Service) SetProfile(ctx context.Context, rec ProfileRecord) error {
 	}
 	arena := &anyenc.Arena{}
 	change := crdt.Change{
-		Dataset:     ProfileDataset,
-		DataVersion: ProfileHandlerVersion,
+		Dataset:     IdentitiesDataset,
+		DataVersion: IdentitiesHandlerVersion,
 		Records: []crdt.RecordChange{
-			{
-				Id:     ProfileSelfId,
-				Upsert: true,
-				Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: rec.encodeUpsert(arena)}},
-			},
+			{Id: identity, Upsert: true, Ops: []crdt.Op{{Type: op, Path: []string{FieldIdentitySpaceIds}, Payload: arena.NewString(spaceId)}}},
 		},
 	}
-	_, err = obj.LocalWrite(ctx, change)
+	_, err = obj.LocalSet(ctx, change)
 	return err
+}
+
+// RemoveSpaceFromIdentities drops spaceId from every identity's sightings
+// — used when the account leaves/offloads a space so spaceIds keeps
+// reflecting live memberships. DEVICE-LOCAL.
+func (s *Service) RemoveSpaceFromIdentities(ctx context.Context, spaceId string) error {
+	if spaceId == "" {
+		return nil
+	}
+	recs, err := s.ListIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		for _, id := range rec.SpaceIds {
+			if id == spaceId {
+				_ = s.RemoveIdentitySpace(ctx, rec.Identity, spaceId)
+				break
+			}
+		}
+	}
+	return nil
 }
 
 // GetInboxCursor returns the SYNCED account-wide coordinator-inbox read
@@ -585,8 +968,8 @@ func (s *Service) Close(_ context.Context) error {
 }
 
 // SpaceRegistry adapter — the tech-space hosts the index object plus
-// one account-values carrier object per target space, all served by
-// the same raw Store. Every tech-space tree routes through it so the
+// one account-values carrier object per target space, plus bundle
+// roots, all served by the same Store. Every tech-space tree routes through it so the
 // listener-bound, deferred-updater, cold-restored object is what the
 // tree syncer touches.
 
@@ -603,9 +986,9 @@ var ErrSpaceRegistryUnknown = errors.New("techspace: unknown (spaceId, treeId)")
 // values never crossed devices.
 //
 // Accepting arbitrary tree ids is safe: the tech space is owner-only —
-// every tree in it is this account's, and the raw Store registers the
-// full tech handler set (spaces/profile/account_values) on every
-// controller. An id any-sync can't resolve fails inside Store.Get and
+// every tree in it is this account's, and the Store registers the
+// full handler set (built-ins + system datasets) on every controller.
+// An id any-sync can't resolve fails inside Store.Get and
 // the syncer skips it.
 func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttree.ObjectTree, error) {
 	if spaceId != s.spaceId {
@@ -627,6 +1010,14 @@ func (s *Service) GetTree(ctx context.Context, spaceId, treeId string) (objecttr
 // derived yet. (The index object is always derived locally at Open, so
 // it never arrives this way, but accepting it is harmless: Derive and
 // PutTree converge on the same deterministic tree.)
+// HasTree reports whether the tech space already stores treeId.
+func (s *Service) HasTree(ctx context.Context, spaceId, treeId string) (bool, error) {
+	if spaceId != s.spaceId {
+		return false, ErrSpaceRegistryUnknown
+	}
+	return s.store.HasTree(ctx, treeId)
+}
+
 func (s *Service) PutTree(ctx context.Context, spaceId string, payload treestorage.TreeStorageCreatePayload) error {
 	if spaceId != s.spaceId {
 		return ErrSpaceRegistryUnknown

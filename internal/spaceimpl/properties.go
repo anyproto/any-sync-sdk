@@ -4,18 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/accountvalues"
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/types"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -54,9 +55,7 @@ func (p *propertiesAPI) Get(ctx context.Context, objectId string) (*anyenc.Value
 	// Doc's buffer is reused; clone before returning so callers can
 	// retain the value past this call (same contract as
 	// Controller.Get).
-	var cloned anyencutil.Value
-	cloned.FillCopy(v)
-	return cloned.Value, nil
+	return anyencx.Clone(v), nil
 }
 
 // Set merges the patch into the object's property record on the route
@@ -131,10 +130,10 @@ func resolveRoute(reg types.Registry, typeId string, patch map[string]any) (sche
 	}
 	parts := make([]string, 0, len(byScope))
 	for sc, keys := range byScope {
-		sort.Strings(keys)
+		slices.Sort(keys)
 		parts = append(parts, fmt.Sprintf("%s: [%s]", sc, strings.Join(keys, ", ")))
 	}
-	sort.Strings(parts)
+	slices.Sort(parts)
 	return 0, nil, fmt.Errorf("propertiesAPI: patch spans multiple scopes — issue one Set per scope (%s)", strings.Join(parts, "; "))
 }
 
@@ -199,7 +198,7 @@ func (p *propertiesAPI) setSynced(ctx context.Context, objectId, typeId string, 
 		}},
 	})
 	if err != nil {
-		return space.ModifyResult{}, err
+		return space.ModifyResult{}, wrapSlotErr(err)
 	}
 	return modifyResultFromWrite(res), nil
 }
@@ -366,68 +365,88 @@ func dataVersionForType(ctx context.Context, reg *types.LiveRegistry, typeId str
 	return types.EncodeDataVersion([]types.DataVersionPair{{TypeId: typeId, ShortId: shortId}}), nil
 }
 
-// AttachType adds typeId to the object's any.types list, declaring that
-// the object implements the type. Idempotent ($addToSet — re-attaching
-// is a no-op). This is the sanctioned way to let an object host a type's
-// properties or datasets: the write-time membership checks
-// (SystemPropertiesHandler.PreValidate for properties, Modify for
-// datasets) require the type to be present here first. Type membership
-// is structural and shared, so this always rides the synced route.
-func (p *propertiesAPI) AttachType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
-	if objectId == "" || typeId == "" {
-		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
-	}
+// membershipWrite issues one membership op on the object's row —
+// always the synced route: membership is structural and shared.
+func (p *propertiesAPI) membershipWrite(ctx context.Context, objectId string, op crdt.Op) (space.ModifyResult, error) {
 	obj, err := p.parent.store.Get(ctx, objectId)
 	if err != nil {
 		return space.ModifyResult{}, err
 	}
-	arena := &anyenc.Arena{}
 	res, err := obj.LocalWrite(ctx, crdt.Change{
 		Dataset:     properties.Dataset,
 		DataVersion: properties.HandlerVersion,
 		Records: []crdt.RecordChange{{
 			Id:     objectId,
 			Upsert: true,
-			Ops: []crdt.Op{{
-				Type:    crdt.OpAddToSet,
-				Path:    []string{"any", "types"},
-				Payload: arena.NewString(typeId),
-			}},
+			Ops:    []crdt.Op{op},
 		}},
 	})
 	if err != nil {
-		return space.ModifyResult{}, err
+		return space.ModifyResult{}, wrapSlotErr(err)
 	}
 	return modifyResultFromWrite(res), nil
 }
 
-// DetachType removes typeId from the object's any.types ($pull). Values
-// in that namespace and records in the type's datasets become orphan
-// data, read-tolerant (docs/06-data-structure.md §"read tolerance").
-func (p *propertiesAPI) DetachType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
+// wrapSlotErr maps the handler's membership rejections onto the public
+// sentinels so callers classify them without reaching into the handler
+// package.
+func wrapSlotErr(err error) error {
+	switch {
+	case errors.Is(err, properties.ErrWrongSlot):
+		return fmt.Errorf("%w: %w", space.ErrWrongSlot, err)
+	case errors.Is(err, properties.ErrTypeRequired):
+		return fmt.Errorf("%w: %w", space.ErrTypeRequired, err)
+	case errors.Is(err, properties.ErrMetaType):
+		return fmt.Errorf("%w: %w", space.ErrMetaType, err)
+	}
+	return err
+}
+
+// SetType replaces the object's one type (`any.type`, a $set). The
+// previous type's values and dataset records become orphan data,
+// read-tolerant; its datasets refuse further writes. A known
+// collection id is refused by the pre-flight (ErrWrongSlot). A pure
+// membership write carries no values, so it stamps no schema
+// constraint: a peer behind on the type's definitions still applies
+// it.
+func (p *propertiesAPI) SetType(ctx context.Context, objectId, typeId string) (space.ModifyResult, error) {
 	if objectId == "" || typeId == "" {
 		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and typeId required")
 	}
-	obj, err := p.parent.store.Get(ctx, objectId)
-	if err != nil {
-		return space.ModifyResult{}, err
+	arena := &anyenc.Arena{}
+	return p.membershipWrite(ctx, objectId, crdt.Op{
+		Type:    crdt.OpSet,
+		Path:    []string{anytype.TypeId, anytype.FieldType},
+		Payload: arena.NewString(typeId),
+	})
+}
+
+// AttachCollection adds the object to a collection ($addToSet on
+// any.collections — idempotent). A known type id is refused by the
+// pre-flight (ErrWrongSlot).
+func (p *propertiesAPI) AttachCollection(ctx context.Context, objectId, collectionId string) (space.ModifyResult, error) {
+	if objectId == "" || collectionId == "" {
+		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and collectionId required")
 	}
 	arena := &anyenc.Arena{}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
-		Dataset:     properties.Dataset,
-		DataVersion: properties.HandlerVersion,
-		Records: []crdt.RecordChange{{
-			Id:     objectId,
-			Upsert: true,
-			Ops: []crdt.Op{{
-				Type:    crdt.OpPull,
-				Path:    []string{"any", "types"},
-				Payload: arena.NewString(typeId),
-			}},
-		}},
+	return p.membershipWrite(ctx, objectId, crdt.Op{
+		Type:    crdt.OpAddToSet,
+		Path:    []string{anytype.TypeId, anytype.FieldCollections},
+		Payload: arena.NewString(collectionId),
 	})
-	if err != nil {
-		return space.ModifyResult{}, err
+}
+
+// DetachCollection removes the object from a collection ($pull).
+// Values in that namespace become orphan data, read-tolerant
+// (docs/data-structure.md §"read tolerance").
+func (p *propertiesAPI) DetachCollection(ctx context.Context, objectId, collectionId string) (space.ModifyResult, error) {
+	if objectId == "" || collectionId == "" {
+		return space.ModifyResult{}, errors.New("propertiesAPI: objectId and collectionId required")
 	}
-	return modifyResultFromWrite(res), nil
+	arena := &anyenc.Arena{}
+	return p.membershipWrite(ctx, objectId, crdt.Op{
+		Type:    crdt.OpPull,
+		Path:    []string{anytype.TypeId, anytype.FieldCollections},
+		Payload: arena.NewString(collectionId),
+	})
 }

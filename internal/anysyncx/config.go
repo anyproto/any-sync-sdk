@@ -2,7 +2,10 @@ package anysyncx
 
 import (
 	"fmt"
+	"math"
+	"net"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/anyproto/any-sync/app"
@@ -10,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/net/rpc"
 	"github.com/anyproto/any-sync/net/secureservice"
 	"github.com/anyproto/any-sync/net/streampool"
+	"github.com/anyproto/any-sync/net/transport/iroh"
 	"github.com/anyproto/any-sync/net/transport/quic"
 	"github.com/anyproto/any-sync/net/transport/webtransport"
 	"github.com/anyproto/any-sync/net/transport/yamux"
@@ -23,8 +27,13 @@ import (
 // config.Network.NodeConfYAML. Kept private so the public Config stays
 // any-sync-agnostic.
 type nodeConfYAML struct {
-	NetworkID string         `yaml:"networkId"`
-	Nodes     []nodeYAML     `yaml:"nodes"`
+	ID string `yaml:"id"`
+	// NetworkID identifies the tree/coordinator fleet; FileNetworkID is
+	// the fileV2 fleet's receipt-signing identity — without it durable
+	// receipts can't verify and files never leave the inflight state.
+	NetworkID     string     `yaml:"networkId"`
+	FileNetworkID string     `yaml:"fileNetworkId"`
+	Nodes         []nodeYAML `yaml:"nodes"`
 }
 
 type nodeYAML struct {
@@ -54,8 +63,10 @@ func parseNodeConf(raw []byte) (nodeconf.Configuration, error) {
 		}
 	}
 	return nodeconf.Configuration{
-		NetworkId: doc.NetworkID,
-		Nodes:     nodes,
+		Id:            doc.ID,
+		NetworkId:     doc.NetworkID,
+		FileNetworkId: doc.FileNetworkID,
+		Nodes:         nodes,
 	}, nil
 }
 
@@ -89,19 +100,41 @@ func (c *configAdapter) GetDrpc() rpc.Config {
 
 func (c *configAdapter) GetYamux() yamux.Config {
 	return yamux.Config{
-		WriteTimeoutSec:    int(c.dialSeconds()),
-		DialTimeoutSec:     int(c.dialSeconds()),
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     c.dialSeconds(),
 		KeepAlivePeriodSec: 25,
 	}
 }
 
 func (c *configAdapter) GetQuic() quic.Config {
 	return quic.Config{
-		WriteTimeoutSec:    int(c.dialSeconds()),
-		DialTimeoutSec:     int(c.dialSeconds()),
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     c.dialSeconds(),
 		MaxStreams:         128,
 		KeepAlivePeriodSec: 25,
 	}
+}
+
+// GetIroh maps the global p2p budget onto the iroh transport. The idle
+// timeout is three keep-alive periods so a quiet relay path survives a
+// missed probe; a dead peer is noticed within that window.
+func (c *configAdapter) GetIroh() iroh.Config {
+	g := c.sdk.ResolveP2P().Global
+	conf := iroh.Config{
+		RelayURLs:          g.RelayURLs,
+		InsecureRelay:      g.InsecureRelay,
+		WriteTimeoutSec:    c.dialSeconds(),
+		DialTimeoutSec:     wholeSeconds(g.DialTimeout),
+		CloseTimeoutSec:    5,
+		MaxStreams:         128,
+		KeepAlivePeriodSec: wholeSeconds(g.KeepAlive),
+		MaxIdleTimeoutSec:  wholeSeconds(3 * g.KeepAlive),
+	}
+	if g.Port != 0 {
+		// dual-stack, like go-iroh's own default bind
+		conf.BindAddr = net.JoinHostPort("::", strconv.Itoa(g.Port))
+	}
+	return conf
 }
 
 func (c *configAdapter) GetWebTransport() webtransport.Config {
@@ -110,11 +143,19 @@ func (c *configAdapter) GetWebTransport() webtransport.Config {
 
 func (c *configAdapter) GetSecureService() secureservice.Config { return secureservice.Config{} }
 
+// GetStreamConfig sizes the shared outgoing queues. The dial queue is
+// one per process and takes every broadcast + head-sync send across all
+// spaces at once; at boot the whole space list floods it while its 4
+// workers may be stuck in slow dials, and an overflowed TryAdd DROPS
+// the message (mitigated by the peer-manager park buffer, but the queue
+// should rarely overflow in the first place). 300 matches heart.
+// SendQueueSize is ignored for outgoing streams — the per-stream queue
+// size is set at streamHandler.OpenStream (spacesync.go).
 func (c *configAdapter) GetStreamConfig() streampool.StreamConfig {
 	return streampool.StreamConfig{
-		SendQueueSize:    100,
+		SendQueueSize:    outgoingQueueSize,
 		DialQueueWorkers: 4,
-		DialQueueSize:    100,
+		DialQueueSize:    outgoingQueueSize,
 	}
 }
 
@@ -122,11 +163,24 @@ func (c *configAdapter) GetNodeConfStorePath() string {
 	return filepath.Join(c.sdk.Storage.DataDir, "nodeconf")
 }
 
-// dialSeconds returns Sync.DialTimeout in seconds, defaulting to 10s.
-func (c *configAdapter) dialSeconds() int64 {
+// dialSeconds returns Sync.DialTimeout in whole seconds, defaulting to
+// 10s.
+func (c *configAdapter) dialSeconds() int {
 	d := c.sdk.Sync.DialTimeout
 	if d <= 0 {
 		d = 10 * time.Second
 	}
-	return int64(d / time.Second)
+	return wholeSeconds(d)
+}
+
+// wholeSeconds converts a positive duration for the transports' *Sec
+// fields, rounding UP so a sub-second value never becomes 0: the
+// transports read 0 as "use my default" (yamux 10s, iroh 15s) or, for
+// the QUIC accept handshake and stream writes, as an already-expired
+// deadline — either way not what the caller configured.
+func wholeSeconds(d time.Duration) int {
+	if d <= 0 {
+		return 0
+	}
+	return int(math.Ceil(d.Seconds()))
 }

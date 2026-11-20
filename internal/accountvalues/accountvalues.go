@@ -13,10 +13,12 @@
 package accountvalues
 
 import (
-	"sort"
+	"cmp"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-store/v2/anyenc"
+	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
@@ -153,12 +155,12 @@ func Diff(arena *anyenc.Arena, carrier, target *anyenc.Value, resolve ScopeResol
 	out := make([]Batch, 0, len(byVersion))
 	for v, ops := range byVersion {
 		// Deterministic op order within a batch for testability.
-		sort.Slice(ops, func(i, j int) bool {
-			return pathKey(ops[i].Path) < pathKey(ops[j].Path)
+		slices.SortFunc(ops, func(a, b crdt.Op) int {
+			return cmp.Compare(pathKey(a.Path), pathKey(b.Path))
 		})
 		out = append(out, Batch{VersionId: v, Ops: ops})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].VersionId < out[j].VersionId })
+	slices.SortFunc(out, func(a, b Batch) int { return cmp.Compare(a.VersionId, b.VersionId) })
 	return out
 }
 
@@ -198,40 +200,16 @@ func visitValuePaths(rec *anyenc.Value, fn func(typeId, propId string, val *anye
 func pathKey(p []string) string { return strings.Join(p, ".") }
 
 // cloneValue deep-copies v onto arena (Diff results must outlive the
-// carrier record's read buffer).
+// carrier record's read buffer). Delegates to anyencutil.Copy so every
+// anyenc type carries through — a hand-rolled switch turned an unlisted
+// type (dateTime, objectID, vectorF32) into a nil payload, which the
+// apply path drops silently, losing the account-scoped value on every
+// device.
 func cloneValue(arena *anyenc.Arena, v *anyenc.Value) *anyenc.Value {
 	if v == nil {
 		return nil
 	}
-	switch v.Type() {
-	case anyenc.TypeObject:
-		obj := arena.NewObject()
-		o, _ := v.Object()
-		o.Visit(func(k []byte, vv *anyenc.Value) {
-			obj.Set(string(k), cloneValue(arena, vv))
-		})
-		return obj
-	case anyenc.TypeArray:
-		arr := arena.NewArray()
-		items, _ := v.Array()
-		for i, it := range items {
-			arr.SetArrayItem(i, cloneValue(arena, it))
-		}
-		return arr
-	case anyenc.TypeString:
-		return arena.NewStringBytes(v.GetStringBytes())
-	case anyenc.TypeNumber:
-		return arena.NewNumberFloat64(v.GetFloat64())
-	case anyenc.TypeBinary:
-		return arena.NewBinary(v.GetBytes())
-	case anyenc.TypeTrue:
-		return arena.NewTrue()
-	case anyenc.TypeFalse:
-		return arena.NewFalse()
-	case anyenc.TypeNull:
-		return arena.NewNull()
-	}
-	return nil
+	return anyencutil.Copy(arena, v)
 }
 
 // Sanity guard used by tests and the techspace registration: the

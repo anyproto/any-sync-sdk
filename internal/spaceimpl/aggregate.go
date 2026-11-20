@@ -2,7 +2,6 @@ package spaceimpl
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -10,6 +9,7 @@ import (
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/valyala/fastjson"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -32,6 +32,14 @@ type aggImpl struct {
 	store    *spaceobjects.Store
 	objectId string
 	dataset  string
+	// allObjects runs over a shared dataset across every object that
+	// holds it (Space.AggregateDataset); objectId is unused.
+	allObjects bool
+	// keyed: the resolved collection holds every object's rows, so the
+	// pipeline starts from this object's key range; shared: it holds one
+	// row per object, so the pipeline starts from this object's row.
+	// Set by collection.
+	keyed, shared bool
 
 	// pipeline is the normalized user pipeline (an anyenc array; nil
 	// for an absent/empty pipeline). arena owns the values aggImpl
@@ -54,6 +62,25 @@ func newAgg(store *spaceobjects.Store, objectId, dataset string, pipeline any) *
 	a := &aggImpl{store: store, objectId: objectId, dataset: dataset, arena: &anyenc.Arena{}}
 	a.pipeline, a.parseErr = a.normalizePipeline(pipeline)
 	return a
+}
+
+// newDatasetAgg builds an aggImpl over the per-space collection of a
+// shared dataset — every object's records.
+func newDatasetAgg(store *spaceobjects.Store, dataset string, pipeline any) *aggImpl {
+	a := newAgg(store, "", dataset, pipeline)
+	a.allObjects = true
+	return a
+}
+
+// collection resolves the collection the pipeline runs over.
+func (a *aggImpl) collection(ctx context.Context) (anystore.Collection, error) {
+	if a.allObjects {
+		return resolveDatasetCollection(ctx, a.store, a.dataset)
+	}
+	coll, ctrl, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	a.keyed = ctrl != nil && ctrl.IsKeyed(a.dataset)
+	a.shared = ctrl != nil && !a.keyed && ctrl.IsShared(a.dataset)
+	return coll, err
 }
 
 // newSharedAgg builds an aggImpl over the per-space `objects`
@@ -85,10 +112,7 @@ func (a *aggImpl) normalizePipeline(pipeline any) (*anyenc.Value, error) {
 	case []byte:
 		v, err = anyenc.Parse(p)
 	default:
-		var raw []byte
-		if raw, err = json.Marshal(p); err == nil {
-			v, err = anyenc.ParseJson(string(raw))
-		}
+		v, err = goToAnyenc(a.arena, p)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", space.ErrBadPipeline, err)
@@ -109,6 +133,17 @@ func (a *aggImpl) combined() *anyenc.Value {
 	exists.Set("$exists", a.arena.NewFalse())
 	match := a.arena.NewObject()
 	match.Set(crdt.DeletedAtField, exists)
+	switch {
+	case a.keyed:
+		// A shared dataset's collection holds every object's rows.
+		lo, hi := crdt.KeyedBounds(a.objectId)
+		idRange := a.arena.NewObject()
+		idRange.Set("$gte", a.arena.NewString(lo))
+		idRange.Set("$lt", a.arena.NewString(hi))
+		match.Set(crdt.IdField, idRange)
+	case a.shared:
+		match.Set(crdt.IdField, a.arena.NewString(a.objectId))
+	}
 	skipStage := a.arena.NewObject()
 	skipStage.Set("$match", match)
 
@@ -130,7 +165,9 @@ func (a *aggImpl) MemoryLimit(bytes int) space.Agg { a.memLimit = &bytes; return
 // applied. coll.Aggregate parses (and detaches from) the combined
 // pipeline; parse errors surface from the terminal call.
 func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
-	aq := coll.Aggregate(a.combined())
+	// The public aggregate surface is a read: $merge/$out sinks would
+	// write store collections past the CRDT and every write fence.
+	aq := coll.Aggregate(a.combined()).ReadOnly()
 	if a.groupLimit != nil {
 		aq = aq.GroupLimit(*a.groupLimit)
 	}
@@ -151,6 +188,9 @@ func (a *aggImpl) buildAgg(coll anystore.Collection) anystore.AggQuery {
 // pipeline — acceptable; the alternative (parse errors reading as
 // internal failures) is worse.
 func classifyAggErr(err error) error {
+	if errors.Is(err, anystore.ErrAggregateReadOnly) {
+		return fmt.Errorf("%w: %v", space.ErrBadPipeline, err)
+	}
 	if err == nil ||
 		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, space.ErrBadPipeline) ||
@@ -171,7 +211,7 @@ func (a *aggImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if a.parseErr != nil {
 		return nil, a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -182,7 +222,7 @@ func (a *aggImpl) Iter(ctx context.Context) (space.Iterator, error) {
 	if err != nil {
 		return nil, classifyAggErr(err)
 	}
-	return &aggIterator{inner: it}, nil
+	return &queryIterator{inner: it}, nil
 }
 
 // All materializes every result document, cloned off the iterator's
@@ -200,11 +240,7 @@ func (a *aggImpl) All(ctx context.Context) ([]*anyenc.Value, error) {
 		if err != nil {
 			return nil, err
 		}
-		cloned, err := cloneAnyenc(doc)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cloned)
+		out = append(out, anyencx.Clone(doc))
 	}
 	return out, it.Err()
 }
@@ -215,7 +251,7 @@ func (a *aggImpl) Count(ctx context.Context) (int, error) {
 	if a.parseErr != nil {
 		return 0, a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -232,7 +268,7 @@ func (a *aggImpl) Explain(ctx context.Context) (string, error) {
 	if a.parseErr != nil {
 		return "", a.parseErr
 	}
-	coll, err := resolveCollection(ctx, a.store, a.objectId, a.dataset)
+	coll, err := a.collection(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -245,26 +281,6 @@ func (a *aggImpl) Explain(ctx context.Context) (string, error) {
 	}
 	return ex.Plan, nil
 }
-
-// aggIterator adapts any-store's Iterator to space.Iterator. Unlike
-// queryIterator there is no tombstone skip (handled in the pipeline
-// prefix) — it's a plain passthrough.
-type aggIterator struct {
-	inner anystore.Iterator
-}
-
-func (i *aggIterator) Next() bool { return i.inner.Next() }
-
-func (i *aggIterator) Doc() (*anyenc.Value, error) {
-	doc, err := i.inner.Doc()
-	if err != nil {
-		return nil, err
-	}
-	return doc.Value(), nil
-}
-
-func (i *aggIterator) Err() error   { return i.inner.Err() }
-func (i *aggIterator) Close() error { return i.inner.Close() }
 
 // Compile-time interface check.
 var _ space.Agg = (*aggImpl)(nil)

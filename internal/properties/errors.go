@@ -1,9 +1,10 @@
 package properties
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
@@ -21,6 +22,22 @@ const (
 	ReasonUnknownProperty    = "unknown_property"
 	ReasonKindMismatch       = "kind_mismatch"
 	ReasonScopeMismatch      = "scope_mismatch"
+	ReasonReservedCarrier    = "reserved_carrier"
+	ReasonWrongSlot          = "wrong_slot"
+	ReasonTypeRequired       = "type_required"
+	ReasonMetaType           = "meta_type"
+)
+
+// OwnerKind classifies a definition id for the slot rule: a type
+// belongs in `any.type`, a collection in `any.collections`. Unknown
+// means the id resolves to neither on this device — no definition, or
+// one that has not synced yet — and passes.
+type OwnerKind uint8
+
+const (
+	OwnerUnknown OwnerKind = iota
+	OwnerType
+	OwnerCollection
 )
 
 // Per-reason sentinels. A ValidationError chains to exactly one of these
@@ -29,12 +46,16 @@ const (
 // the umbrella crdt.ErrValidation. The handler package re-exports these
 // for external callers.
 var (
-	ErrInvalidPath        = errors.New("property write rejected: path must be {typeId}.{propId}")
+	ErrInvalidPath        = errors.New("property write rejected: path must be {typeId}.{propId}, or {typeId}.{propId}.{key…} under an object property")
 	ErrTypeNotImplemented = errors.New("property write rejected: object does not implement the type")
 	ErrTypeUnknown        = errors.New("property write rejected: type schema is not resolvable on this peer")
 	ErrUnknownProperty    = errors.New("property write rejected: type has no such property")
 	ErrKindMismatch       = errors.New("property write rejected: value kind does not match the declared kind")
 	ErrScopeMismatch      = errors.New("property write rejected: write route does not match the property's declared scope")
+	ErrReservedCarrier    = errors.New("property write rejected: a type declaring a reserved module is carried only by its own root")
+	ErrWrongSlot          = errors.New("property write rejected: a type goes in any.type, a collection in any.collections")
+	ErrTypeRequired       = errors.New("property write rejected: an object needs a type — any.type cannot be cleared")
+	ErrMetaType           = errors.New("property write rejected: any, type, collection and spaceIndex are not an object's type")
 )
 
 // reasonErr maps a Reason discriminant to its sentinel. Unknown reasons
@@ -53,6 +74,14 @@ func reasonErr(reason string) error {
 		return ErrKindMismatch
 	case ReasonScopeMismatch:
 		return ErrScopeMismatch
+	case ReasonReservedCarrier:
+		return ErrReservedCarrier
+	case ReasonWrongSlot:
+		return ErrWrongSlot
+	case ReasonTypeRequired:
+		return ErrTypeRequired
+	case ReasonMetaType:
+		return ErrMetaType
 	}
 	return nil
 }
@@ -82,19 +111,38 @@ type ValidationError struct {
 	WriteRoute    schema.Scope
 
 	Known []types.PropInfo // declared properties of the type (unknown_property)
-	Types []string         // the object's any.types (type_not_implemented)
-	Path  []string         // offending op path (invalid_path)
+	// Members is what the object is after the change — its type and
+	// its collections (type_not_implemented).
+	Members []string
+	Path    []string // offending op path (invalid_path)
+
+	// Slot is the membership field the id was written to and Kind
+	// what the id names (wrong_slot).
+	Slot string
+	Kind OwnerKind
+
+	// ObjectId is the row the write targets (reserved_carrier,
+	// type_required, meta_type).
+	ObjectId string
 }
 
 // Error renders an agent-readable, single-line rejection message.
 func (e *ValidationError) Error() string {
 	switch e.Reason {
 	case ReasonInvalidPath:
-		return fmt.Sprintf("property write rejected: path must be {typeId}.{propId}; got %q",
+		return fmt.Sprintf("property write rejected: path must be {typeId}.{propId} (or deeper under an object property); got %q",
 			strings.Join(e.Path, "."))
 	case ReasonTypeNotImplemented:
-		return fmt.Sprintf("property write rejected: object does not implement type %s; attach it to any.types before writing %s.* values. Current types: [%s]",
-			e.typeLabel(), e.TypeId, strings.Join(e.Types, ", "))
+		return fmt.Sprintf("property write rejected: object does not have %s; set it as any.type or add it to any.collections before writing %s.* values. Current members: [%s]",
+			e.typeLabel(), e.TypeId, strings.Join(e.Members, ", "))
+	case ReasonWrongSlot:
+		return fmt.Sprintf("property write rejected: %s is a %s and cannot be written to any.%s",
+			e.typeLabel(), e.Kind, e.Slot)
+	case ReasonTypeRequired:
+		return "property write rejected: an object needs a type — any.type cannot be cleared"
+	case ReasonMetaType:
+		return fmt.Sprintf("property write rejected: %s is a meta id, not a type an object carries; set a type of this space as any.type",
+			e.typeLabel())
 	case ReasonTypeUnknown:
 		return fmt.Sprintf("property write rejected: type %s has no resolvable schema on this peer; define its properties (or wait for the type to sync) before writing %s.* values",
 			e.typeLabel(), e.TypeId)
@@ -107,6 +155,9 @@ func (e *ValidationError) Error() string {
 	case ReasonScopeMismatch:
 		return fmt.Sprintf("property write rejected: property %s on type %s is %s-scoped and cannot be written through the %s route",
 			e.propLabel(), e.typeLabel(), e.DeclaredScope, e.WriteRoute)
+	case ReasonReservedCarrier:
+		return fmt.Sprintf("property write rejected: type %s declares a reserved module and is carried only by its own root, not by object %s",
+			e.typeLabel(), e.ObjectId)
 	}
 	return fmt.Sprintf("property write rejected: %s.%s", e.TypeId, e.PropId)
 }
@@ -120,6 +171,17 @@ func (e *ValidationError) Unwrap() []error {
 		return []error{crdt.ErrValidation, r}
 	}
 	return []error{crdt.ErrValidation}
+}
+
+// String renders the OwnerKind for messages.
+func (k OwnerKind) String() string {
+	switch k {
+	case OwnerType:
+		return "type"
+	case OwnerCollection:
+		return "collection"
+	}
+	return "unknown"
 }
 
 // typeLabel is `"Name" (id)` when a display name is known, else `(id)`.
@@ -145,13 +207,9 @@ func (e *ValidationError) knownList() string {
 	if len(e.Known) == 0 {
 		return "(none)"
 	}
-	ps := make([]types.PropInfo, len(e.Known))
-	copy(ps, e.Known)
-	sort.Slice(ps, func(i, j int) bool {
-		if ps[i].Name != ps[j].Name {
-			return ps[i].Name < ps[j].Name
-		}
-		return ps[i].Id < ps[j].Id
+	ps := slices.Clone(e.Known)
+	slices.SortFunc(ps, func(a, b types.PropInfo) int {
+		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Id, b.Id))
 	})
 	parts := make([]string, 0, len(ps))
 	for _, p := range ps {

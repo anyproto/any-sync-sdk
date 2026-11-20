@@ -4,31 +4,32 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
+	"strings"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/query"
+	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/handler"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/object"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
+	"github.com/anyproto/any-sync-sdk/internal/types"
 	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
+	collectiontype "github.com/anyproto/any-sync-sdk/internal/types/collection"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	typetype "github.com/anyproto/any-sync-sdk/internal/types/type"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
 // listTypesFilter selects rows from the per-space `objects` collection
-// whose `any.types` array carries the meta-type marker and that aren't
-// tombstoned. Compiled once — ParseCondition allocates and walks the
-// query tree on every call, which we don't want on a hot read path.
-// JSON literal (not map[string]any) because ParseCondition's map path
-// goes through json.Marshal under the hood, which we'd rather skip.
-var listTypesFilter = query.MustParseCondition(
-	`{"any.types":{"$in":["__type__"]},"_deletedAt":{"$exists":false}}`,
-)
+// whose `any.type` is the meta-type marker and that aren't tombstoned.
+// One definition, shared with the store's catalog scan.
+var listTypesFilter = spaceobjects.LiveTypeRowsFilter
 
 // typesAPI implements space.TypesAPI. MVP scope: Create + AddProperty.
 // The other methods return "not implemented" so callers see a
@@ -40,16 +41,27 @@ type typesAPI struct {
 
 func newTypesAPI(parent *spaceImpl) *typesAPI { return &typesAPI{parent: parent} }
 
+// typeChangeType is the root changeType of a type object's tree. A
+// joiner's sync reads it off the fetched root to materialize types
+// first (Service.PullFirstTypes).
+const typeChangeType = "type"
+
 // Create mints a new type object: a fresh any-sync tree whose
 // `properties` dataset record carries the type's display metadata
-// (any.name / any.description / any.icon / any.xkey) and `any.types =
-// ["__type__"]` to mark it as a meta-type instance.
+// (any.name / any.description / any.icon), its programmatic handle
+// (type.xkey) and `any.type = "__type__"` to mark it as a meta-type
+// instance.
+//
+// The universal fields stay under `any`; `xkey` is meaningful only on
+// a type object, so it lives in the meta-type's own namespace — which
+// also makes it unwritable on a row that doesn't carry the marker
+// (properties.SystemPropertiesHandler membership check).
 //
 // The returned typeId is the new tree's id (= root change id) — used
 // as the namespace prefix in property paths on instance objects.
 func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (string, error) {
 	obj, err := t.parent.store.Create(ctx, spaceobjects.CreateOpts{
-		ChangeType: "type",
+		ChangeType: typeChangeType,
 	})
 	if err != nil {
 		return "", err
@@ -68,14 +80,32 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 		multi.Set("any.icon", arena.NewString(params.IconCID))
 	}
 	if params.XKey != "" {
-		multi.Set("any.xkey", arena.NewString(params.XKey))
+		multi.Set(typetype.TypeId+"."+typetype.FieldXKeyProp, arena.NewString(params.XKey))
 	}
-	// Mark the object as a meta-type instance — the convention we use
-	// in MVP to distinguish types from regular objects without a
-	// dedicated catalog.
-	types := arena.NewArray()
-	types.SetArrayItem(0, arena.NewString("__type__"))
-	multi.Set("any.types", types)
+	if len(params.Layout) > 0 {
+		layout, err := encodeXFormat(arena, params.Layout)
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: TypeCreateParams.Layout: %w", err)
+		}
+		multi.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+	}
+	if params.Hidden {
+		multi.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewTrue())
+	}
+	for _, k := range slices.Sorted(maps.Keys(params.Meta)) {
+		v, err := typeMetaValue(arena, k, params.Meta[k])
+		if err != nil {
+			return "", fmt.Errorf("typesAPI: TypeCreateParams.Meta: %w", err)
+		}
+		if v == nil {
+			continue
+		}
+		multi.Set(typetype.TypeId+"."+typetype.FieldMetaProp+"."+k, v)
+	}
+	// The marker in the type slot is what makes the row a type object.
+	// Set in the same change as the xkey write, so the local pre-flight
+	// grants the `type` namespace.
+	multi.Set(anytype.TypeId+"."+anytype.FieldType, arena.NewString(typetype.MetaTypeMarker))
 
 	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
 	if err != nil {
@@ -90,6 +120,11 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: multi}},
 		}},
 	}); err != nil {
+		// A tree without its marker row is an object with no type;
+		// reclaim it locally (root-only, outside head-sync).
+		if derr := t.parent.store.DeleteTree(ctx, typeId); derr != nil {
+			objectLog.Warn("orphaned tree after a refused type stamp", zap.String("typeId", typeId), zap.Error(derr))
+		}
 		return "", fmt.Errorf("typesAPI: seed type metadata: %w", err)
 	}
 	return typeId, nil
@@ -105,20 +140,58 @@ func (t *typesAPI) Create(ctx context.Context, params space.TypeCreateParams) (s
 // an error. Use a custom dataset/handler for that type's mutable
 // state.
 func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.PropertyDraft) (string, error) {
-	if _, ok := t.findRegisteredType(typeId); ok {
-		return "", fmt.Errorf("typesAPI: %q is a registered type — properties are statically declared", typeId)
+	if t.staticType(typeId) {
+		return "", fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
 	}
+	if err := validatePropertyDraft(&draft); err != nil {
+		return "", err
+	}
+	payload, err := propertyDefPayload(&anyenc.Arena{}, &draft)
+	if err != nil {
+		return "", err
+	}
+	res, err := t.writePropertyDefs(ctx, typeId, crdt.RecordChange{
+		Upsert: true, // empty Id → propId derived from ChangeId
+		Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
+	})
+	if err != nil {
+		return "", err
+	}
+	if len(res.RecordIds) == 0 {
+		return "", errors.New("typesAPI: write returned no record id")
+	}
+	return res.RecordIds[0], nil
+}
+
+// validatePropertyDraft is the caller-side gate every property
+// definition passes — AddProperty's and a bundle's alike.
+func validatePropertyDraft(draft *space.PropertyDraft) error {
 	if draft.Kind == 0 {
-		return "", errors.New("typesAPI: PropertyDraft.Kind required")
+		return errors.New("typesAPI: PropertyDraft.Kind required")
+	}
+	if propertyKindLabel(draft.Kind) == "" {
+		return fmt.Errorf("typesAPI: PropertyDraft.Kind %d is not a property kind", draft.Kind)
 	}
 	switch draft.Scope {
 	case 0, space.ScopeSynced, space.ScopeAccount, space.ScopeLocal:
 	default:
-		return "", fmt.Errorf("typesAPI: PropertyDraft.Scope must be synced/account/local (derived is reserved for built-ins); got %s", draft.Scope)
+		return fmt.Errorf("typesAPI: PropertyDraft.Scope must be synced/account/local (derived is reserved for built-ins); got %s", draft.Scope)
 	}
-	arena := &anyenc.Arena{}
+	return nil
+}
+
+// propertyDefPayload builds the definition record a draft describes —
+// the single creation shape the property handler validates.
+func propertyDefPayload(arena *anyenc.Arena, draft *space.PropertyDraft) (*anyenc.Value, error) {
 	payload := arena.NewObject()
 	payload.Set(typetype.FieldKind, arena.NewString(propertyKindLabel(draft.Kind)))
+	if len(draft.XFormat) > 0 {
+		xf, err := encodeXFormat(arena, draft.XFormat)
+		if err != nil {
+			return nil, fmt.Errorf("typesAPI: PropertyDraft.XFormat: %w", err)
+		}
+		payload.Set(typetype.FieldXFormat, xf)
+	}
 	if draft.Scope != 0 && draft.Scope != space.ScopeSynced {
 		// Synced is the implicit default — only non-default scopes are
 		// written, so pre-scope and default definitions stay byte-
@@ -141,30 +214,46 @@ func (t *typesAPI) AddProperty(ctx context.Context, typeId string, draft space.P
 		}
 		payload.Set(typetype.FieldMeta, metaObj)
 	}
+	return payload, nil
+}
 
+// writePropertyDefs is the shared LocalWrite helper for the property
+// definitions dataset.
+func (t *typesAPI) writePropertyDefs(ctx context.Context, typeId string, recs ...crdt.RecordChange) (object.WriteResult, error) {
 	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
 	if err != nil {
-		return "", err
+		return object.WriteResult{}, err
 	}
 	obj, err := t.parent.store.Get(ctx, typeId)
 	if err != nil {
-		return "", err
+		return object.WriteResult{}, err
 	}
-	res, err := obj.LocalWrite(ctx, crdt.Change{
+	return t.parent.localWriteRetry(ctx, obj, typeId, crdt.Change{
 		Dataset:     typetype.DatasetPropertyDefs,
 		DataVersion: dataVersion,
-		Records: []crdt.RecordChange{{
-			Upsert: true, // empty Id → propId derived from ChangeId
-			Ops:    []crdt.Op{{Type: crdt.OpSet, Payload: payload}},
-		}},
+		Records:     recs,
 	})
+}
+
+// propertyDefExists reports whether the type object carries a property
+// definition record under propId — live or tombstoned. A removed
+// definition keeps its id, which is how a bundle's adopt path tells
+// "never declared" from "removed".
+func (t *typesAPI) propertyDefExists(ctx context.Context, typeId, propId string) (bool, error) {
+	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
-		return "", err
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("typesAPI: open defs %s: %w", typeId, err)
 	}
-	if len(res.RecordIds) == 0 {
-		return "", errors.New("typesAPI: write returned no record id")
+	if _, err := coll.FindId(ctx, propId); err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return false, nil
+		}
+		return false, fmt.Errorf("typesAPI: find def %s: %w", propId, err)
 	}
-	return res.RecordIds[0], nil
+	return true, nil
 }
 
 // builtInAnyTypeInfo describes the synthetic `any` type — present in
@@ -192,6 +281,31 @@ func builtInSpaceIndexTypeInfo() space.TypeInfo {
 	}
 }
 
+// builtInMetaTypeInfo describes the synthetic `type` meta-type —
+// the shape of type objects themselves. Every type object implements
+// it (that's what the marker in `any.type` says), so it belongs in
+// the catalog next to `any` and `spaceIndex`.
+func builtInMetaTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          typetype.TypeId,
+		Name:        typetype.Name,
+		Description: typetype.Description,
+		BuiltIn:     true,
+	}
+}
+
+// builtInMetaCollectionTypeInfo describes the synthetic `collection`
+// meta-type — the shape of collection objects. Listed with the other
+// built-ins so every namespace a row can hold has a type entry.
+func builtInMetaCollectionTypeInfo() space.TypeInfo {
+	return space.TypeInfo{
+		Id:          collectiontype.TypeId,
+		Name:        collectiontype.Name,
+		Description: collectiontype.Description,
+		BuiltIn:     true,
+	}
+}
+
 // registeredTypeInfo maps a caller-registered handler.Type into the
 // public TypeInfo shape. Registered types are statically declared at
 // SDK init (via config.Config.Types), so they're surfaced with
@@ -209,8 +323,76 @@ func registeredTypeInfo(t handler.Type) space.TypeInfo {
 		Name:        name,
 		Description: t.Description,
 		IconCID:     t.IconCID,
+		Hidden:      t.Hidden,
 		BuiltIn:     true,
 	}
+}
+
+// registeredTypeParts is the compiled view of a registered type's
+// static parts — the declared ones, or one implicit part per dataset.
+func (t *typesAPI) registeredTypeParts(rt handler.Type) (*types.CompiledType, error) {
+	ct, err := spaceobjects.StaticTypeParts(rt, t.parent.store.Modules())
+	if err != nil {
+		return nil, fmt.Errorf("typesAPI: static parts of %q: %w", rt.Id, err)
+	}
+	return ct, nil
+}
+
+// staticType reports whether id names a definition whose declarations
+// are hardcoded — a caller-registered type or collection, or one of the
+// synthetic built-ins (`any`, `spaceIndex`, `type`, `collection`).
+// Every runtime mutator rejects them with ErrTypeRegistered; without
+// the built-in half a mutator called with an enumerable id like `type`
+// (Types().List surfaces it) falls through to a tree build on that
+// literal id and surfaces an opaque CID error instead.
+func (t *typesAPI) staticType(id string) bool {
+	if _, reserved := spaceobjects.ReservedTypeIds[id]; reserved {
+		return true
+	}
+	if _, ok := t.findRegisteredType(id); ok {
+		return true
+	}
+	_, ok := t.findRegisteredCollection(id)
+	return ok
+}
+
+// findRegisteredCollection returns the registered collection for id,
+// or (zero, false) if none.
+func (t *typesAPI) findRegisteredCollection(id string) (handler.Collection, bool) {
+	for _, c := range t.parent.store.ExternalCollections() {
+		if c.Id == id {
+			return c, true
+		}
+	}
+	return handler.Collection{}, false
+}
+
+// requireType refuses the type-only surface on a collection object:
+// a row carrying the collection marker answers ErrNotAType. Any other
+// row — a type, or nothing resolvable here — passes, so the existing
+// failure modes (ErrNotFound, a tree that does not build) stay.
+func (t *typesAPI) requireType(ctx context.Context, id string) error {
+	if _, ok := t.findRegisteredCollection(id); ok {
+		return fmt.Errorf("%w: %q", space.ErrNotAType, id)
+	}
+	if t.staticType(id) {
+		return nil
+	}
+	coll, err := t.parent.store.SharedObjects(ctx)
+	if err != nil {
+		return fmt.Errorf("typesAPI: shared objects: %w", err)
+	}
+	doc, err := coll.FindId(ctx, id)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return nil
+		}
+		return fmt.Errorf("typesAPI: find %s: %w", id, err)
+	}
+	if markerOf(doc.Value()) == collectiontype.MetaMarker {
+		return fmt.Errorf("%w: %q", space.ErrNotAType, id)
+	}
+	return nil
 }
 
 // findRegisteredType returns the catalog entry for typeId, or
@@ -225,7 +407,7 @@ func (t *typesAPI) findRegisteredType(typeId string) (handler.Type, bool) {
 }
 
 // List returns every object whose persisted `properties` row is a
-// meta-type instance (`any.types` contains "__type__"). One any-store
+// meta-type instance (`any.type == "__type__"`). One any-store
 // query against the per-space `objects` collection — no tree builds,
 // no any-sync calls. Eventual-consistency: rows that the controller
 // has applied are visible; whatever any-sync hasn't replayed yet
@@ -242,9 +424,11 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	defer iter.Close()
 
 	registered := t.parent.store.ExternalTypes()
-	out := make([]space.TypeInfo, 0, 2+len(registered))
+	out := make([]space.TypeInfo, 0, 4+len(registered))
 	out = append(out, builtInAnyTypeInfo())
 	out = append(out, builtInSpaceIndexTypeInfo())
+	out = append(out, builtInMetaTypeInfo())
+	out = append(out, builtInMetaCollectionTypeInfo())
 	for _, rt := range registered {
 		out = append(out, registeredTypeInfo(rt))
 	}
@@ -265,20 +449,27 @@ func (t *typesAPI) List(ctx context.Context) ([]space.TypeInfo, error) {
 	return out, nil
 }
 
-// Get returns one type's display metadata or space.ErrNotFound when
-// the id isn't a meta-type instance on this space. Special-cases the
+// Get returns one type's display metadata, space.ErrObjectDeleted for
+// a deleted id, or space.ErrNotFound when the id isn't a meta-type
+// instance on this space. Special-cases the
 // synthetic `any` built-in and any caller-registered type from
 // config.Config.Types — both are statically declared at SDK init and
 // don't live in the space's tree storage.
 //
-// Reads from the per-space `objects` collection in any-store. No
-// any-sync calls.
+// Reads from the per-space `objects` collection in any-store; an id
+// with no live row also reads its tree's deleted flag.
 func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyTypeInfo(), nil
 	}
 	if typeId == spaceindex.TypeId {
 		return builtInSpaceIndexTypeInfo(), nil
+	}
+	if typeId == typetype.TypeId {
+		return builtInMetaTypeInfo(), nil
+	}
+	if typeId == collectiontype.TypeId {
+		return builtInMetaCollectionTypeInfo(), nil
 	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeInfo(rt), nil
@@ -290,59 +481,210 @@ func (t *typesAPI) Get(ctx context.Context, typeId string) (space.TypeInfo, erro
 	doc, err := coll.FindId(ctx, typeId)
 	if err != nil {
 		if errors.Is(err, anystore.ErrDocNotFound) {
-			return space.TypeInfo{}, space.ErrNotFound
+			return space.TypeInfo{}, definitionMiss(ctx, t.parent, typeId)
 		}
 		return space.TypeInfo{}, fmt.Errorf("typesAPI: find %s: %w", typeId, err)
 	}
 	v := doc.Value()
-	if v == nil || v.Get(crdt.DeletedAtField) != nil || !hasTypeMarker(v) {
-		return space.TypeInfo{}, space.ErrNotFound
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return space.TypeInfo{}, definitionMiss(ctx, t.parent, typeId)
 	}
-	return typeInfoFromRow(v), nil
+	switch markerOf(v) {
+	case typetype.MetaTypeMarker:
+		return typeInfoFromRow(v), nil
+	case collectiontype.MetaMarker:
+		return space.TypeInfo{}, fmt.Errorf("%w: %q", space.ErrNotAType, typeId)
+	}
+	return space.TypeInfo{}, space.ErrNotFound
 }
 
 // typeInfoFromRow decodes a row from the per-space `objects`
 // collection into the public TypeInfo shape. Caller is responsible
-// for having checked hasTypeMarker.
+// for having checked the marker.
 func typeInfoFromRow(rec *anyenc.Value) space.TypeInfo {
 	return space.TypeInfo{
 		Id:          rec.GetString(crdt.IdField),
 		Name:        rec.GetString("any", "name"),
 		Description: rec.GetString("any", "description"),
 		IconCID:     rec.GetString("any", "icon"),
-		XKey:        rec.GetString("any", "xkey"),
+		XKey:        rec.GetString(typetype.TypeId, typetype.FieldXKeyProp),
+		Layout:      types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldLayoutProp)),
+		Hidden:      rec.GetBool(typetype.TypeId, typetype.FieldHiddenProp),
+		Meta:        types.DecodeXFormat(rec.Get(typetype.TypeId, typetype.FieldMetaProp)),
 		BuiltIn:     false,
 	}
 }
 
-// hasTypeMarker reports whether `record.any.types` contains the
-// reserved meta-type label "__type__". Used to distinguish type
-// objects from regular objects without a separate catalog.
-func hasTypeMarker(rec *anyenc.Value) bool {
-	arr := rec.GetArray("any", "types")
-	for _, v := range arr {
-		if string(v.GetStringBytes()) == "__type__" {
-			return true
+// typeMetaValue validates one meta entry — a single-level key and a
+// scalar value — and encodes it. A nil value encodes to nil: the
+// caller's unset.
+func typeMetaValue(a *anyenc.Arena, key string, v any) (*anyenc.Value, error) {
+	if key == "" || strings.ContainsAny(key, ".$") || len(key) > 64 {
+		return nil, fmt.Errorf("%w: meta key %q must be a single-level key (no '.', no '$', at most 64 bytes)", space.ErrInvalidFieldValue, key)
+	}
+	switch t := v.(type) {
+	case nil:
+		return nil, nil
+	case string:
+		return a.NewString(t), nil
+	case bool:
+		return a.NewBool(t), nil
+	case int:
+		return a.NewNumberFloat64(float64(t)), nil
+	case int32:
+		return a.NewNumberFloat64(float64(t)), nil
+	case int64:
+		return a.NewNumberFloat64(float64(t)), nil
+	case float32:
+		return a.NewNumberFloat64(float64(t)), nil
+	case float64:
+		return a.NewNumberFloat64(t), nil
+	}
+	return nil, fmt.Errorf("%w: meta key %q: value must be a string, bool or number (got %T)", space.ErrInvalidFieldValue, key, v)
+}
+
+// Patch rewrites a user type's display and rendering metadata in one
+// change on its objects row: the universal fields under `any`, layout
+// and the flags under the meta-type's namespace. Absent fields keep
+// their value; an empty string clears a text field; ClearLayout unsets
+// the layout.
+func (t *typesAPI) Patch(ctx context.Context, typeId string, patch space.TypePatch) error {
+	if err := t.requireType(ctx, typeId); err != nil {
+		return err
+	}
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if _, err := t.Get(ctx, typeId); err != nil {
+		return err // ErrNotAType on a collection row
+	}
+	arena := &anyenc.Arena{}
+	set := arena.NewObject()
+	unset := arena.NewObject()
+	text := func(path string, v *string) {
+		if v == nil {
+			return
+		}
+		if *v == "" {
+			unset.Set(path, arena.NewNull())
+			return
+		}
+		set.Set(path, arena.NewString(*v))
+	}
+	text("any.name", patch.Name)
+	text("any.description", patch.Description)
+	text("any.icon", patch.IconCID)
+	if patch.Hidden != nil {
+		set.Set(typetype.TypeId+"."+typetype.FieldHiddenProp, arena.NewBool(*patch.Hidden))
+	}
+	for _, k := range slices.Sorted(maps.Keys(patch.Meta)) {
+		v, err := typeMetaValue(arena, k, patch.Meta[k])
+		if err != nil {
+			return fmt.Errorf("typesAPI: TypePatch.Meta: %w", err)
+		}
+		path := typetype.TypeId + "." + typetype.FieldMetaProp + "." + k
+		if v == nil {
+			unset.Set(path, arena.NewNull())
+		} else {
+			set.Set(path, v)
 		}
 	}
-	return false
+	switch {
+	case patch.ClearLayout:
+		unset.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, arena.NewNull())
+	case patch.Layout != nil:
+		layout, err := encodeXFormat(arena, patch.Layout)
+		if err != nil {
+			return fmt.Errorf("typesAPI: TypePatch.Layout: %w", err)
+		}
+		set.Set(typetype.TypeId+"."+typetype.FieldLayoutProp, layout)
+	}
+	var ops []crdt.Op
+	if set.GetObject() != nil && set.GetObject().Len() > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: set})
+	}
+	if unset.GetObject() != nil && unset.GetObject().Len() > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unset})
+	}
+	if len(ops) == 0 {
+		return nil
+	}
+	dataVersion, err := t.parent.store.DataVersion(properties.Dataset)
+	if err != nil {
+		return err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if _, err := t.parent.localWriteRetry(ctx, obj, typeId, crdt.Change{
+		Dataset:     properties.Dataset,
+		DataVersion: dataVersion,
+		Records:     []crdt.RecordChange{{Id: typeId, Ops: ops}},
+	}); err != nil {
+		return fmt.Errorf("typesAPI: patch type: %w", err)
+	}
+	return nil
 }
 
-func (t *typesAPI) Delete(_ context.Context, _ string) error {
-	return errors.New("typesAPI: Delete not implemented")
+// markerOf returns the definition marker in `record.any.type` —
+// "__type__" for a type object, "__collection__" for a collection
+// object — or "" for a regular row (or a nil one).
+func markerOf(rec *anyenc.Value) string {
+	if rec == nil {
+		return ""
+	}
+	switch v := rec.GetString(anytype.TypeId, anytype.FieldType); v {
+	case typetype.MetaTypeMarker, collectiontype.MetaMarker:
+		return v
+	}
+	return ""
 }
 
-// Properties returns the property definitions of a type. For the
-// built-in `any` type, the list is hardcoded (one entry per
-// anytype.Properties). Caller-registered types own datasets, not
-// property definitions, so an empty slice is returned (those types
-// expose state via custom datasets reached through Space.Modify /
-// Query, not through the property API). For user-created types, the
-// list is read off the type object's `defs` dataset.
+// Delete removes a user type through the object deletion path
+// (Objects().Delete). Objects naming it in any.type keep the id. Any
+// other id answers as Get does.
+func (t *typesAPI) Delete(ctx context.Context, typeId string) error {
+	_, reserved := spaceobjects.ReservedTypeIds[typeId]
+	if _, registered := t.findRegisteredType(typeId); reserved || registered {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if _, err := t.Get(ctx, typeId); err != nil {
+		return err
+	}
+	return t.parent.objects.Delete(ctx, typeId)
+}
+
+// definitionMiss classifies a type or collection id that has no live
+// objects row: the row of a deleted object is purged, so the tree's
+// deleted flag tells it apart from an unknown id.
+func definitionMiss(ctx context.Context, parent *spaceImpl, id string) error {
+	deleted, err := parent.store.TreeDeleted(ctx, id)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: %s: deleted status: %w", id, err)
+	}
+	if deleted {
+		return fmt.Errorf("spaceimpl: %q: %w", id, space.ErrObjectDeleted)
+	}
+	return space.ErrNotFound
+}
+
+// builtInMetaCollectionProperties translates collectiontype.Properties
+// into the public PropertyDef shape.
+func builtInMetaCollectionProperties() []space.PropertyDef {
+	return builtInTypeProperties(collectiontype.Properties)
+}
+
+// Properties returns the property definitions of a type or a
+// collection. For the built-ins (`any`, `spaceIndex`, `type`,
+// `collection`) the list is hardcoded (one entry per package-level
+// Properties table); registered types and collections answer their
+// static declarations. For user-created definitions the list is read
+// off the owner object's `properties` dataset.
 //
 // Pure any-store read — no any-sync tree build. Empty slice if the
-// type has no `defs` writes yet (collection not initialised) or if
-// the typeId isn't a known type.
+// owner has no definition writes yet (collection not initialised) or
+// if the id isn't a known definition.
 func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.PropertyDef, error) {
 	if typeId == anytype.TypeId {
 		return builtInAnyProperties(), nil
@@ -350,8 +692,17 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 	if typeId == spaceindex.TypeId {
 		return builtInSpaceIndexProperties(), nil
 	}
+	if typeId == typetype.TypeId {
+		return builtInMetaTypeProperties(), nil
+	}
+	if typeId == collectiontype.TypeId {
+		return builtInMetaCollectionProperties(), nil
+	}
 	if rt, ok := t.findRegisteredType(typeId); ok {
 		return registeredTypeProperties(rt), nil
+	}
+	if rc, ok := t.findRegisteredCollection(typeId); ok {
+		return registeredPropertyDecls(rc.Properties), nil
 	}
 	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
 	if err != nil {
@@ -385,15 +736,19 @@ func (t *typesAPI) Properties(ctx context.Context, typeId string) ([]space.Prope
 
 // builtInAnyProperties translates anytype.Properties into the public
 // PropertyDef shape. Built-ins use human-readable ids — they pass
-// through to the SDK's permissive validator unchanged.
+// through to the SDK's permissive validator unchanged. The descriptor
+// is deep-copied: the table is process-shared, a view is the caller's
+// to mutate.
 func builtInAnyProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(anytype.Properties))
 	for _, p := range anytype.Properties {
 		out = append(out, space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  schemaKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
 		})
 	}
 	return out
@@ -406,10 +761,37 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 	out := make([]space.PropertyDef, 0, len(spaceindex.Properties))
 	for _, p := range spaceindex.Properties {
 		out = append(out, space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  schemaKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
+		})
+	}
+	return out
+}
+
+// builtInMetaTypeProperties translates typetype.Properties into the
+// public PropertyDef shape — the values a type object carries in its
+// own namespace (`xkey`), as opposed to the universal ones it carries
+// under `any`.
+func builtInMetaTypeProperties() []space.PropertyDef {
+	return builtInTypeProperties(typetype.Properties)
+}
+
+// builtInTypeProperties translates a meta-type's hardcoded table into
+// the public PropertyDef shape.
+func builtInTypeProperties(table []typetype.BuiltInProperty) []space.PropertyDef {
+	out := make([]space.PropertyDef, 0, len(table))
+	for _, p := range table {
+		out = append(out, space.PropertyDef{
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        schemaKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
+			XFormat:     types.CloneXFormat(p.XFormat),
 		})
 	}
 	return out
@@ -421,20 +803,30 @@ func builtInSpaceIndexProperties() []space.PropertyDef {
 // validates writes against. Returns nil for a type that declares no
 // properties (owns only separate datasets).
 func registeredTypeProperties(t handler.Type) []space.PropertyDef {
-	if len(t.Properties) == 0 {
+	return registeredPropertyDecls(t.Properties)
+}
+
+// registeredPropertyDecls maps static PropertyDecls (a registered type's
+// or collection's) into the public PropertyDef shape.
+func registeredPropertyDecls(decls []handler.PropertyDecl) []space.PropertyDef {
+	if len(decls) == 0 {
 		return nil
 	}
-	out := make([]space.PropertyDef, 0, len(t.Properties))
-	for _, p := range t.Properties {
+	out := make([]space.PropertyDef, 0, len(decls))
+	for _, p := range decls {
 		def := space.PropertyDef{
-			Id:    p.Id,
-			Name:  p.Name,
-			Kind:  handlerKindToPropertyKind(p.Kind),
-			Scope: p.Scope,
+			Id:          p.Id,
+			Name:        p.Name,
+			Description: p.Description,
+			Kind:        handlerKindToPropertyKind(p.Kind),
+			Scope:       p.Scope,
 		}
 		if def.Scope == 0 {
 			def.Scope = space.ScopeSynced
 		}
+		// Deep-copied: the registration is process-shared, a view is
+		// the caller's to mutate.
+		def.XFormat = types.CloneXFormat(p.XFormat)
 		out = append(out, def)
 	}
 	return out
@@ -457,6 +849,8 @@ func handlerKindToPropertyKind(k handler.PropertyKind) space.PropertyKind {
 		return space.PropertyKindArray
 	case handler.PropertyKindObject:
 		return space.PropertyKindObject
+	case handler.PropertyKindDatetime:
+		return space.PropertyKindDatetime
 	}
 	return 0
 }
@@ -483,18 +877,29 @@ func decodePropertyDef(v *anyenc.Value) space.PropertyDef {
 	if sc, ok := schema.ParseScope(v.GetString(typetype.FieldScope)); ok {
 		def.Scope = sc
 	}
-	if metaObj := v.GetObject(typetype.FieldMeta); metaObj != nil {
-		meta := map[string]string{}
-		metaObj.Visit(func(key []byte, val *anyenc.Value) {
-			if val.Type() == anyenc.TypeString {
-				meta[string(key)] = string(val.GetStringBytes())
-			}
-		})
-		if len(meta) > 0 {
-			def.Meta = meta
-		}
+	def.XFormat = types.DecodeXFormat(v.Get(typetype.FieldXFormat))
+	if meta := decodeStringMap(v.GetObject(typetype.FieldMeta)); meta != nil {
+		def.Meta = meta
 	}
 	return def
+}
+
+// decodeStringMap reads an anyenc object into a string→string map,
+// skipping non-string leaves. Returns nil for an absent or empty object.
+func decodeStringMap(obj *anyenc.Object) map[string]string {
+	if obj == nil {
+		return nil
+	}
+	out := map[string]string{}
+	obj.Visit(func(key []byte, val *anyenc.Value) {
+		if val.Type() == anyenc.TypeString {
+			out[string(key)] = string(val.GetStringBytes())
+		}
+	})
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // schemaKindToPropertyKind maps the internal schema.Kind enum to the
@@ -513,16 +918,176 @@ func schemaKindToPropertyKind(k schema.Kind) space.PropertyKind {
 		return space.PropertyKindArray
 	case schema.KindObject:
 		return space.PropertyKindObject
+	case schema.KindDatetime:
+		return space.PropertyKindDatetime
 	}
 	return 0
 }
 
-func (t *typesAPI) RemoveProperty(_ context.Context, _, _ string) error {
-	return errors.New("typesAPI: RemoveProperty not implemented")
+// RemoveProperty drops a property definition by tombstoning its record
+// in the type object's defs dataset (the handler's BeforeDelete sweeps
+// the sibling shortId row). Existing instance value records are NOT
+// cleaned up — subsequent writes touching that propId are dropped
+// op-by-op via the unknown-property rule. Returns space.ErrNotFound for
+// an unknown or already-removed propId (a pre-flight, so a stray delete
+// can't mint a tombstone for a record that never existed).
+func (t *typesAPI) RemoveProperty(ctx context.Context, typeId, propId string) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if _, err := t.findPropertyDef(ctx, typeId, propId); err != nil {
+		return err
+	}
+	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
+	if err != nil {
+		return err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if _, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     typetype.DatasetPropertyDefs,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Id:  propId,
+			Ops: []crdt.Op{{Type: crdt.OpDelete}},
+		}},
+	}); err != nil {
+		return fmt.Errorf("typesAPI: remove property: %w", err)
+	}
+	return nil
 }
 
-func (t *typesAPI) UpdatePropertyMeta(_ context.Context, _, _ string, _ space.PropertyMetaUpdate) error {
-	return errors.New("typesAPI: UpdatePropertyMeta not implemented")
+// PatchProperty applies a generic per-path patch to a property
+// definition via a single multi-field $set/$unset change on the type
+// object's defs dataset. Set assigns dotted-path values; Unset removes
+// dotted paths (subtree removals allowed, e.g. an entire option key
+// under x-format).
+//
+// Pinned paths (key, kind, scope, items, properties) are rejected
+// up-front — the WHOLE patch fails rather than the handler silently
+// dropping the offending op and applying the rest. Every other path,
+// x-format included, takes any JSON value: the descriptor's vocabulary
+// and its leaf-only patch rule are the consumer's.
+func (t *typesAPI) PatchProperty(ctx context.Context, typeId, propId string, patch space.PropertyPatch) error {
+	if t.staticType(typeId) {
+		return fmt.Errorf("%w: %q", space.ErrTypeRegistered, typeId)
+	}
+	if len(patch.Set) == 0 && len(patch.Unset) == 0 {
+		return nil
+	}
+
+	arena := &anyenc.Arena{}
+	setObj := arena.NewObject()
+	unsetObj := arena.NewObject()
+
+	checkPath := func(path string) error {
+		if path == "" {
+			return errors.New("typesAPI: patch path is empty")
+		}
+		segs := strings.Split(path, ".")
+		for _, s := range segs {
+			if s == "" {
+				return fmt.Errorf("typesAPI: patch path %q has an empty segment", path)
+			}
+		}
+		if typetype.IsPinnedPath(segs) {
+			return fmt.Errorf("%w: path %q is pinned after first write", space.ErrPinnedField, path)
+		}
+		return nil
+	}
+
+	for path, val := range patch.Set {
+		if err := checkPath(path); err != nil {
+			return err
+		}
+		v, err := goToAnyenc(arena, val)
+		if err != nil {
+			return fmt.Errorf("typesAPI: patch property: convert %q: %w", path, err)
+		}
+		setObj.Set(path, v)
+	}
+	for _, path := range patch.Unset {
+		if err := checkPath(path); err != nil {
+			return err
+		}
+		unsetObj.Set(path, arena.NewNull())
+	}
+
+	// Existence pre-flight: with Upsert=false a modify against an
+	// unknown propId would silently no-op.
+	if _, err := t.findPropertyDef(ctx, typeId, propId); err != nil {
+		return err
+	}
+
+	var ops []crdt.Op
+	if len(patch.Set) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpSet, Payload: setObj})
+	}
+	if len(patch.Unset) > 0 {
+		ops = append(ops, crdt.Op{Type: crdt.OpUnset, Payload: unsetObj})
+	}
+	dataVersion, err := t.parent.store.DataVersion(typetype.DatasetPropertyDefs)
+	if err != nil {
+		return err
+	}
+	obj, err := t.parent.store.Get(ctx, typeId)
+	if err != nil {
+		return err
+	}
+	if _, err := obj.LocalWrite(ctx, crdt.Change{
+		Dataset:     typetype.DatasetPropertyDefs,
+		DataVersion: dataVersion,
+		Records: []crdt.RecordChange{{
+			Id:  propId,
+			Ops: ops,
+		}},
+	}); err != nil {
+		return fmt.Errorf("typesAPI: patch property: %w", err)
+	}
+	return nil
+}
+
+// findPropertyDef reads one property definition off the type's defs
+// dataset. Returns space.ErrNotFound for unknown ids or tombstones.
+func (t *typesAPI) findPropertyDef(ctx context.Context, typeId, propId string) (space.PropertyDef, error) {
+	coll, err := t.parent.store.OpenObjectCollection(ctx, typeId, typetype.DatasetPropertyDefs)
+	if err != nil {
+		if errors.Is(err, anystore.ErrCollectionNotFound) {
+			return space.PropertyDef{}, space.ErrNotFound
+		}
+		return space.PropertyDef{}, fmt.Errorf("typesAPI: open defs %s: %w", typeId, err)
+	}
+	doc, err := coll.FindId(ctx, propId)
+	if err != nil {
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			return space.PropertyDef{}, space.ErrNotFound
+		}
+		return space.PropertyDef{}, fmt.Errorf("typesAPI: find def %s: %w", propId, err)
+	}
+	v := doc.Value()
+	if v == nil || v.Get(crdt.DeletedAtField) != nil {
+		return space.PropertyDef{}, space.ErrNotFound
+	}
+	return decodePropertyDef(v), nil
+}
+
+// encodeXFormat converts a descriptor bag for the record payload: one
+// whole object, the handler's single creation shape. The bag is
+// opaque — converted, never inspected — with one guard: a map whose
+// only key is an extended-JSON wrapper (`$date`, `$oid`, …) converts
+// to a scalar, which the handler would reject with a raw validation
+// error, so it is refused here with a clean one.
+func encodeXFormat(arena *anyenc.Arena, m map[string]any) (*anyenc.Value, error) {
+	xf, err := goToAnyenc(arena, m)
+	if err != nil {
+		return nil, err
+	}
+	if xf.Type() != anyenc.TypeObject {
+		return nil, errors.New("XFormat must be a JSON object (not an extended-JSON wrapper)")
+	}
+	return xf, nil
 }
 
 // propertyKindLabel maps the public PropertyKind enum to the on-wire
@@ -541,6 +1106,8 @@ func propertyKindLabel(k space.PropertyKind) string {
 		return "array"
 	case space.PropertyKindObject:
 		return "object"
+	case space.PropertyKindDatetime:
+		return "datetime"
 	default:
 		return ""
 	}

@@ -3,6 +3,8 @@ package subscribe
 import (
 	"context"
 	"errors"
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -83,19 +85,50 @@ func subscribeSorted(t *testing.T, eng *Engine, scope Scope, filter query.Filter
 // from the given (id, postDoc, deleted, ops, sourceObjectId).
 func fireEvent(eng *Engine, objectId, dataset, id string, postDoc *anyenc.Value, deleted bool, ops []space.EventOp) {
 	ev := Event{
-		SpaceId:  "test",
-		ObjectId: objectId,
-		Dataset:  dataset,
+		SpaceId:   "test",
+		ObjectId:  objectId,
+		Dataset:   dataset,
 		VersionId: crdt.VersionId("v" + id),
-		Records: []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
+		Records:   []EventRecord{{Id: id, Deleted: deleted, Ops: ops}},
 	}
-	postValue := func(i int) *anyenc.Value {
+	postValue := func(i int) (*anyenc.Value, error) {
 		if i == 0 {
-			return postDoc
+			return postDoc, nil
 		}
-		return nil
+		return nil, nil
 	}
 	eng.OnApply(ev, postValue)
+}
+
+// fireUnreadable invokes engine.OnApply with a single-record event
+// whose post value cannot be read; the record carries one $set op.
+func fireUnreadable(eng *Engine, objectId, dataset, id string) {
+	ev := Event{
+		SpaceId:   "test",
+		ObjectId:  objectId,
+		Dataset:   dataset,
+		VersionId: crdt.VersionId("v" + id),
+		Records:   []EventRecord{{Id: id, Ops: []space.EventOp{{Type: crdt.OpSet, Path: []string{"n"}}}}},
+	}
+	eng.OnApply(ev, func(int) (*anyenc.Value, error) { return nil, errors.New("read failed") })
+}
+
+// fireRecords invokes engine.OnApply with one multi-record event; docs
+// holds each record's post doc by index (nil: absent).
+func fireRecords(eng *Engine, objectId, dataset string, records []EventRecord, docs []*anyenc.Value) {
+	ev := Event{
+		SpaceId:   "test",
+		ObjectId:  objectId,
+		Dataset:   dataset,
+		VersionId: "vmulti",
+		Records:   records,
+	}
+	eng.OnApply(ev, func(i int) (*anyenc.Value, error) {
+		if i < len(docs) {
+			return docs[i], nil
+		}
+		return nil, nil
+	})
 }
 
 func waitOne(t *testing.T, sub *Sub) (space.SubscriptionEvent, error) {
@@ -174,8 +207,8 @@ func TestApply_UpdateHeldRecordEmitsUpdated(t *testing.T) {
 
 // Update that flips a record out of the filter's match set emits a
 // Removed (the record is still in the database, just no longer in the
-// query's window). lost is incremented so accumulated filter-evictions
-// can trip the drift bound.
+// query's window). The window holds every match, so the departure is
+// no loss.
 func TestApply_UpdateOutOfFilterEmitsRemoved(t *testing.T) {
 	eng := New("test")
 	defer eng.Close()
@@ -200,9 +233,8 @@ func TestApply_UpdateOutOfFilterEmitsRemoved(t *testing.T) {
 	assert.Empty(t, ev.Updated)
 	assert.Equal(t, []space.RemovedRecord{{Id: "m1", Reason: space.RemoveFilteredOut}}, ev.Removed, "filter-rejected update must emit Removed with RemoveFilteredOut")
 
-	// Engine state: entry dropped, lost bumped (counts toward drift).
 	assert.Equal(t, 0, len(sub.entries), "entry must leave the held set when the filter rejects the post-apply doc")
-	assert.Equal(t, 1, sub.lost, "filter-rejected updates count toward the drift budget")
+	assert.Equal(t, 0, sub.lost, "a window that holds every match counts no loss")
 }
 
 // Same record updating BACK to a filter-matching state re-enters the
@@ -303,10 +335,101 @@ func TestSentinel_PromoteOnVisibleDelete(t *testing.T) {
 	ev, err := waitOne(t, sub)
 	require.NoError(t, err)
 	// Visibility transitions: a was visible → gone (Removed). c was
-	// sentinel (not visible) → promoted to visible (Added).
+	// sentinel (not visible) → promoted to visible (Added), shipping
+	// the doc the window held for it — postValue covers a only.
 	assert.ElementsMatch(t, []string{"c"}, idsOf(ev.Added))
+	require.NotNil(t, ev.Added[0].Doc)
+	assert.Equal(t, 3, ev.Added[0].Doc.GetInt("n"))
 	assert.Empty(t, ev.Updated)
 	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
+}
+
+// The apply path gates on HasSubscribers without the lock, so a sub
+// counts from before its snapshot: an apply that commits during the
+// read queues on the fence instead of skipping the engine. A failed
+// snapshot leaves no count behind.
+func TestSubscribe_CountsBeforeSnapshot(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	cfg := SubConfig{Scope: Scope{ObjectId: "obj1", Dataset: "chat"}}
+
+	var duringSnapshot bool
+	sub, err := eng.Subscribe(cfg, func(func(string, *anyenc.Value)) error {
+		duringSnapshot = eng.HasSubscribers()
+		return nil
+	})
+	require.NoError(t, err)
+	defer sub.Close()
+	assert.True(t, duringSnapshot)
+	assert.Equal(t, int64(1), eng.counter.Load())
+
+	_, err = eng.Subscribe(cfg, func(func(string, *anyenc.Value)) error { return errors.New("boom") })
+	require.Error(t, err)
+	assert.Equal(t, int64(1), eng.counter.Load())
+}
+
+// A closed sub releases its held set and leaves the engine's fan-out
+// scratch, so the handle a consumer still holds keeps the mailbox only.
+func TestCloseSub_ReleasesHeldSet(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	initial := []row{makeRow(arena, "a", 1, nil), makeRow(arena, "b", 2, nil)}
+	sub := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 2, initial)
+	fireEvent(eng, "obj1", "chat", "c", makeRow(arena, "c", 3, nil).d, false, nil)
+	require.Len(t, sub.entries, 3)
+
+	require.NoError(t, sub.Close())
+	assert.Nil(t, sub.entries)
+	assert.Nil(t, sub.maxRef)
+	for _, s := range eng.scratch[:cap(eng.scratch)] {
+		assert.Nil(t, s)
+	}
+}
+
+// An unbounded sub (Limit 0) has no sentinel, so nothing is ever
+// shipped from the held set: it tracks membership only — no doc and no
+// tuple per entry, sorted or not — while its events still carry the
+// post docs.
+func TestUnbounded_TracksMembershipOnly(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+	arena := newArena()
+	initial := []row{
+		makeRow(arena, "a", 1, nil),
+		makeRow(arena, "b", 2, nil),
+	}
+	sub := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 0, initial)
+	membershipOnly := func() {
+		t.Helper()
+		for id, e := range sub.entries {
+			assert.Nil(t, e.raw, id)
+			assert.Empty(t, e.tuple, id)
+		}
+	}
+	membershipOnly()
+
+	fireEvent(eng, "obj1", "chat", "b", makeRow(arena, "b", 5, nil).d, false, nil)
+	ev, err := waitOne(t, sub)
+	require.NoError(t, err)
+	require.Len(t, ev.Updated, 1)
+	require.NotNil(t, ev.Updated[0].Doc)
+	assert.Equal(t, 5, ev.Updated[0].Doc.GetInt("n"))
+
+	fireEvent(eng, "obj1", "chat", "c", makeRow(arena, "c", 3, nil).d, false, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	require.Len(t, ev.Added, 1)
+	require.NotNil(t, ev.Added[0].Doc)
+	assert.Equal(t, 3, ev.Added[0].Doc.GetInt("n"))
+
+	fireEvent(eng, "obj1", "chat", "a", nil, true, nil)
+	ev, err = waitOne(t, sub)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []space.RemovedRecord{{Id: "a", Reason: space.RemoveDeleted}}, ev.Removed)
+
+	assert.ElementsMatch(t, []string{"b", "c"}, slices.Collect(maps.Keys(sub.entries)))
+	membershipOnly()
 }
 
 // The three RemoveReason causes are reported distinctly: a tombstone is
@@ -507,6 +630,74 @@ func TestScope_SharedAndExplicitDoNotCrossFire(t *testing.T) {
 	waitNone(t, explicit) // explicit on obj1 — no event for obj2
 }
 
+// An AllObjects sub sees its dataset from every object; a per-object
+// sub of the same dataset sees its own object only.
+func TestScope_AllObjectsRoutesByDataset(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	all := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, nil)
+	own := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, nil)
+
+	arena := newArena()
+	r1 := makeRow(arena, "obj1/a", 1, nil)
+	fireEvent(eng, "obj1", "samples", "obj1/a", r1.d, false, nil)
+	ev, err := waitOne(t, all)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1/a"}, idsOf(ev.Added))
+	ev, err = waitOne(t, own)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1/a"}, idsOf(ev.Added))
+
+	r2 := makeRow(arena, "obj2/a", 2, nil)
+	fireEvent(eng, "obj2", "samples", "obj2/a", r2.d, false, nil)
+	ev, err = waitOne(t, all)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj2/a"}, idsOf(ev.Added))
+	waitNone(t, own)
+
+	// Another dataset of the same object reaches neither.
+	r3 := makeRow(arena, "b", 3, nil)
+	fireEvent(eng, "obj1", "notes", "b", r3.d, false, nil)
+	waitNone(t, all)
+	waitNone(t, own)
+
+	// A closed sub leaves its bucket.
+	require.NoError(t, all.Close())
+	assert.Empty(t, eng.scope.perDataset)
+}
+
+// NotifyRecordsDeleted removes the named rows from every window that
+// holds them.
+func TestNotifyRecordsDeleted(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	arena := newArena()
+	initial := []row{
+		makeRow(arena, "obj1/a", 1, nil),
+		makeRow(arena, "obj1/b", 2, nil),
+		makeRow(arena, "obj2/a", 3, nil),
+	}
+	all := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, initial)
+	own := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, initial[:2])
+	other := subscribeSorted(t, eng, Scope{ObjectId: "obj2", Dataset: "samples"}, nil, 0, initial[2:])
+
+	eng.NotifyRecordsDeleted("test", "samples", "obj1", []string{"obj1/a", "obj1/b"})
+
+	for _, sub := range []*Sub{all, own} {
+		ev, err := waitOne(t, sub)
+		require.NoError(t, err)
+		assert.ElementsMatch(t, []string{"obj1/a", "obj1/b"}, removedIdsOf(ev.Removed))
+		assert.Empty(t, ev.Added)
+		assert.Empty(t, ev.Updated)
+	}
+	waitNone(t, other)
+
+	eng.NotifyRecordsDeleted("test", "samples", "obj1", nil)
+	waitNone(t, all)
+}
+
 // Engine.Close cascades — every live sub gets its mailbox closed.
 func TestEngineClose_CascadesToSubs(t *testing.T) {
 	eng := New("test")
@@ -546,4 +737,46 @@ func itoa(i int) string {
 		out = append([]byte{'-'}, out...)
 	}
 	return string(out)
+}
+
+// CloseObject ends every per-object sub of the object — all datasets —
+// with the given reason, after the Removed a NotifyDeleted queued, and
+// leaves shared, per-dataset and other objects' subs alone.
+func TestCloseObject_ClosesPerObjectSubs(t *testing.T) {
+	eng := New("test")
+	defer eng.Close()
+
+	arena := newArena()
+	initial := []row{makeRow(arena, "obj1", 1, nil)}
+	shared := subscribeSorted(t, eng, Scope{Shared: true}, nil, 0, initial)
+	perDataset := subscribeSorted(t, eng, Scope{AllObjects: true, Dataset: "samples"}, nil, 0, nil)
+	chat := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "chat"}, nil, 0, nil)
+	samples := subscribeSorted(t, eng, Scope{ObjectId: "obj1", Dataset: "samples"}, nil, 0, nil)
+	other := subscribeSorted(t, eng, Scope{ObjectId: "obj2", Dataset: "chat"}, nil, 0, nil)
+
+	eng.NotifyDeleted("test", ObjectsDataset, "obj1")
+	eng.CloseObject("obj1", space.ErrObjectDeleted)
+
+	// The shared sub saw the row leave and stays open.
+	ev, err := waitOne(t, shared)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"obj1"}, removedIdsOf(ev.Removed))
+	assert.NoError(t, shared.Err())
+
+	for _, sub := range []*Sub{chat, samples} {
+		_, err := waitOne(t, sub)
+		assert.True(t, errors.Is(err, mb.ErrClosed), "per-object sub must be closed; got %v", err)
+		assert.True(t, errors.Is(sub.Err(), space.ErrObjectDeleted), "close reason; got %v", sub.Err())
+	}
+	for _, sub := range []*Sub{perDataset, other} {
+		waitNone(t, sub)
+		assert.NoError(t, sub.Err())
+	}
+
+	// The consumer's Close still releases a closed sub; a second
+	// CloseObject on an unknown object is a no-op.
+	require.NoError(t, chat.Close())
+	eng.CloseObject("obj1", space.ErrObjectDeleted)
+	eng.CloseObject("nope", space.ErrObjectDeleted)
+	assert.True(t, eng.HasSubscribers())
 }

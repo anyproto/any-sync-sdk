@@ -13,6 +13,7 @@ import (
 	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/util/crypto"
 
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -45,6 +46,12 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 // transparently. The first call after Create may race with the
 // periodic headsync that pushes the space header to the coordinator;
 // we retry with a short backoff so callers don't have to.
+//
+// The invite private key is persisted as this account's issued-key
+// custody (synced tech-space row), so every device of the minting
+// account can re-encode the same token — Members.Invites returns it
+// on the matching row. Persist failure fails the call: the ACL invite
+// stands, but an unrecoverable token defeats the contract; re-mint.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := ensureShareable(ctx, a.s); err != nil {
 		return space.Invite{}, err
@@ -62,6 +69,9 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := addRecordWaitingForLog(ctx, cl, res.InviteRec); err != nil {
 		return space.Invite{}, fmt.Errorf("acl: publish invite: %w", err)
 	}
+	if err := a.s.persistIssuedKey(ctx, techspace.IssuedKeyMember, res.InviteKey); err != nil {
+		return space.Invite{}, err
+	}
 	return space.Invite{SpaceId: a.s.id, InviteKey: res.InviteKey}, nil
 }
 
@@ -74,13 +84,22 @@ func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 // found". This is a transient startup race on a freshly-created space,
 // so we retry with a short backoff instead of surfacing it to callers.
 func addRecordWaitingForLog(ctx context.Context, cl aclclient.AclSpaceClient, rec *consensusproto.RawRecord) error {
+	return callWaitingForLog(ctx, func() error { return cl.AddRecord(ctx, rec) })
+}
+
+// callWaitingForLog runs an ACL publish call with the log-not-ready
+// retry described on addRecordWaitingForLog. call is re-invoked whole on
+// each attempt — for client methods without a build/publish split (e.g.
+// AddAccounts) the record is rebuilt per attempt, which is fine: prior
+// attempts were rejected, so no duplicate can land.
+func callWaitingForLog(ctx context.Context, call func() error) error {
 	const (
 		maxAttempts = 35
 		backoff     = time.Second
 	)
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
-		if err := cl.AddRecord(ctx, rec); err != nil {
+		if err := call(); err != nil {
 			lastErr = err
 			if !isLogNotReady(err) {
 				return err
@@ -161,7 +180,11 @@ func (a *aclAPI) RevokeInvite(ctx context.Context, inviteRecordId string) error 
 	if err != nil {
 		return err
 	}
-	return cl.RevokeInvite(ctx, inviteRecordId)
+	if err := cl.RevokeInvite(ctx, inviteRecordId); err != nil {
+		return err
+	}
+	a.clearStaleMemberCustody(ctx)
+	return nil
 }
 
 func (a *aclAPI) RevokeAllInvites(ctx context.Context) error {
@@ -169,7 +192,38 @@ func (a *aclAPI) RevokeAllInvites(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return cl.RevokeAllInvites(ctx)
+	if err := cl.RevokeAllInvites(ctx); err != nil {
+		return err
+	}
+	a.clearStaleMemberCustody(ctx)
+	return nil
+}
+
+// clearStaleMemberCustody drops this account's member-invite custody
+// once it no longer matches an active invite record — called after a
+// successful revoke. Best-effort: the revoke already landed and the
+// read path hides stale custody, so failures are swallowed.
+func (a *aclAPI) clearStaleMemberCustody(ctx context.Context) {
+	key, ok := a.s.loadIssuedKey(ctx, techspace.IssuedKeyMember)
+	if !ok {
+		return
+	}
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return
+	}
+	acl.RLock()
+	_, matchErr := acl.AclState().GetInviteIdByPrivKey(key)
+	acl.RUnlock()
+	if matchErr == nil {
+		// Custody still matches an active invite — keep it.
+		return
+	}
+	_ = a.s.clearIssuedKey(ctx, techspace.IssuedKeyMember)
 }
 
 func (a *aclAPI) AcceptRequest(ctx context.Context, requestRecordId string, perm space.Permission) error {
@@ -250,23 +304,54 @@ func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) er
 	if len(accounts) == 0 {
 		return errors.New("acl: AddAccounts: empty accounts")
 	}
+	// Same precondition as CreateInvite: the ACL record is rejected until
+	// the coordinator knows the space ("space not exists" / log not
+	// found), so register it shareable first. Idempotent + retried.
+	if err := ensureShareable(ctx, a.s); err != nil {
+		return err
+	}
 	out := make([]list.AccountAdd, 0, len(accounts))
 	for i, m := range accounts {
 		pk, err := decodeIdentity(m.Identity)
 		if err != nil {
 			return fmt.Errorf("acl: account %d: %w", i, err)
 		}
-		out = append(out, list.AccountAdd{
+		// Symkey-only metadata: the ACL carries a member's own metadata
+		// symkey (m.Metadata name/icon is no longer written). An owner
+		// adding accounts directly can't produce another account's key,
+		// but if it has already learned that member's symkey (from a prior
+		// 1-1 or shared space), it forwards it here so the other members
+		// can resolve the added member's profile. Absent a cached key the
+		// record carries no metadata, and resolution waits until the key
+		// reaches this account another way.
+		add := list.AccountAdd{
 			Identity:    pk,
 			Permissions: toAclPermissions(m.Permission),
-			Metadata:    encodeMetadata(m.Metadata),
-		})
+		}
+		if enc, ok := a.s.tsp.GetIdentityMetaKey(ctx, m.Identity); ok {
+			add.Metadata = []byte(enc)
+		}
+		out = append(out, add)
 	}
 	cl, err := a.client(ctx)
 	if err != nil {
 		return err
 	}
-	return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: out})
+	if err := callWaitingForLog(ctx, func() error {
+		return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: out})
+	}); err != nil {
+		return err
+	}
+	// Membership is effective; notify the added accounts via the
+	// coordinator inbox (durable, retried) so the space surfaces on their
+	// devices as invite-pending. Queue failures are logged, never fail
+	// the add.
+	identities := make([]string, 0, len(accounts))
+	for _, m := range accounts {
+		identities = append(identities, m.Identity)
+	}
+	a.s.parent.markRegularInvitesToSend(ctx, a.s.id, identities)
+	return nil
 }
 
 func (a *aclAPI) OwnershipChange(ctx context.Context, newOwner string, oldOwnerPerm space.Permission) error {
@@ -297,6 +382,138 @@ func (a *aclAPI) CancelJoinRequest(ctx context.Context) error {
 	return cl.CancelRequest(ctx)
 }
 
+// CreateGuestKey mints (or returns) the space's shared read-only guest
+// identity — see space.ACL.CreateGuestKey. Idempotent via owner-side
+// custody: the private key is persisted on the owner's tech-space row
+// (it is not recoverable from the ACL), so repeated calls return the
+// same invite while the guest account is still active.
+//
+// The custody field and the ACL are reconciled to hold exactly ONE
+// guest identity: any ACL guest account the custody doesn't know —
+// a concurrent mint on another device, a failed custody persist, a
+// stored key whose account was revoked elsewhere — is removed (with a
+// read-key rotation) before a fresh identity is minted. Without this,
+// an orphaned guest identity would survive every future revocation:
+// RemoveAccounts re-encrypts the rotated key for remaining members,
+// guests included.
+func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
+	if !a.s.localIdentityIsOwner(ctx) {
+		return space.Invite{}, errors.New("acl: CreateGuestKey: owner only")
+	}
+	if guestKey, ok := a.s.loadIssuedKey(ctx, techspace.IssuedKeyGuest); ok {
+		guests, gErr := a.activeGuestIdentities(ctx)
+		if gErr != nil {
+			return space.Invite{}, gErr
+		}
+		// Custody active and no orphans — the idempotent fast path.
+		if len(guests) == 1 && guests[0].Equals(guestKey.GetPublic()) {
+			return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
+		}
+	}
+	// Same publish preconditions as AddAccounts: coordinator must know
+	// the space, consensus log must exist. No metadata and no inbox
+	// notification — the guest identity is synthetic, nobody's device
+	// listens for it.
+	if err := ensureShareable(ctx, a.s); err != nil {
+		return space.Invite{}, err
+	}
+	if err := a.removeAllGuestIdentities(ctx); err != nil {
+		return space.Invite{}, err
+	}
+	guestKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	if err != nil {
+		return space.Invite{}, fmt.Errorf("acl: guest key: %w", err)
+	}
+	cl, err := a.client(ctx)
+	if err != nil {
+		return space.Invite{}, err
+	}
+	if err := callWaitingForLog(ctx, func() error {
+		return cl.AddAccounts(ctx, list.AccountsAddPayload{Additions: []list.AccountAdd{{
+			Identity:    guestKey.GetPublic(),
+			Permissions: list.AclPermissionsGuest,
+		}}})
+	}); err != nil {
+		return space.Invite{}, fmt.Errorf("acl: add guest account: %w", err)
+	}
+	if err := a.s.persistIssuedKey(ctx, techspace.IssuedKeyGuest, guestKey); err != nil {
+		return space.Invite{}, err
+	}
+	return space.Invite{SpaceId: a.s.id, InviteKey: guestKey, Kind: space.InviteKindGuest}, nil
+}
+
+// RevokeGuestKey removes EVERY guest identity from the ACL (custodied
+// or orphaned — public access must end regardless of which device
+// minted what), rotating the read key, and clears the owner-side
+// custody — see space.ACL.RevokeGuestKey.
+func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
+	if !a.s.localIdentityIsOwner(ctx) {
+		return errors.New("acl: RevokeGuestKey: owner only")
+	}
+	rec, _ := a.s.tsp.Get(ctx, a.s.id)
+	stored := rec.IssuedInviteKey(techspace.IssuedKeyGuest)
+	guests, err := a.activeGuestIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	if len(guests) == 0 && stored == "" {
+		return fmt.Errorf("acl: RevokeGuestKey: %w", space.ErrNoActiveGuestKey)
+	}
+	if err := a.removeAllGuestIdentities(ctx); err != nil {
+		return err
+	}
+	return a.s.clearIssuedKey(ctx, techspace.IssuedKeyGuest)
+}
+
+// activeGuestIdentities lists every ACL account currently holding
+// guest permission.
+func (a *aclAPI) activeGuestIdentities(ctx context.Context) ([]crypto.PubKey, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return nil, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return nil, errors.New("acl: space has no acl")
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	var out []crypto.PubKey
+	for _, acc := range acl.AclState().CurrentAccounts() {
+		if acc.Permissions.IsGuest() {
+			out = append(out, acc.PubKey)
+		}
+	}
+	return out, nil
+}
+
+// removeAllGuestIdentities drops every guest account from the ACL in
+// one RemoveAccounts (read-key rotation included). No-op when none.
+func (a *aclAPI) removeAllGuestIdentities(ctx context.Context) error {
+	guests, err := a.activeGuestIdentities(ctx)
+	if err != nil {
+		return err
+	}
+	if len(guests) == 0 {
+		return nil
+	}
+	change, err := newReadKeyChange()
+	if err != nil {
+		return err
+	}
+	cl, err := a.client(ctx)
+	if err != nil {
+		return err
+	}
+	if err := cl.RemoveAccounts(ctx, list.AccountRemovePayload{
+		Identities: guests,
+		Change:     change,
+	}); err != nil {
+		return fmt.Errorf("acl: remove guest accounts: %w", err)
+	}
+	return nil
+}
+
 func (a *aclAPI) StopSharing(ctx context.Context) error {
 	change, err := newReadKeyChange()
 	if err != nil {
@@ -306,7 +523,12 @@ func (a *aclAPI) StopSharing(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	return cl.StopSharing(ctx, change)
+	if err := cl.StopSharing(ctx, change); err != nil {
+		return err
+	}
+	// StopSharing revokes every invite as a side effect.
+	a.clearStaleMemberCustody(ctx)
+	return nil
 }
 
 // newReadKeyChange mints a fresh metadata privkey + read key. The
@@ -328,13 +550,28 @@ func newReadKeyChange() (list.ReadKeyChangePayload, error) {
 // address form, matching Account.Id()) into a crypto.PubKey.
 func decodeIdentity(s string) (crypto.PubKey, error) {
 	if s == "" {
-		return nil, errors.New("acl: identity empty")
+		return nil, fmt.Errorf("acl: identity empty: %w", space.ErrBadIdentity)
 	}
 	pk, err := crypto.DecodeAccountAddress(s)
 	if err != nil {
-		return nil, fmt.Errorf("acl: decode identity %q: %w", s, err)
+		return nil, fmt.Errorf("acl: decode identity %q: %w: %w", s, space.ErrBadIdentity, err)
 	}
 	return pk, nil
+}
+
+// selfAclActive reports whether state places the account's own
+// identity in StatusActive. Caller holds the ACL lock.
+func selfAclActive(state *list.AclState) bool {
+	me := state.Identity()
+	if me == nil {
+		return false
+	}
+	for _, acc := range state.CurrentAccounts() {
+		if acc.PubKey.Equals(me) {
+			return acc.Status == list.StatusActive
+		}
+	}
+	return false
 }
 
 // toAclPermissions maps the SDK Permission enum to any-sync's value.
@@ -380,12 +617,63 @@ func fromAclPermissions(p list.AclPermissions) space.Permission {
 	}
 }
 
-// encodeMetadata flattens an AccountMetadata into the wire bytes that
-// land on the ACL record. Same NUL-separated layout as
-// space.EncodeAccountMetadata — kept as a thin alias so internal call
-// sites stay short.
-func encodeMetadata(m space.AccountMetadata) []byte { return space.EncodeAccountMetadata(m) }
+// ownRole resolves this account's current ACL permission in spaceId
+// from the loaded space's ACL state — the ACL mirror's source for the
+// row's ownRole field. Same access pattern as PushKeys (space via the
+// app cache, ACL read under RLock). An account absent from the ACL
+// (e.g. a still-pending joiner) resolves to PermissionNone without
+// error — that IS its current permission.
+func (s *Service) ownRole(ctx context.Context, spaceId string) (space.Permission, error) {
+	handle, err := s.app.GetSpace(ctx, spaceId)
+	if err != nil {
+		return space.PermissionNone, fmt.Errorf("ownRole: load space %q: %w", spaceId, err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return space.PermissionNone, fmt.Errorf("ownRole: space %q has no acl", spaceId)
+	}
+	acl.RLock()
+	state := acl.AclState()
+	perms := state.Permissions(state.Identity())
+	acl.RUnlock()
+	return fromAclPermissions(perms), nil
+}
 
-// decodeMetadata is the inverse — public alias so internal callers
-// don't have to import the same helper from two places.
-func decodeMetadata(b []byte) space.AccountMetadata { return space.DecodeAccountMetadata(b) }
+// encodeSelfSymKeyMetadata derives this account's metadata symkey and
+// returns its marshalled bytes for the ACL RequestMetadata / create
+// payload. The ACL carries ONLY the symkey, never inline name/icon —
+// co-members cache the key and resolve the profile from identityRepo
+// (see docs/one-to-one-spaces.md). any-sync encrypts these bytes at rest with the space
+// metadata key, so only members can read the symkey. Returns nil bytes
+// on derive/marshal failure (the member still joins; their profile just
+// stays unresolved until a later key arrival).
+func encodeSelfSymKeyMetadata(signKey crypto.PrivKey) ([]byte, error) {
+	k, err := space.DeriveAccountMetadataSymKey(signKey)
+	if err != nil {
+		return nil, err
+	}
+	s, err := space.MarshalSymKey(k)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(s), nil
+}
+
+// decodeSymKeyMetadata decrypts an active member's ACL RequestMetadata
+// (encrypted at rest with the space metadata key) and returns the
+// contact's metadata symkey string, "" when absent or the caller lacks
+// the metadata key.
+func decodeSymKeyMetadata(raw []byte, keys map[string]list.AclKeys, keyRecordId string) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	k, ok := keys[keyRecordId]
+	if !ok || k.MetadataPrivKey == nil {
+		return ""
+	}
+	plain, err := k.MetadataPrivKey.Decrypt(raw)
+	if err != nil {
+		return ""
+	}
+	return string(plain)
+}

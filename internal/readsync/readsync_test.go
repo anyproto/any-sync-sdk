@@ -1,0 +1,566 @@
+package readsync
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	anystore "github.com/anyproto/any-store/v2"
+	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage"
+	"github.com/anyproto/any-sync/commonspace/object/keyvalue/keyvaluestorage/innerstorage"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/anyproto/any-sync-sdk/internal/readstate"
+)
+
+var ctx = context.Background()
+
+const (
+	testSpace = "space1"
+	testObj   = "obj1"
+	selfPeer  = "peer-self"
+)
+
+// fakeKV records Set calls and serves Iterate from its rows. Faithful
+// to the real store in two ways that matter to reconcile: Set upserts
+// the own-peer row (so a republish is visible to the next pass), and
+// split mode delivers each row in its own Iterate callback — the real
+// storage.Iterate groups only consecutive rows of an unsorted scan, so
+// a key's rows can arrive split across callbacks.
+type fakeKV struct {
+	keyvaluestorage.Storage
+	mu       sync.Mutex
+	sets     map[string][]byte
+	setCount map[string]int
+	rows     map[string][]innerstorage.KeyValue
+	split    bool
+	// deletePrefixes records DeletePrefix calls in order.
+	deletePrefixes []string
+	// beforeSet runs before Set takes the store mutex; inIterate runs
+	// once Iterate holds it, before the first callback. Test schedules.
+	beforeSet func()
+	inIterate func()
+}
+
+func newFakeKV() *fakeKV {
+	return &fakeKV{sets: map[string][]byte{}, setCount: map[string]int{}, rows: map[string][]innerstorage.KeyValue{}}
+}
+
+func (f *fakeKV) Set(_ context.Context, key string, value []byte) error {
+	if f.beforeSet != nil {
+		f.beforeSet()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sets[key] = append([]byte(nil), value...)
+	f.setCount[key]++
+	for i, kv := range f.rows[key] {
+		if kv.PeerId == selfPeer {
+			f.rows[key][i].Value.Value = append([]byte(nil), value...)
+			return nil
+		}
+	}
+	f.rows[key] = append(f.rows[key], innerstorage.KeyValue{
+		Key: key, PeerId: selfPeer,
+		Value: innerstorage.Value{Value: append([]byte(nil), value...)},
+	})
+	return nil
+}
+
+func (f *fakeKV) Iterate(_ context.Context, fn func(decryptor keyvaluestorage.Decryptor, key string, values []innerstorage.KeyValue) (bool, error)) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.inIterate != nil {
+		f.inIterate()
+	}
+	for key, values := range f.rows {
+		// The real store hides watermark rows from Iterate.
+		if len(values) > 0 && values[0].DeletePrefix != "" {
+			continue
+		}
+		if f.split {
+			for _, kv := range values {
+				cont, err := fn(plainDecryptor, key, []innerstorage.KeyValue{kv})
+				if err != nil || !cont {
+					return err
+				}
+			}
+			continue
+		}
+		cont, err := fn(plainDecryptor, key, values)
+		if err != nil || !cont {
+			return err
+		}
+	}
+	return nil
+}
+
+func plainDecryptor(kv innerstorage.KeyValue) ([]byte, error) { return kv.Value.Value, nil }
+
+func frontierKV(key, peerId string, heads []string) innerstorage.KeyValue {
+	raw, _ := json.Marshal(frontierValue{Heads: heads})
+	return innerstorage.KeyValue{Key: key, PeerId: peerId, Value: innerstorage.Value{Value: raw}}
+}
+
+type fixture struct {
+	*Service
+	db  anystore.DB
+	eng *readstate.Engine
+	kv  *fakeKV
+}
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	return newFixtureWith(t, nil, nil)
+}
+
+// newFixtureWith builds the fixture over an engine with the given gap
+// resolver and space loader.
+func newFixtureWith(t *testing.T, resolve readstate.Resolver, load readstate.Loader) *fixture {
+	t.Helper()
+	db, err := anystore.Open(ctx, filepath.Join(t.TempDir(), "readsync.db"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	seq := uint64(1000)
+	eng := readstate.New(db, testSpace, func(context.Context) (uint64, error) {
+		seq++
+		return seq, nil
+	}, resolve, load)
+	require.NoError(t, eng.Open(ctx))
+	kv := newFakeKV()
+	svc := New(
+		func(spaceId string) *readstate.Engine {
+			if spaceId == testSpace {
+				return eng
+			}
+			return nil
+		},
+		func(context.Context) (keyvaluestorage.Storage, error) { return kv, nil },
+		selfPeer,
+	)
+	t.Cleanup(svc.Close)
+	return &fixture{Service: svc, db: db, eng: eng, kv: kv}
+}
+
+func (f *fixture) trackUnread(t *testing.T, changeId, versionId string, prev []string) {
+	t.Helper()
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		return f.eng.TrackChange(txCtx, readstate.Track{
+			ObjectId: testObj, ChangeId: changeId, VersionId: versionId,
+			PrevIds: prev, ApplySeq: 1, RecordIds: []string{"rec-" + changeId},
+			Tags: []string{"message"}, Tracked: true,
+		})
+	}))
+}
+
+func TestKeyCodec(t *testing.T) {
+	sp, ob, ok := parseKey(kvKey("sp1", "ob1"))
+	require.True(t, ok)
+	assert.Equal(t, "sp1", sp)
+	assert.Equal(t, "ob1", ob)
+
+	_, _, ok = parseKey("other/sp1/ob1")
+	assert.False(t, ok)
+	_, _, ok = parseKey("read/justspace")
+	assert.False(t, ok)
+}
+
+func TestMarkPublishesFrontier(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+
+	res, err := f.MarkReadUpTo(ctx, testSpace, testObj, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c1"}, res.Frontier)
+
+	f.kv.mu.Lock()
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	require.NotNil(t, raw)
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{"c1"}, val.Heads)
+}
+
+func TestOnKeyValues_MergesRemoteFrontier(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	f.trackUnread(t, "c2", "v02", []string{"c1"})
+
+	// Own row is ignored; another device's row covers both changes.
+	f.OnKeyValues(plainDecryptor, []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"bogus"}),
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c2"}),
+	})
+
+	require.Eventually(t, func() bool {
+		entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+		return err == nil && len(entries) == 0
+	}, 2*time.Second, 10*time.Millisecond)
+
+	heads, _, err := f.eng.Frontier(ctx, testObj)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"c2"}, heads)
+}
+
+func TestReconcile_ReplaysPublishedFrontiers(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+	}
+	// A foreign-space key must be skipped, not break iteration.
+	f.kv.rows[kvKey("space-other", "objX")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("space-other", "objX"), "peer-other", []string{"zz"}),
+	}
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	// Second run is the idempotent fast path — still clean.
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+}
+
+func TestReconcile_MergesOwnRowAfterRebuild(t *testing.T) {
+	f := newFixture(t)
+	// Fresh DB (rebuild): the unread entry exists, and the only KV row
+	// is OUR OWN previously-published frontier. It must count.
+	f.trackUnread(t, "c1", "v01", nil)
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries, "own published frontier restores read state after a rebuild")
+}
+
+func TestReconcile_RepublishesDivergentFrontier(t *testing.T) {
+	f := newFixture(t)
+	// Local frontier advanced (a mark whose publish was lost): KV has
+	// a stale own row.
+	f.trackUnread(t, "c1", "v01", nil)
+	f.trackUnread(t, "c2", "v02", []string{"c1"})
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}), // stale
+	}
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	require.NotNil(t, raw, "divergent frontier republished at reconcile")
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{"c2"}, val.Heads)
+}
+
+// The SYN-97 loop: real Iterate can split a key's rows across
+// callbacks; a group without the own row must not look divergent.
+func TestReconcile_SplitGroups_NoFalseRepublish(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// Own row is CURRENT; a remote row arrives in a separate callback.
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Zero(t, count, "up-to-date frontier must not republish, split groups or not")
+}
+
+func TestReconcile_SplitGroups_DivergentPublishesOnce(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	f.trackUnread(t, "c2", "v02", []string{"c1"})
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// Stale own row plus two historical remote rows, one callback each.
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-old-1", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), "peer-old-2", []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Equal(t, 1, count, "one republish per divergent key, not one per callback group")
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{"c2"}, val.Heads)
+}
+
+func TestReconcile_ConvergesAfterOnePass(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		_, err := f.eng.MarkReadUpTo(txCtx, testObj, "")
+		return err
+	}))
+	// No own row at all (publish was lost before it hit disk).
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+	}
+	f.kv.split = true
+
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+	require.NoError(t, f.Reconcile(ctx, testSpace))
+
+	f.kv.mu.Lock()
+	count := f.kv.setCount[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	assert.Equal(t, 1, count, "pass 1 heals, pass 2 must publish nothing")
+}
+
+func TestMarkReadUpTo_ChunksLargeSets(t *testing.T) {
+	f := newFixture(t)
+	const n = markChunkSize + 500
+	require.NoError(t, f.eng.WriteTx(ctx, func(txCtx context.Context) error {
+		for i := 0; i < n; i++ {
+			prev := []string{fmt.Sprintf("c%06d", i-1)}
+			if i == 0 {
+				prev = nil
+			}
+			if err := f.eng.TrackChange(txCtx, readstate.Track{
+				ObjectId: testObj, ChangeId: fmt.Sprintf("c%06d", i),
+				VersionId: fmt.Sprintf("v%06d", i), PrevIds: prev, ApplySeq: uint64(i + 1),
+				RecordIds: []string{"r"}, Tags: []string{"message"}, Tracked: true,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	res, err := f.MarkReadUpTo(ctx, testSpace, testObj, "")
+	require.NoError(t, err)
+	assert.Len(t, res.Removed, n, "all chunks aggregated")
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+
+	// Published once, with the final frontier.
+	f.kv.mu.Lock()
+	raw := f.kv.sets[kvKey(testSpace, testObj)]
+	f.kv.mu.Unlock()
+	require.NotNil(t, raw)
+	var val frontierValue
+	require.NoError(t, json.Unmarshal(raw, &val))
+	assert.Equal(t, []string{fmt.Sprintf("c%06d", n-1)}, val.Heads)
+
+	// The per-object lock map evicted on release.
+	f.Service.mu.Lock()
+	assert.Empty(t, f.Service.objMu)
+	f.Service.mu.Unlock()
+}
+
+func TestReconcileAll_SinglePassRoutesBySpace(t *testing.T) {
+	f := newFixture(t)
+	f.trackUnread(t, "c1", "v01", nil)
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c1"}),
+	}
+	// Untracked-space keys are skipped without error.
+	f.kv.rows[kvKey("space-untracked", "objX")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("space-untracked", "objX"), "peer-other", []string{"zz"}),
+	}
+
+	require.NoError(t, f.ReconcileAll(ctx))
+
+	entries, _, err := f.eng.UnreadEntries(ctx, testObj)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+// GetAll mirrors the real store's prefix semantics (IteratePrefix under
+// the hood, watermark rows filtered): every visible row whose key
+// starts with the argument.
+func (f *fakeKV) GetAll(_ context.Context, key string, get func(decryptor keyvaluestorage.Decryptor, values []innerstorage.KeyValue) error) error {
+	f.mu.Lock()
+	var values []innerstorage.KeyValue
+	for k, rows := range f.rows {
+		if !strings.HasPrefix(k, key) {
+			continue
+		}
+		for _, kv := range rows {
+			if kv.DeletePrefix != "" {
+				continue
+			}
+			values = append(values, kv)
+		}
+	}
+	f.mu.Unlock()
+	return get(plainDecryptor, values)
+}
+
+// DeletePrefix mirrors the real watermark apply: drops every row under
+// the prefix, RETAINS the watermark row (hidden from GetAll/Iterate by
+// the DeletePrefix filter, exactly like the real store), and records
+// the call.
+func (f *fakeKV) DeletePrefix(_ context.Context, prefix string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for k := range f.rows {
+		if strings.HasPrefix(k, prefix) {
+			delete(f.rows, k)
+		}
+	}
+	f.rows[prefix] = []innerstorage.KeyValue{{
+		Key: prefix, PeerId: selfPeer, DeletePrefix: prefix,
+	}}
+	f.deletePrefixes = append(f.deletePrefixes, prefix)
+	return nil
+}
+
+func TestPublishedFrontiers_AllDeviceRows(t *testing.T) {
+	f := newFixture(t)
+	assert.Empty(t, mustFrontiers(t, f, testObj), "no rows yet")
+
+	f.kv.rows[kvKey(testSpace, testObj)] = []innerstorage.KeyValue{
+		frontierKV(kvKey(testSpace, testObj), selfPeer, []string{"c1"}),
+		frontierKV(kvKey(testSpace, testObj), "peer-other", []string{"c2"}),
+	}
+	sets := mustFrontiers(t, f, testObj)
+	require.Len(t, sets, 2, "own rows count too")
+	assert.ElementsMatch(t, [][]string{{"c1"}, {"c2"}}, sets)
+}
+
+func mustFrontiers(t *testing.T, f *fixture, objectId string) [][]string {
+	t.Helper()
+	sets, err := f.PublishedFrontiers(ctx, testSpace, objectId)
+	require.NoError(t, err)
+	return sets
+}
+
+// TestPruneSpace pins the prune contract: a watermark is issued only
+// while visible frontier rows remain, so the reconciler can call it on
+// every pass without spamming rewrites.
+func TestPruneSpace(t *testing.T) {
+	f := newFixture(t)
+
+	// Nothing published: no watermark.
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Empty(t, f.kv.deletePrefixes)
+
+	// Rows from two devices: one watermark, rows gone.
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj1"), selfPeer, []string{"c1"}),
+		frontierKV(kvKey("sp-dead", "obj1"), "peer-other", []string{"c2"}),
+	}
+	f.kv.rows[kvKey("sp-dead", "obj2")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj2"), "peer-other", []string{"c3"}),
+	}
+	// Another space's rows must not be touched.
+	f.kv.rows[kvKey("sp-live", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-live", "obj1"), selfPeer, []string{"c9"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Equal(t, []string{"read/sp-dead/"}, f.kv.deletePrefixes)
+	assert.NotContains(t, f.kv.rows, kvKey("sp-dead", "obj1"))
+	assert.NotContains(t, f.kv.rows, kvKey("sp-dead", "obj2"))
+	assert.Contains(t, f.kv.rows, kvKey("sp-live", "obj1"), "other spaces untouched")
+
+	// Prefix now empty: further calls are no-ops.
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 1, "self-clearing: no re-issue without rows")
+
+	// A late row from a lagging device re-arms the prune.
+	f.kv.rows[kvKey("sp-dead", "obj3")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj3"), "peer-lagging", []string{"c4"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 2, "re-issued after a late publish")
+}
+
+// TestPruneSpace_RetainedWatermarkNotVisible pins that the watermark
+// row the store keeps under the prefix never counts as a visible
+// frontier — otherwise every reconcile pass would re-issue a fresh
+// watermark forever.
+func TestPruneSpace_RetainedWatermarkNotVisible(t *testing.T) {
+	f := newFixture(t)
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj1"), selfPeer, []string{"c1"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Len(t, f.kv.deletePrefixes, 1)
+	require.Contains(t, f.kv.rows, "read/sp-dead/", "fake retains the watermark row")
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	require.Len(t, f.kv.deletePrefixes, 1, "retained watermark row must not re-arm the prune")
+}
+
+// TestPruneSpace_FutureRowsSkipped: rows stamped ahead of the local
+// clock cannot be covered by a watermark we issue now — re-issuing for
+// them every pass is churn, so the prune skips until they fall due.
+func TestPruneSpace_FutureRowsSkipped(t *testing.T) {
+	f := newFixture(t)
+	future := frontierKV(kvKey("sp-dead", "obj1"), "peer-skewed", []string{"c1"})
+	future.TimestampMicro = time.Now().Add(time.Hour).UnixMicro()
+	f.kv.rows[kvKey("sp-dead", "obj1")] = []innerstorage.KeyValue{future}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Empty(t, f.kv.deletePrefixes, "future-stamped rows must not trigger a watermark")
+
+	// A coverable row alongside re-enables the prune.
+	f.kv.rows[kvKey("sp-dead", "obj2")] = []innerstorage.KeyValue{
+		frontierKV(kvKey("sp-dead", "obj2"), selfPeer, []string{"c2"}),
+	}
+	require.NoError(t, f.PruneSpace(ctx, "sp-dead"))
+	assert.Len(t, f.kv.deletePrefixes, 1)
+}
+
+// TestPublishGate_DropsWhenUntracked: publish re-checks liveness so a
+// mark racing a space removal cannot resurrect just-pruned rows.
+func TestPublishGate_DropsWhenUntracked(t *testing.T) {
+	f := newFixture(t)
+	var live atomic.Bool
+	live.Store(true)
+	orig := f.Service.engineFor
+	f.Service.engineFor = func(spaceId string) *readstate.Engine {
+		if !live.Load() {
+			return nil
+		}
+		return orig(spaceId)
+	}
+
+	live.Store(false)
+	f.Service.publish(ctx, testSpace, testObj, []string{"c1"})
+	assert.Empty(t, f.kv.sets, "publish must drop when the space is no longer tracked")
+
+	live.Store(true)
+	f.Service.publish(ctx, testSpace, testObj, []string{"c1"})
+	assert.Len(t, f.kv.sets, 1, "publish resumes for a live space")
+}

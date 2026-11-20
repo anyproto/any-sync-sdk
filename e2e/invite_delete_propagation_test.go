@@ -73,6 +73,7 @@ func newBlocksType() handler.Type {
 //  6. Alice waits up to 2 minutes for the record to disappear from
 //     her Query — the actual regression check.
 func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
+	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
 	if err != nil {
 		t.Skipf("no any-sync network config available: %v", err)
@@ -112,7 +113,7 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		t.Fatalf("alice: Spaces().Create: %v", err)
 	}
 
-	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Types: []string{"blocks-type"}})
+	objId, err := sp.Objects().Create(ctx, space.CreateObjectOpts{Type: "blocks-type"})
 	require.NoError(t, err, "alice: Objects().Create")
 
 	const recId = "rec-X"
@@ -187,6 +188,23 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		t.Fatalf("bob never reached MemberStatusActive")
 	}
 
+	// The accept record that activated bob also kicks his ACL mirror:
+	// his tech-space row must surface the granted role as OwnRole.
+	if !waitFor(ctx, 30*time.Second, 1*time.Second, func() bool {
+		infos, lErr := bob.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.OwnRole == space.PermissionWriter
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("bob's space row never mirrored OwnRole=writer")
+	}
+
 	// Bob waits for Alice's seed record to converge.
 	if !waitFor(ctx, 2*time.Minute, 1*time.Second, func() bool {
 		_ = bobSpace.SyncHeads(ctx)
@@ -245,5 +263,29 @@ func TestE2E_JoinerDeletePropagatesToOwner(t *testing.T) {
 		}
 		t.Fatalf("alice never observed bob's delete after %s; record state on alice: %s",
 			deadline, dump)
+	}
+
+	// Step 7: live role change. Alice demotes bob to reader; the
+	// permission-change ACL record applies on bob's loaded space,
+	// kicks his ACL mirror, and the row's OwnRole must follow — the
+	// role is live per applied ACL record, not only at the initial
+	// grant.
+	require.NoError(t, sp.ACL().ChangePermissions(ctx, []space.PermissionChange{
+		{Identity: bob.Account().Id(), Permission: space.PermissionReader},
+	}), "alice: ChangePermissions")
+	if !waitFor(ctx, 90*time.Second, 1*time.Second, func() bool {
+		_ = bobSpace.SyncHeads(ctx)
+		infos, lErr := bob.Spaces().List(ctx)
+		if lErr != nil {
+			return false
+		}
+		for _, info := range infos {
+			if info.Id == sp.Id() {
+				return info.OwnRole == space.PermissionReader
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("bob's space row never mirrored the writer→reader demotion")
 	}
 }

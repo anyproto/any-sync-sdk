@@ -4,28 +4,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/tree/treestorage"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/internal/spaceobjects"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	anytype "github.com/anyproto/any-sync-sdk/internal/types/any"
 	"github.com/anyproto/any-sync-sdk/internal/types/spaceindex"
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// spaceIndexTypesArray builds the any.types value for the spaceIndex
-// object: the single built-in spaceIndex type it implements. Declared
-// on seed so the write-time pre-flight admits the spaceIndex.*
-// namespace.
-func spaceIndexTypesArray(arena *anyenc.Arena) *anyenc.Value {
-	arr := arena.NewArray()
-	arr.SetArrayItem(0, arena.NewString(spaceindex.TypeId))
-	return arr
-}
+// spaceIndexTypeKey is the dotted `any.type` key the spaceIndex object
+// writes its built-in type under. Declared on seed so the write-time
+// pre-flight admits the spaceIndex.* namespace.
+const spaceIndexTypeKey = anytype.TypeId + "." + anytype.FieldType
 
 // seedSpaceIndexOnCreate is the owner-side initial write of the
 // in-space spaceIndex object. Runs once during Service.Create after
@@ -39,9 +37,9 @@ func spaceIndexTypesArray(arena *anyenc.Arena) *anyenc.Value {
 func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobjects.Store, spaceId string, req space.CreateRequest, normalizedSpaceType string) error {
 	// Derive the spaceIndex object — idempotent on the any-sync side
 	// (a second Create with the same seed returns the existing tree).
-	// ChangeType intentionally left empty: any-sync's DeriveTree
-	// hashes the full payload (including ChangeType) into the tree id,
-	// so it must match what ensureSpaceIndexWiring derives with.
+	// ChangeType intentionally left empty: the derived root hashes the
+	// full payload (including ChangeType) into the tree id, so it must
+	// match what ensureSpaceIndexWiring derives with.
 	obj, err := store.Derive(ctx, spaceobjects.DeriveOpts{
 		ChangePayload: []byte(spaceindex.WellKnownDeriveSeed),
 	})
@@ -54,11 +52,10 @@ func (s *Service) seedSpaceIndexOnCreate(ctx context.Context, store *spaceobject
 	// Always set all four keys, even when empty — keeps the row's
 	// `spaceIndex.*` namespace present on disk so subsequent reads
 	// distinguish "seeded with blanks" from "never seeded".
-	// Declare the type this object implements so the write-time schema
-	// pre-flight admits the spaceIndex.* namespace (any.types
-	// membership). Same change as the values — collectTypeAdditions
-	// picks it up.
-	payload.Set("any.types", spaceIndexTypesArray(arena))
+	// Declare the type this object has so the write-time schema
+	// pre-flight admits the spaceIndex.* namespace. Same change as the
+	// values — the membership scan picks it up.
+	payload.Set(spaceIndexTypeKey, arena.NewString(spaceindex.TypeId))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(req.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(req.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(req.IconCID))
@@ -117,6 +114,26 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 		return
 	}
 
+	// The local copy has no spaceIndex namespace — but that does NOT mean
+	// the object is absent network-wide. A second device of the same
+	// account (every device is an owner) loading a space another device
+	// created races here: the spaceIndex object exists and may already be
+	// renamed, it just hasn't synced to this device yet. Re-seeding from
+	// THIS device's stale tech-space row would derive the same object id
+	// with a fresh OrderId and win LWW, reverting the real name on every
+	// device (the "rename never converges" flake). So sync first and
+	// re-check; only seed when the object is genuinely absent everywhere
+	// (a legacy pre-spaceIndex space, or an owner that crashed after
+	// CreateSpace but before the initial seed LocalWrite). If the sync
+	// fails we can't prove absence — skip and let the next load retry,
+	// rather than risk the clobber.
+	if err := s.app.SyncHeads(ctx, s.id); err != nil {
+		return
+	}
+	if spaceIndexHasNamespace(ctx, s.store, objectId) {
+		return
+	}
+
 	// Pull the tech-space row to source the initial values. This is
 	// the legacy migration path — the tech-space row is what the
 	// owner created with via the pre-spaceIndex code.
@@ -133,7 +150,7 @@ func (s *spaceImpl) maybeLazySeedSpaceIndex(ctx context.Context) {
 	}
 	arena := &anyenc.Arena{}
 	payload := arena.NewObject()
-	payload.Set("any.types", spaceIndexTypesArray(arena))
+	payload.Set(spaceIndexTypeKey, arena.NewString(spaceindex.TypeId))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldName, arena.NewString(rec.Name))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldDescription, arena.NewString(rec.Description))
 	payload.Set(spaceindex.TypeId+"."+spaceindex.FieldIcon, arena.NewString(rec.IconCID))
@@ -173,13 +190,13 @@ func lazySpaceTypeTag(rec techspace.SpaceIndexRecord) string {
 // resulting LocalWrite carries one multi-field $set so all three
 // columns land under one VersionId.
 //
-// No permission gate in v1 — non-writers are rejected by any-sync
-// ACL on the apply path at peers. See PROMPT.md § "Open questions".
+// No local permission gate: peers reject non-writers against the
+// any-sync ACL on the apply path.
 func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataRequest) error {
 	if req.Name == nil && req.Description == nil && req.IconCID == nil {
 		return errors.New("spaceimpl: SetMetadata: at least one field required")
 	}
-	objectId, err := s.parent.spaceIndexObjectIdFor(ctx, s.id)
+	objectId, err := s.indexObjectId(ctx)
 	if err != nil {
 		return err
 	}
@@ -217,16 +234,100 @@ func (s *spaceImpl) SetMetadata(ctx context.Context, req space.SetMetadataReques
 	return nil
 }
 
+// SetP2PAdvertise writes the per-space p2p advertising switch onto the
+// space's tech-space row and, when switched on, republishes this
+// device's global p2p record into the space at once. A write that would
+// not change the row is skipped.
+func (s *spaceImpl) SetP2PAdvertise(ctx context.Context, on bool) error {
+	if rec, ok := s.tsp.Get(ctx, s.id); ok && rec.P2PAdvertise == on {
+		return nil
+	}
+	if _, err := s.tsp.SetP2PAdvertise(ctx, s.id, on); err != nil {
+		return fmt.Errorf("spaceimpl: SetP2PAdvertise: %w", err)
+	}
+	if on {
+		s.app.RepublishGlobalRecord(s.id)
+	}
+	return nil
+}
+
 // SpaceIndexObjectId returns the deterministic spaceIndex object id
 // for this space. Returns "" only when the underlying derive failed
 // to compute (rare — usually a programming error if hit).
 func (s *spaceImpl) SpaceIndexObjectId() string {
 	// Prefer the cached value; fall back to an on-demand derive.
-	id, err := s.parent.spaceIndexObjectIdFor(context.Background(), s.id)
+	id, err := s.indexObjectId(context.Background())
 	if err != nil {
 		return ""
 	}
 	return id
+}
+
+// WaitIndexSynced blocks until the local view of the spaceIndex is
+// trustworthy, via either exit:
+//
+//   - Fast path (offline-capable): the seeded metadata row is already
+//     projected locally — regular spaces get it at Create.
+//   - Converged path: a clean head-sync round with the sync-status
+//     rollup at Synced. Covers spaces that never seed metadata (1-1 /
+//     nameless derived spaces): after a converged round the network's
+//     current index state is local — including "the index tree exists
+//     nowhere yet", a valid converged answer (callers then read an
+//     empty registry), NOT a wait-forever.
+//
+// Read-only: the tree is loaded (Store.Get runs ColdRestore, so
+// pre-boot head-synced state projects too), never derived — a wait
+// primitive must not create trees, least of all on read-only/guest
+// spaces where the write gate would refuse the same effect.
+func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
+	objectId, err := s.indexObjectId(ctx)
+	if err != nil {
+		return err
+	}
+	var lastErr error
+	seeded := func(ctx context.Context) bool {
+		if _, gerr := s.store.Get(ctx, objectId); gerr != nil {
+			lastErr = gerr // tree not arrived yet, or a real failure — keep waiting, report on timeout
+			return false
+		}
+		return spaceIndexHasNamespace(ctx, s.store, objectId)
+	}
+	if seeded(ctx) {
+		return nil
+	}
+	backoff := time.Second
+	for {
+		serr := s.app.SyncHeads(ctx, s.id)
+		if serr != nil {
+			lastErr = serr // offline round — keep waiting; the caller's ctx is the only deadline
+		}
+		if seeded(ctx) {
+			return nil
+		}
+		// Converged exit: a clean round + Synced rollup means the local
+		// index state IS the network's (a nil round alone is not proof —
+		// any-sync swallows per-peer failures; the rollup flips Synced
+		// only on HeadsApply from a responsible peer). Absent tree after
+		// convergence = index exists nowhere = done.
+		if serr == nil && s.app.SyncStatus().Status(s.id).State == space.SyncStateSynced {
+			_, gerr := s.store.Get(ctx, objectId)
+			if gerr == nil || errors.Is(gerr, treestorage.ErrUnknownTreeId) {
+				return nil
+			}
+			lastErr = gerr
+		}
+		select {
+		case <-ctx.Done():
+			if lastErr != nil {
+				return fmt.Errorf("%w (last attempt: %v)", ctx.Err(), lastErr)
+			}
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		if backoff < 5*time.Second {
+			backoff *= 2
+		}
+	}
 }
 
 // spaceIndexHasNamespace returns true when the per-space `objects`

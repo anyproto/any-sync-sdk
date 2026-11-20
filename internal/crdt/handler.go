@@ -3,6 +3,7 @@ package crdt
 import (
 	"context"
 	"errors"
+	"slices"
 
 	anystore "github.com/anyproto/any-store/v2"
 	"github.com/anyproto/any-store/v2/anyenc"
@@ -21,6 +22,21 @@ var ErrUnknownDataset = errors.New("crdt: no handler for dataset")
 // Change entirely.
 var ErrValidation = errors.New("crdt: validation rejected")
 
+// ErrRecordDeleted is the rejection sentinel for a modify (including
+// upsert) that landed on a tombstoned record. Delete-wins absorbs the
+// write — the tombstone is sticky and none of the ops land — and
+// without this rejection the absorbed write is indistinguishable from
+// a successful create to a local caller (ModifyResult with recordIds
+// and no rejections, nothing stored). The absorption itself is the
+// convergence rule and stays; this sentinel only makes it visible.
+// Deleting an already-deleted record stays silent (idempotent).
+var ErrRecordDeleted = errors.New("crdt: record is deleted; the id cannot be reused")
+
+// ErrDatasetUndeletable is the rejection sentinel of a delete on a
+// dataset declared DeleteByNone. The local pre-flight returns it before
+// the change exists; apply records it for a delete written elsewhere.
+var ErrDatasetUndeletable = errors.New("crdt: the dataset refuses record deletes")
+
 // ChangeCtx is the per-callback context handed to a Handler. It carries the
 // originating Change (read-only metadata: VersionId, ChangeId, Timestamp,
 // Creator, ObjectAuthor, …) and the record's pre-op state.
@@ -28,9 +44,10 @@ var ErrValidation = errors.New("crdt: validation rejected")
 // ObjectAuthor is the constant root-signer (object creator); Creator is the
 // per-change signer (who wrote THIS change). For the root change they
 // coincide; for shared spaces / multi-author objects they diverge — handlers
-// that gate "only the author of this message can edit it" should read
-// Creator, while handlers that stamp object-level provenance should read
-// ObjectAuthor.
+// that gate "only the author of this message can edit it" read Creator;
+// handlers stamping the object's creation facts (author, createdAt)
+// read ObjectAuthor, and per-change provenance (modifiedBy) reads
+// Creator.
 //
 // Before evolves across ops in the same RecordChange: op[1]'s Before is
 // op[0]'s after — but only counting ops that actually landed (rejected ops
@@ -41,6 +58,43 @@ var ErrValidation = errors.New("crdt: validation rejected")
 type ChangeCtx struct {
 	Change *Change
 	Before *anyenc.Value
+	// SelfIdentity is this replica's account identity
+	// (PubKey.Account() encoding). Populated ONLY on the read-tracking
+	// classify path — read state is device-local, so identity-relative
+	// verdicts (ReadClassification.Audience) are sound there. It stays
+	// zero in the Before* handler hooks on purpose: handler validation
+	// runs on every replica for the same change and must be
+	// replica-independent, or CRDT replicas diverge.
+	SelfIdentity string
+
+	// Get resolves the CURRENT value of a record in one of this
+	// object's datasets by explicit id — nil when the record is absent,
+	// the id is empty, or the invoker wired no reader (hand-built test
+	// contexts). Reads happen inside the apply WriteTx, so a record
+	// created earlier in the same change is visible. Tombstones are
+	// returned as-is (check _deletedAt); their content fields are wiped.
+	//
+	// Determinism contract for Before* hooks: the hook runs on every
+	// replica for the same change and its output must not diverge, so a
+	// handler may consult ONLY fields that are immutable post-create
+	// (derived creation stamps such as creator/createdAt qualify;
+	// freely-edited fields do not) and only on records that are causal
+	// ancestors of the triggering change — the writer saw them, so
+	// every replica applies them first. Known accepted edge: a record
+	// deleted CONCURRENTLY with the triggering change loses its fields
+	// on the tombstone, so a replica that applied the delete first
+	// reads nil-equivalent state; derived output disagrees between
+	// replicas on that race, which is tolerable only because derived
+	// ops are local re-derivation, never synced payload.
+	Get func(dataset, id string) *anyenc.Value
+
+	// RecordId is the resolved id of the record being classified.
+	// Populated ONLY on the read-tracking classify path (like
+	// SelfIdentity) — a create with an auto-derived id carries an empty
+	// RecordChange.Id, and a classifier that wants to point-read the
+	// just-applied record via Get needs the real id. Zero in the
+	// Before* handler hooks.
+	RecordId string
 }
 
 // Sibling describes a write the handler wants applied to a different
@@ -68,6 +122,20 @@ type Sink struct {
 // callback as the triggering op. Inherits the change's VersionId.
 func (s *Sink) Derive(op Op) { s.derived = append(s.derived, op) }
 
+// DeriveOnce queues op unless a derived op with the same Path is already
+// queued. For per-change stamps (e.g. modifiedAt) emitted from the per-op
+// BeforeModify hook, which may fire several times for one RecordChange —
+// without the guard each op would queue a duplicate stamp, and every
+// duplicate is projected onto the wire as a separate derived op.
+func (s *Sink) DeriveOnce(op Op) {
+	for i := range s.derived {
+		if slices.Equal(s.derived[i].Path, op.Path) {
+			return
+		}
+	}
+	s.derived = append(s.derived, op)
+}
+
 // Project queues a write to a different dataset on the same Controller.
 // Applied in the same WriteTx as the triggering change.
 func (s *Sink) Project(dataset string, rec RecordChange) {
@@ -89,7 +157,9 @@ func (s *Sink) reset() {
 // Handler is the lifecycle behavior for one dataset. Hooks fire inside
 // any-store's Modify callback so handlers can read pre-state from
 // ctx.Before and emit derived or sibling writes via sink without an extra
-// DB round-trip.
+// DB round-trip. Cross-record reads go through ctx.Get, subject to its
+// determinism contract (immutable fields of causal ancestors only) —
+// hooks run on every replica and must not diverge.
 //
 // Per-op error returns from BeforeModify drop just the offending op; other
 // ops in the same RecordChange still apply. BeforeCreate / BeforeDelete are
@@ -109,6 +179,32 @@ type Handler interface {
 	BeforeDelete(ctx *ChangeCtx, rec *RecordChange, sink *Sink) error
 }
 
+// ObjectStamper is an optional interface for the handler of a SHARED
+// dataset (row id = ObjectId, see SharedCollections). StampObject runs
+// once per applied synced change on any OTHER dataset of the same
+// object — inside the apply tx, after the change's records landed, and
+// only when the change wrote something: a record materialized, an op
+// applied, or a tombstone was written (a fully rejected change stamps
+// nothing, matching the handler's own BeforeModify gate). Ops queued
+// on sink via Derive/DeriveOnce are applied to the object's row in the
+// stamper's dataset with the triggering change's VersionId, so the row
+// carries the "object changed" marks (modifiedAt / modifiedBy) that
+// per-dataset handlers cannot see. Strict: an absent or tombstoned row is left
+// untouched — creation stamps it through BeforeCreate. Sink.Project
+// is not honored here.
+//
+// SDK-internal: not part of the consumer handler API. A stamper on a
+// dataset that is not shared never runs.
+//
+// ctx carries the change only (Before is nil); the determinism
+// contract of Handler hooks applies — the output must not depend on
+// replica-local state. Op payloads must live on memory owned by the
+// call (a fresh arena): they are retained past the store write, into
+// the event dispatched to subscribers.
+type ObjectStamper interface {
+	StampObject(ctx *ChangeCtx, sink *Sink)
+}
+
 // HandlerReg binds a dataset name to its handler behavior and the
 // metadata the Controller needs: the handler Version (persisted in _meta
 // for re-index decisions; defaults to 1) and any indexes to ensure on the
@@ -120,6 +216,11 @@ type HandlerReg struct {
 	Version int
 	Handler Handler
 	Indexes []anystore.IndexInfo
+	// PruneIndexPrefix, when set, makes Indexes the whole set under
+	// that name prefix: opening the dataset's per-object collection
+	// drops any other index named under it. For a dataset whose indexes
+	// are declared at runtime and can be removed.
+	PruneIndexPrefix string
 	// Schema is the dataset's required, JSON-Schema-compatible field
 	// declaration. Each field carries a class (Scope: synced/derived/
 	// local/account) the apply path enforces: derived fields are
@@ -127,6 +228,20 @@ type HandlerReg struct {
 	// Dynamic rejects undeclared fields. Free-form datasets (shortIds,
 	// the per-type `objects` namespace) set Schema.Dynamic.
 	Schema schema.Dataset
+
+	// Keyed marks a dataset whose records from every object of a space
+	// live in one collection, supplied pre-opened through
+	// SharedCollections. A record is stored under the document id
+	// `<objectId>/<recordId>` and stamped with ObjectIdField; handlers
+	// keep seeing the record id the change carries.
+	Keyed bool
+
+	// SchemaRev is an opaque fingerprint of the registered schema for
+	// runtime-defined datasets. The store compares a resident
+	// controller's rev against the current catalog rev to detect stale
+	// registrations (a field added/removed after construction) and
+	// evict lazily. Empty for static registrations.
+	SchemaRev string
 
 	// DynamicScopeByKey marks a Dynamic dataset whose UNDECLARED field
 	// heads carry per-key scopes owned by the dataset's own layer (the
@@ -137,6 +252,26 @@ type HandlerReg struct {
 	// direction check is skipped for undeclared heads; DECLARED fields
 	// (e.g. the derived author/createdAt/spaceId) stay fully enforced.
 	DynamicScopeByKey bool
+
+	// ReadTracking opts the dataset into read/unread tracking; nil =
+	// untracked. See readtracking.go.
+	ReadTracking *ReadTracking
+
+	// DisableFilteredReplay opts the dataset out of the record-filtered
+	// history fast path (docs/version-history-proposal.md §4.2). The
+	// fast path is sound only while apply hooks stay record-local —
+	// a handler that reads OTHER records during apply must set this,
+	// forcing per-record history through the full-object slow path.
+	DisableFilteredReplay bool
+
+	// SkipHistory keeps this dataset out of the persistent history
+	// index (docs/version-history-proposal.md §4.4): no index rows are
+	// written and the dataset is invisible in history listings. For
+	// chatty machine-written datasets (presence-like state) whose
+	// permanent index would leak disk for history nobody asks for.
+	// DAG changes still retain everything — flipping the flag later
+	// just requires a backfill.
+	SkipHistory bool
 }
 
 // LocalPreValidator is an optional interface a Handler may implement
@@ -154,6 +289,21 @@ type HandlerReg struct {
 // object's single row, so one `before` suffices.
 type LocalPreValidator interface {
 	PreValidate(ch *Change, before *anyenc.Value) error
+}
+
+// RecordGetter resolves a record's CURRENT value by explicit id (nil
+// when absent or the id is empty). Handed to LocalPreValidatorMulti so
+// a batch validator can read per-record pre-state.
+type RecordGetter func(id string) *anyenc.Value
+
+// LocalPreValidatorMulti is the batch-friendly variant of
+// LocalPreValidator: instead of one pre-resolved `before`, the handler
+// receives a getter and resolves pre-state per record — required for
+// changes carrying N explicit-id records (e.g. recording N networkSigns
+// in one change). When a handler implements both interfaces the
+// Controller prefers this one.
+type LocalPreValidatorMulti interface {
+	PreValidateMulti(ch *Change, get RecordGetter) error
 }
 
 // DefaultHandler is a no-op handler accepting every op. Useful as a base

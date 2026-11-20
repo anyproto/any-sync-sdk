@@ -2,8 +2,8 @@ package subscribe
 
 import (
 	"github.com/anyproto/any-store/v2/anyenc"
-	"github.com/anyproto/any-store/v2/anyenc/anyencutil"
 
+	"github.com/anyproto/any-sync-sdk/internal/anyencx"
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
 	"github.com/anyproto/any-sync-sdk/internal/properties"
 	"github.com/anyproto/any-sync-sdk/space"
@@ -45,21 +45,29 @@ type Event struct {
 	Dataset   string
 	VersionId crdt.VersionId
 	Records   []EventRecord
+	// Source is the object the apply ran on, handed to a refill as is;
+	// nil for a notification.
+	Source any
 }
 
 // EventRecord is one record's worth of projected change inside an
-// Event. Id is the record id within Dataset (for shared per-space
-// datasets like "objects" this equals ObjectId).
+// Event; Records[i] projects the change's record i, the index a
+// PostValueFn takes. Id is the record id within Dataset (for shared
+// per-space datasets like "objects" this equals ObjectId); empty for a
+// record nothing landed on, which the engine skips.
 type EventRecord struct {
 	Id string
 	// Created is true when this change first materialised the record.
-	// The engine uses it (combined with sentinel/visibility state) to
-	// decide Added vs Updated emit semantics.
+	// The engine does not read it: a consumer tells a creation from an
+	// update by it.
 	Created bool
 	// Deleted is true when the change tombstoned this record. Ops is
 	// empty in that case; the engine drops the entry from its held
 	// set.
 	Deleted bool
+	// Unreadable: the post value could not be read when the event was
+	// built; Ops is empty.
+	Unreadable bool
 	// Ops is the projected $set / $unset operations on the post-apply
 	// record. Empty when Deleted is true. Surfaced verbatim to
 	// SubscriptionEvent SubRecord.Ops for atomic-update consumers.
@@ -70,19 +78,24 @@ type EventRecord struct {
 // change being built. Provided by the per-space layer (the
 // spaceobjects Store holds the controller). Index is into ch.Records.
 //
-// May return nil for tombstoned / dropped records (e.g. a gated op
-// that didn't land); callers should treat nil as "the record no
-// longer exists at this point in the timeline".
-type PostValueFn func(recordIndex int) *anyenc.Value
+// (nil, nil) is a record that no longer exists at this point in the
+// timeline: tombstoned, dropped, a gated op that didn't land. An
+// error is a row that could not be read, which is not the same as
+// absent: the engine re-reads the window from storage or closes the
+// subscription rather than treat the record as gone.
+type PostValueFn func(recordIndex int) (*anyenc.Value, error)
 
 // BuildEvent projects (ch, recordIds, derivedOps, postValue) into the
 // wire Event shape — runs the same per-record projection an engine
 // caller would need, with deep-cloned op payloads. afterApplyFor
 // builds this once per change before handing it to Engine.OnApply.
+// rejections are the apply's ApplyResult.Rejections: a record whose
+// delete the handler refused keeps its slot with an empty Id, since
+// nothing landed on it.
 //
 // Safe to call with a nil change — returns a zero Event in that case;
 // callers should check ch != nil themselves if they want to skip work.
-func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) Event {
+func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, rejections []crdt.OpRejection, postValue PostValueFn) Event {
 	if ch == nil {
 		return Event{}
 	}
@@ -91,7 +104,7 @@ func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, pos
 		ObjectId:  ch.ObjectId,
 		Dataset:   ch.Dataset,
 		VersionId: ch.VersionId,
-		Records:   projectRecords(ch, recordIds, derivedOps, postValue),
+		Records:   projectRecords(ch, recordIds, derivedOps, rejections, postValue),
 	}
 }
 
@@ -109,11 +122,12 @@ func BuildEvent(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, pos
 //
 // Op.Payload values are deep-cloned via anyencutil.Value.FillCopy so
 // the resulting Event is safe to outlive the build call.
-func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, postValue PostValueFn) []EventRecord {
+func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op, rejections []crdt.OpRejection, postValue PostValueFn) []EventRecord {
 	if len(ch.Records) == 0 {
 		return nil
 	}
 	out := make([]EventRecord, 0, len(ch.Records))
+	rejected := wholeRecordRejections(rejections)
 	for i, rc := range ch.Records {
 		rid := rc.Id
 		if i < len(recordIds) && recordIds[i] != "" {
@@ -121,13 +135,25 @@ func projectRecords(ch *crdt.Change, recordIds []string, derivedOps [][]crdt.Op,
 		}
 		er := EventRecord{Id: rid}
 		if hasRecordDelete(rc.Ops) {
+			if _, refused := rejected[i]; refused {
+				out = append(out, EventRecord{})
+				continue
+			}
 			er.Deleted = true
 			out = append(out, er)
 			continue
 		}
+		// A row that cannot be read projects no ops: a projection
+		// against no post value would turn $inc into $unset. The engine
+		// settles its subscriptions from storage.
 		var post *anyenc.Value
 		if postValue != nil {
-			post = postValue(i)
+			var err error
+			if post, err = postValue(i); err != nil {
+				er.Unreadable = true
+				out = append(out, er)
+				continue
+			}
 		}
 		for _, op := range rc.Ops {
 			projected, ok := projectOp(op, post)
@@ -171,6 +197,21 @@ func hasRecordDelete(ops []crdt.Op) bool {
 	return false
 }
 
+// wholeRecordRejections indexes the records the apply dropped whole
+// (OpIndex -1); for a delete, the handler refused it. Nil when none.
+func wholeRecordRejections(rejections []crdt.OpRejection) map[int]struct{} {
+	var out map[int]struct{}
+	for _, rj := range rejections {
+		if rj.OpIndex == -1 {
+			if out == nil {
+				out = make(map[int]struct{}, len(rejections))
+			}
+			out[rj.RecordIndex] = struct{}{}
+		}
+	}
+	return out
+}
+
 // isCreationMarker reports whether op is the synthetic _ver.id stamp
 // the apply path emits exactly once — on the change that first
 // materialises a record (recordModifier.Modify, the `creating`
@@ -201,7 +242,7 @@ func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 		return space.EventOp{
 			Type:    op.Type,
 			Path:    clonePath(op.Path),
-			Payload: clonePayload(op.Payload),
+			Payload: anyencx.Clone(op.Payload),
 		}, true
 	default:
 		// $inc / $addToSet / $pull / $incGated — derive the post-apply
@@ -218,7 +259,7 @@ func projectOp(op crdt.Op, post *anyenc.Value) (space.EventOp, bool) {
 		return space.EventOp{
 			Type:    crdt.OpSet,
 			Path:    path,
-			Payload: clonePayload(val),
+			Payload: anyencx.Clone(val),
 		}, true
 	}
 }
@@ -245,16 +286,4 @@ func lookupPath(v *anyenc.Value, path []string) *anyenc.Value {
 		return v
 	}
 	return v.Get(path...)
-}
-
-// clonePayload deep-copies an anyenc value off its current arena onto
-// a fresh parser-owned arena. Mirrors crdt.cloneValue; we duplicate
-// here to keep this package free of crdt-internal helpers. nil-safe.
-func clonePayload(v *anyenc.Value) *anyenc.Value {
-	if v == nil {
-		return nil
-	}
-	var w anyencutil.Value
-	w.FillCopy(v)
-	return w.Value
 }

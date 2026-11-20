@@ -1,7 +1,6 @@
 package spaceimpl
 
 import (
-	"context"
 	"sync"
 )
 
@@ -86,13 +85,12 @@ func (r *watcherRegistry) stopForSpace(spaceId string) {
 	}
 }
 
-// kickProfiles asks every registered members watcher to refetch
-// identityRepo profiles immediately rather than waiting for the
-// next slow tick. Used after Account.UpdateMetadata so the caller's
+// kickProfiles queues an identityRepo refetch on every registered
+// members watcher rather than waiting for the next slow tick. Used after Account.UpdateMetadata so the caller's
 // own profile change is visible across loaded spaces without a
 // 60-second delay. Watchers that don't track profiles (e.g. the
 // spaceIndex watcher) are skipped via the type assertion.
-func (r *watcherRegistry) kickProfiles(ctx context.Context) {
+func (r *watcherRegistry) kickProfiles() {
 	r.mu.Lock()
 	ws := make([]*memberWatcher, 0, len(r.wm))
 	for w := range r.wm {
@@ -102,6 +100,6 @@ func (r *watcherRegistry) kickProfiles(ctx context.Context) {
 	}
 	r.mu.Unlock()
 	for _, w := range ws {
-		go w.fetchProfilesOnce(ctx)
+		w.requestProfiles(nil)
 	}
 }

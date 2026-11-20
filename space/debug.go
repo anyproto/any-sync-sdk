@@ -13,7 +13,7 @@ import (
 // Two reads:
 //
 //   - Object(id) — per-object snapshot (tree structure + sync state
-//     + local CRDT state). Triggers cold-restore on first touch of
+//   - local CRDT state). Triggers cold-restore on first touch of
 //     an object; not a hot path.
 //   - Space()    — per-peer headsync counters from the last
 //     diffsyncer round (in-memory, lost on restart).

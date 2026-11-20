@@ -38,11 +38,13 @@ organization, a team or a workspace builds that on this primitive.
 |---|---|
 | Create a child | A Writer, an Admin or the Owner of the parent |
 | Add a member to a child | The child's Admins and Owner; only members of the parent can be added |
+| Give outsiders read-only access to a child | The child's Owner, with a guest key |
 | Read or write a child's data | Members of the child |
 | List a parent's children | The parent's Admins and Owner |
 | Remove a member of a child | The child's Admins and Owner; the parent's Admins and Owner, without the child's read key |
 | Change a child's owner | The child's Owner; the parent's Owner |
 | Delete a child | The child's Owner; the parent's Owner |
+| Delete a parent | The parent's Owner, once it has no children |
 
 Membership in the parent gives no access to its children. The parent's
 Owner and Admins govern a child but read it only when they are members of
@@ -95,8 +97,11 @@ they are.
 4. The creator pushes the child with the receipt.
 
 Steps 1 and 2 work offline. The child exists on the network only after the
-push. A child the coordinator refuses stays a local space, and a creator
-who loses the role before the first push is refused.
+push. A creator who loses the role before the first push is refused.
+
+A child the coordinator refuses is kept as a local space with a status
+that names the failed check. The client can retry the push or remove the
+space, and decides what to offer the user for each reason.
 
 The creation role is fixed. A parent has no setting for it.
 
@@ -114,6 +119,10 @@ A child's own Admins and Owner manage its members, mainly by direct-add
 Only members of the parent can be added to a child. The coordinator checks
 this on every admission path: accepted join requests, direct-add batches
 and invite joins.
+
+The exception is a guest key. A child's Owner can create one, and its
+guest identity gives read-only access to holders who are not members of
+the parent.
 
 ## The list of children
 
@@ -161,6 +170,11 @@ The parent's Owner can delete a child without access to its data. The
 coordinator accepts the parent's current owner in place of the child's
 owner.
 
+## Deleting a parent
+
+A parent that still has children cannot be deleted: the coordinator
+refuses the deletion. The parent's Owner deletes the children first.
+
 ## SDK surface
 
 The SDK exposes:
@@ -170,7 +184,8 @@ The SDK exposes:
 - removing a member of a child as an Admin or the Owner of the parent;
 - changing a child's owner as the parent's Owner;
 - deleting a child as the parent's Owner;
-- the "rotation pending" state of a space.
+- the "rotation pending" state of a space;
+- the status of a refused child, with retry and removal.
 
 `SpaceInfo` carries the parent id.
 
@@ -187,11 +202,12 @@ is the client's work.
 ## Outside V1
 
 - **External members.** Paid seats that admit accounts which are not
-  members of the parent.
+  members of the parent. In V1 an outsider gets read-only access through
+  a guest key.
 - **A configurable creation role.** The parent's ACL options can hold it;
   a ceiling set by a network or a license belongs on the coordinator.
-- **Deleting a parent.** Its children are meant to be deleted with it. V1
-  does not handle a parent that is deleted while it has children.
+- **Deleting a parent together with its children.** In V1 the children
+  are deleted first.
 - **More than one level** of nesting.
 
 ## Open questions

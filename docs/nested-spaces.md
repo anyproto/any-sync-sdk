@@ -107,9 +107,11 @@ The creation role is fixed. A parent has no setting for it.
 
 ## Billing
 
-A child counts against the shared-spaces limit of the legalOwner, not of
-its creator. The limit is one number, counted across the children of every
-parent the same account owns. There is no cap per member or per parent.
+A child counts against the legalOwner's limit on child spaces, not against
+its creator. This limit is separate from the shared-spaces limit: a child
+uses nobody's shared-spaces limit. It is one number per account, counted
+across the children of every parent that account owns. There is no cap per
+member or per parent.
 
 ## Membership
 
@@ -225,6 +227,6 @@ is the client's work.
      Owner of the parent.
 2. **Limits.** Whether a child's member limits and file storage are charged
    to the legalOwner, as the number of children is.
-3. **Protocol version.** Child spaces are expected to need a new any-sync
-   protocol version, which clients on older versions do not open. The
-   version and the point where an old client is refused are not chosen.
+3. **Old clients.** The any-sync change that adds child spaces raises the
+   any-sync protocol version. Where a client on an older version is
+   refused for a child space is not chosen.

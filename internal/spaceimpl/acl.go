@@ -132,6 +132,10 @@ func isLogNotReady(err error) bool {
 // the first tick fires immediately, but peer connections may not be
 // established yet, so the first attempt is best-effort).
 //
+// Only the space's Owner makes the call: the coordinator refuses it
+// from any other account, and an account that is not the Owner acts in
+// a space that is shared already, or it would not be a member of it.
+//
 // Idempotent on the coordinator — calling it many times is cheap.
 //
 // Total retry window ≈ 35s — long enough to clear the worst case of
@@ -141,6 +145,9 @@ func ensureShareable(ctx context.Context, s *spaceImpl) error {
 		maxAttempts = 35
 		backoff     = time.Second
 	)
+	if !s.localIdentityIsOwner(ctx) {
+		return nil
+	}
 	coord := s.app.Coordinator()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {

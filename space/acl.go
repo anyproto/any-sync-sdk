@@ -39,8 +39,10 @@ var (
 	ErrInviteNotFound = list.ErrNoSuchInvite
 
 	// ErrCoordinatorForbidden is the coordinator refusing an operation
-	// for this account. CreateInvite, CreateGuestKey and AddAccounts
-	// return it from make-shareable, which is owner-only.
+	// for this account. The Owner's CreateInvite, CreateGuestKey and
+	// AddAccounts first make the space shareable, which only the Owner
+	// may do: they return it when the coordinator holds another account
+	// as the owner. An Admin's calls skip that step.
 	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
 
 	// ErrCoordinatorLimitReached is the coordinator refusing an

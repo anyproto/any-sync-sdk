@@ -49,6 +49,8 @@ type signFixture struct {
 	// answer is written to it, as the space service does. nil: the
 	// spaces have no row.
 	rows map[string]space.Refusal
+	// deleted holds the spaces whose row reads deleted.
+	deleted map[string]bool
 }
 
 func newSignFixture() *signFixture {
@@ -63,9 +65,9 @@ func newSignFixture() *signFixture {
 		}
 	}
 	f.onChildSign.Store(&onAnswer)
-	recorded := func(spaceId string) (space.Refusal, bool) {
+	recorded := func(spaceId string) (space.Refusal, bool, bool) {
 		refusal, ok := f.rows[spaceId]
-		return refusal, ok
+		return refusal, f.deleted[spaceId], ok
 	}
 	f.recorded.Store(&recorded)
 	return f
@@ -315,6 +317,43 @@ func TestCredentialProvider_ClearedRefusalDropsTheWait(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 2, f.coord.calls)
 	assert.Empty(t, f.refused)
+}
+
+// A child whose row reads deleted is not asked for, on a push or on
+// request: another device of the account deleted it while this one
+// still holds it. Signed, it would be pushed and listed again.
+func TestCredentialProvider_DeletedChildIsNotAskedFor(t *testing.T) {
+	ctx := context.Background()
+	f := newSignFixture()
+	f.rows = map[string]space.Refusal{}
+	refused := testSpaceHeader(t, "parent.1")
+	f.coord.err = coordinatorproto.ErrParentPermissionDenied
+	_, err := f.GetCredential(ctx, refused)
+	require.ErrorIs(t, err, coordinatorproto.ErrParentPermissionDenied)
+	require.Equal(t, 1, f.coord.calls)
+
+	// The row is deleted, the cause of the refusal goes and the wait
+	// ends: the coordinator would sign.
+	f.deleted = map[string]bool{refused.Id: true}
+	f.coord.err = nil
+	f.clock = f.clock.Add(signRetryMax)
+	for _, now := range []bool{false, true} {
+		_, err = f.sign(ctx, refused, now)
+		require.ErrorIs(t, err, space.ErrSpaceDeleted)
+	}
+
+	// The same for a child that was never asked for, after a restart
+	// too.
+	fresh := testSpaceHeader(t, "parent.1")
+	f.rows[fresh.Id] = space.RefusalNone
+	f.deleted[fresh.Id] = true
+	f.restart()
+	for _, child := range []*spacesyncproto.RawSpaceHeaderWithId{refused, fresh} {
+		_, err = f.GetCredential(ctx, child)
+		require.ErrorIs(t, err, space.ErrSpaceDeleted)
+	}
+	assert.Equal(t, 1, f.coord.calls, "the coordinator is not asked")
+	assert.Len(t, f.answers, 1, "and nothing is recorded")
 }
 
 // A child of a parent the account owns and this device stores is not

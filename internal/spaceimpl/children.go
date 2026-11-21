@@ -81,11 +81,11 @@ func (s *Service) childSignAnswered(ctx context.Context, spaceId string, refusal
 	s.setRefusal(context.WithoutCancel(ctx), spaceId, refusal)
 }
 
-// recordedRefusal reads the refusal the index holds for spaceId; ok is
-// false when it has no row.
-func (s *Service) recordedRefusal(spaceId string) (space.Refusal, bool) {
+// recordedRow reads what the index holds for spaceId: its refusal, and
+// whether the row reads deleted; ok is false when it has no row.
+func (s *Service) recordedRow(spaceId string) (refusal space.Refusal, deleted, ok bool) {
 	rec, ok := s.tsp.Get(context.Background(), spaceId)
-	return rec.Refusal, ok
+	return rec.Refusal, ok && rec.IsDeleted(), ok
 }
 
 // setRefusal writes refusal on spaceId's row when it differs.

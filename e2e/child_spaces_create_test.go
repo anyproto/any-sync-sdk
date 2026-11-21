@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -149,6 +150,75 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 		return si.Refusal == space.RefusalNone
 	})
 	waitNote(t, ctx, ownerB.name, ownerB.get(t, ctx, over.Id()), overNote, "written while refused")
+}
+
+// childSpacesRefusedChildDeletedElsewhere: a refused child that another
+// device of its creator deletes stays deleted. The device that created
+// it still holds it, and asks for it no more: once the cause of the
+// refusal is gone the child is not signed, and never listed under the
+// parent.
+func childSpacesRefusedChildDeletedElsewhere(t *testing.T, net *childNet) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
+	defer cancel()
+
+	owner := net.account(t, ctx, "owner")
+	creator := net.account(t, ctx, "creator's first device")
+	parent := owner.create(t, ctx, "Parent")
+	addMembers(t, ctx, parent, grant{creator, space.PermissionReader})
+
+	child := creator.createChild(t, ctx, parent.Id(), "Reader's child")
+	refused := creator.waitRow(t, ctx, child.Id(), "the reader's child is refused", func(si space.SpaceInfo) bool {
+		return si.Refusal != space.RefusalNone
+	})
+	refusedAt := time.Now()
+	require.Equal(t, space.RefusalParentPermissionDenied, refused.Refusal)
+
+	other := net.device(t, ctx, creator, "creator's second device")
+	other.waitRow(t, ctx, child.Id(), "the refusal reaches the second device", func(si space.SpaceInfo) bool {
+		return si.Refusal == space.RefusalParentPermissionDenied
+	})
+	require.NoError(t, other.spaces().Delete(ctx, child.Id()), "the second device deletes the child")
+	creator.waitRow(t, ctx, child.Id(), "the delete reaches the first device", func(si space.SpaceInfo) bool {
+		return si.Status == space.StatusDeleted
+	})
+
+	// The cause of the refusal goes: the creator becomes a Writer, and
+	// the coordinator signs a child it creates now.
+	require.NoError(t, parent.ACL().ChangePermissions(ctx, []space.PermissionChange{
+		{Identity: creator.id(), Permission: space.PermissionWriter},
+	}), "the owner promotes the creator")
+	control := creator.createChild(t, ctx, parent.Id(), "Writer's child")
+	require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
+		return creator.spaces().RetryPush(ctx, control.Id()) == nil
+	}), "the coordinator signs a child of the promoted creator")
+	promotedAt := time.Now()
+
+	// A device asks again for a refused child on a head-sync round
+	// (every 30 s) once a wait is over: a minute after the refusal, then
+	// two more after a second one. The first ask the promotion could
+	// meet comes a minute and a round after the refusal, or, when the
+	// second refusal fell before the promotion, three minutes and two
+	// rounds after it.
+	const round = 30 * time.Second
+	ask := refusedAt.Add(time.Minute + round)
+	if promotedAt.After(refusedAt.Add(time.Minute - 5*time.Second)) {
+		ask = refusedAt.Add(3*time.Minute + 2*round)
+	}
+	for time.Now().Before(ask.Add(15 * time.Second)) {
+		require.NotContains(t, children(t, ctx, owner, parent.Id()), child.Id(), "the deleted child is not signed")
+		select {
+		case <-time.After(2 * time.Second):
+		case <-ctx.Done():
+			t.Fatal(ctx.Err())
+		}
+	}
+	err := net.coordinatorCall(ctx, creator, func(cl coordinatorproto.DRPCCoordinatorClient) error {
+		_, err := cl.SpaceStatusCheck(ctx, &coordinatorproto.SpaceStatusCheckRequest{SpaceId: child.Id()})
+		return err
+	})
+	assert.ErrorIs(t, err, coordinatorproto.ErrSpaceNotExists, "the coordinator holds no record of the deleted child")
+	row, _ := creator.row(ctx, child.Id())
+	assert.Equal(t, space.StatusDeleted, row.Status, "the child stays deleted on the first device")
 }
 
 // childSpacesCreateOffline: a child created offline under a

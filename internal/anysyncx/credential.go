@@ -41,6 +41,10 @@ const (
 // A parent the account owns reaches the network when one of its devices
 // pushes it, so a child of such a parent is not asked for before a tree
 // node answered a head-sync round of the parent.
+//
+// A child whose row reads deleted gets no receipt: signed, it would be
+// pushed and listed under its parent again. Another device of the
+// account can delete a child this device still holds.
 type credentialProvider struct {
 	coordClient coordinatorclient.CoordinatorClient
 	localOnly   *localOnlySpaces
@@ -49,11 +53,11 @@ type credentialProvider struct {
 	// to sign a child space: the check the child failed, RefusalNone
 	// when it was signed.
 	onChildSign atomic.Pointer[func(ctx context.Context, spaceId string, refusal space.Refusal)]
-	// recorded reads the refusal the index holds for a child space; ok
-	// is false for a space with no row. The row is shared by the
-	// account's devices and outlives the process; the waits below are
-	// this process's own.
-	recorded atomic.Pointer[func(spaceId string) (refusal space.Refusal, ok bool)]
+	// recorded reads the row the index holds for a child space: its
+	// refusal, and whether it reads deleted; ok is false for a space
+	// with no row. The row is shared by the account's devices and
+	// outlives the process; the waits below are this process's own.
+	recorded atomic.Pointer[func(spaceId string) (refusal space.Refusal, deleted, ok bool)]
 
 	// ownStored reports a space this device stores and the account
 	// owns: one the network holds only once a device of the account
@@ -112,12 +116,25 @@ func (c *credentialProvider) sign(ctx context.Context, header *spacesyncproto.Ra
 	}
 	hdr := DecodeSpaceHeader(header.RawHeader)
 	child := hdr != nil && hdr.ParentSpaceId != ""
+	var (
+		recorded space.Refusal
+		known    bool
+	)
+	if child {
+		var deleted bool
+		if fn := c.recorded.Load(); fn != nil {
+			recorded, deleted, known = (*fn)(header.Id)
+		}
+		if deleted {
+			return nil, fmt.Errorf("anysyncx: space %s: %w", header.Id, space.ErrSpaceDeleted)
+		}
+	}
 	if child && c.awaitsParent(header.Id, hdr.ParentSpaceId) {
 		return nil, fmt.Errorf("anysyncx: space %s: the network does not hold its parent %s yet: %w",
 			header.Id, hdr.ParentSpaceId, coordinatorproto.ErrParentSpaceNotAvailable)
 	}
 	if child && !now {
-		if err := c.waiting(header.Id); err != nil {
+		if err := c.waiting(header.Id, recorded, known); err != nil {
 			return nil, err
 		}
 	}
@@ -186,19 +203,13 @@ func (c *credentialProvider) networkHolds(spaceId string) {
 }
 
 // waiting returns the refusal to fail a push of the child spaceId with
-// instead of asking the coordinator, nil to ask. A refusal the index no
-// longer holds is over, and its wait with it. A child the index holds
-// as refused for a parent that cannot be one is asked about only on
-// request. Any other refusal is asked about again once its wait is
+// instead of asking the coordinator, nil to ask. recorded is the
+// refusal on its row, known false when it has none. A refusal the index
+// no longer holds is over, and its wait with it. A child the index
+// holds as refused for a parent that cannot be one is asked about only
+// on request. Any other refusal is asked about again once its wait is
 // over; a restart starts with no wait.
-func (c *credentialProvider) waiting(spaceId string) error {
-	var (
-		recorded space.Refusal
-		known    bool
-	)
-	if fn := c.recorded.Load(); fn != nil {
-		recorded, known = (*fn)(spaceId)
-	}
+func (c *credentialProvider) waiting(spaceId string, recorded space.Refusal, known bool) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if known {
@@ -266,12 +277,12 @@ func refusalOf(err error) space.Refusal {
 
 // OnChildSign registers fn for each answer of the coordinator to a
 // request to sign a child space: the check the child failed,
-// RefusalNone when it was signed. recorded reads the refusal the index
-// holds for a space, ok false when it has no row. Both run on the push
-// path.
+// RefusalNone when it was signed. recorded reads the row the index
+// holds for a space: its refusal and whether it reads deleted, ok false
+// when it has no row. Both run on the push path.
 func (a *App) OnChildSign(
 	fn func(ctx context.Context, spaceId string, refusal space.Refusal),
-	recorded func(spaceId string) (refusal space.Refusal, ok bool),
+	recorded func(spaceId string) (refusal space.Refusal, deleted, ok bool),
 ) {
 	a.cred.onChildSign.Store(&fn)
 	a.cred.recorded.Store(&recorded)

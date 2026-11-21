@@ -295,7 +295,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
-	app.OnChildSign(s.childSignAnswered, s.recordedRefusal)
+	app.OnChildSign(s.childSignAnswered, s.recordedRow)
 	app.SetOwnStoredFn(s.ownsStored)
 	app.OnNodeRound(s.nodeRound)
 	s.startJoinController()

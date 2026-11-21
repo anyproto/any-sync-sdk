@@ -1309,6 +1309,44 @@ func TestSDK_ChildSpace_RefusalOnADeviceWithoutTheSpace(t *testing.T) {
 	assert.False(t, sdk.app.SpaceExists(childId), "and nothing is pulled")
 }
 
+// Another device of the account deletes a refused child that this one
+// holds: the row reads deleted and the copy stays until the next start.
+// The device asks for the child no more, also once the coordinator
+// would sign it.
+func TestSDK_ChildSpace_DeletedOnAnotherDeviceIsNotAskedFor(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	require.NoError(t, spaces.Track(ctx, foreignSpaceA))
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: foreignSpaceA})
+	require.NoError(t, err)
+	childId := child.Id()
+	coord.set(func() { coord.sign = func() error { return coordinatorproto.ErrParentPermissionDenied } })
+	require.ErrorIs(t, spaces.RetryPush(ctx, childId), space.ErrParentPermissionDenied)
+	require.Equal(t, space.RefusalParentPermissionDenied, child.Info().Refusal)
+
+	// The other device's delete arrives as the tombstone on the synced
+	// row.
+	_, err = sdk.tsp.SetRemoteStatus(ctx, childId, techspace.StatusDeleted)
+	require.NoError(t, err)
+	require.True(t, sdk.app.SpaceExists(childId), "this device still holds the child")
+
+	coord.set(func() {
+		coord.signs = 0
+		coord.sign = func() error { return nil }
+	})
+	require.ErrorIs(t, sdk.app.SignSpace(ctx, childId), space.ErrSpaceDeleted)
+	require.ErrorIs(t, spaces.RetryPush(ctx, childId), space.ErrSpaceDeleted)
+	coord.set(func() { assert.Zero(t, coord.signs, "the coordinator is not asked") })
+	rec, ok := sdk.tsp.Get(ctx, childId)
+	require.True(t, ok)
+	assert.Equal(t, space.RefusalParentPermissionDenied, rec.Refusal, "and nothing is recorded as signed")
+}
+
 // A parent and its child created with no network reach it together.
 // The child is not asked for before the network holds the parent, so
 // the coordinator's "parent not available" is never an answer nobody

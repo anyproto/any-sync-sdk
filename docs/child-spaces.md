@@ -105,7 +105,13 @@ err := sdk.Spaces().RetryPush(ctx, childId)
 | `ErrNotChildSpace` | The space has no parent. |
 | `ErrSpaceNotStored` | This device has no copy of the space. A device that holds it retries the push. |
 
-A refused child that is no longer wanted is removed with `Delete`.
+A refused child that is no longer wanted is removed with `Delete`, on
+any device of the account. A device asks for the child no more once its
+own row reads deleted, also when it still holds a copy, whatever becomes
+of the cause of the refusal. A sign already sent when the deletion lands
+completes, and a device the deletion has not reached yet still asks: a
+child signed that way is deleted on the network by the deletion
+reconciler.
 
 The child spaces limit belongs to the account that owns the parent and
 counts the children of all the spaces it owns. That account reads its own

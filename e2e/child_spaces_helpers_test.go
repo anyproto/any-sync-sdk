@@ -43,6 +43,7 @@ func TestE2E_ChildSpaces(t *testing.T) {
 		run  func(*testing.T, *childNet)
 	}{
 		{"CreateAndLimit", childSpacesCreateAndLimit},
+		{"RefusedChildDeletedElsewhere", childSpacesRefusedChildDeletedElsewhere},
 		{"CreateOffline", childSpacesCreateOffline},
 		{"SharedSpacesLimitUntouched", childSpacesSharedSpacesLimitUntouched},
 		{"Membership", childSpacesMembership},

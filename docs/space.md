@@ -105,7 +105,9 @@ type AclSpaceClient interface {
   `DeclineRequest`, `CancelJoinRequest`), membership (`AddAccounts`,
   `RemoveAccounts`, `ChangePermissions`, `OwnershipChange`,
   `RequestSelfRemove`, `StopSharing`) and guest access
-  (`CreateGuestKey`, `RevokeGuestKey`).
+  (`CreateGuestKey`, `RevokeGuestKey`). `RotationPending` reads the
+  state a removal without a read key change leaves
+  (docs/child-spaces.md).
 - **Invite format.** SDK-defined: one base58 token carrying the space
   id, the invite private key minted by any-sync's `BuildInvite`, and the
   kind (member request-to-join, or guest). Not compatible with
@@ -259,6 +261,11 @@ removed: it stays in `List` with `StatusDeleted`. A coordinator
 push and never purges a registered record, so `NotExists` means the space
 was never registered (its first push has not landed, it was deleted
 before it could push, or the push was refused) and the row is left alone.
+
+**Child spaces.** A space can be created under a parent space
+(`CreateChild`). Creation, a child the coordinator refuses, the calls of
+the parent's Admins and Owner and the deletion of a parent are in
+docs/child-spaces.md.
 
 **1-1 and guest spaces** delete locally only. `Delete` writes a synced,
 non-terminal marker (`oneToOneDeleted` / `guestDeleted`) and offloads;

@@ -681,8 +681,8 @@ func (s *SDK) bootstrap(ctx context.Context) {
 		warn("reconcile deletions", spacesync.ReconcileDeletions(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id),
 			zap.String("spaceId", rec.Id))
 		// A child space can wait for this device to change its read
-		// key. The watcher that does it starts here for a child, not at
-		// its first Get.
+		// key (docs/child-spaces.md § Rotation pending). The watcher
+		// that does it starts here for a child, not at its first Get.
 		if rec.ParentSpaceId != "" {
 			s.spaces.StartAclMirror(ctx, rec.Id)
 		}

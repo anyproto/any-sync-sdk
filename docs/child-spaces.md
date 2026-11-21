@@ -204,7 +204,9 @@ No call ends it. A device writes the read key change by itself when its
 account is an Admin or the Owner of the child and the device holds the
 child with its read key:
 
-- when the SDK starts, for every child the device holds, with no `Get`;
+- when the SDK starts, with no `Get`: for a child the device holds whose
+  row names the parent and whose load at start succeeds. A headless SDK
+  loads no space at start, and rotates from the first `Get` of the child;
 - while it runs, when the removal reaches a child that is loaded: one
   the SDK loaded at start or the application opened since;
 - with the network reachable; a change that could not be published is
@@ -276,7 +278,8 @@ anything:
 - the coordinator in reach: the signed delete is sent on the call path.
   `ErrSpaceHasChildren` while `Children` still lists a child, the ones
   the account is not a member of and the ones in deletion included.
-  Nothing changed, and the call is made again later.
+  Nothing is written then, and nothing repeats the call: the application
+  calls `Delete` again once `Children` lists none.
 
 With no coordinator in reach `Delete` stays offline-first: the space
 leaves the account at once and the network delete is sent later. When the

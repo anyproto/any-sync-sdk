@@ -739,3 +739,38 @@ func TestSpaceIndexHandler_DerivedRefusesDeletedStatus(t *testing.T) {
 	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
 	assert.Equal(t, techspace.StatusArchived, rec.RemoteStatus)
 }
+
+// The parent id is written with the row by the creating device, filled
+// once on a joined row, and pinned from then on.
+func TestSpaceIndexHandler_ParentSpaceIdSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+	ctx := context.Background()
+
+	created := techspace.SpaceIndexRecord{Id: "child-created", Type: "any.space", ParentSpaceId: "parent-a"}
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v1", created.Id, true,
+		crdt.Op{Type: crdt.OpSet, Payload: created.EncodeCreate(arena)})))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, created.Id))
+	assert.Equal(t, "parent-a", rec.ParentSpaceId)
+
+	const joined = "child-joined"
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v2", joined, true,
+		setMulti(arena, map[string]string{techspace.FieldRemoteStatus: techspace.StatusActive}))))
+	assert.Empty(t, techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, joined)).ParentSpaceId)
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v3", joined, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldParentSpaceId}, Payload: arena.NewString("parent-a")})))
+
+	for i, id := range []string{created.Id, joined} {
+		res, err := ctrl.ApplyChangeWithResult(ctx, makeChange(crdt.VersionId("v4"+string(rune('a'+i))), id, false,
+			crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldParentSpaceId}, Payload: arena.NewString("parent-b")}))
+		require.NoError(t, err)
+		require.Len(t, res.Rejections, 1)
+		assert.ErrorIs(t, res.Rejections[0].Err, techspace.ErrParentImmutable)
+		rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, id))
+		assert.Equal(t, "parent-a", rec.ParentSpaceId)
+	}
+
+	// A top-level row carries no parent field at all.
+	top := techspace.SpaceIndexRecord{Id: "top", Type: "any.space"}.EncodeCreate(arena)
+	assert.Nil(t, top.Get(techspace.FieldParentSpaceId))
+}

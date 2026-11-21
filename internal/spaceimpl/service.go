@@ -1005,26 +1005,34 @@ func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error)
 	// owner can write the initial spaceIndex properties, and non-
 	// owners skip silently (the owner's eventual write propagates).
 	s.goSeed(sp)
-	s.backfillHeaderType(ctx, spaceId)
+	s.backfillHeader(ctx, spaceId)
 	return sp, nil
 }
 
-// backfillHeaderType fills the set-once tech-space row `type` from the
-// now-loaded space's on-wire header. Rows registered on join/track are
-// created before the header is readable and carry an empty type until
-// the first successful load lands here. Best-effort: a miss retries on
-// the next load, and the handler's set-once rule absorbs races.
-func (s *Service) backfillHeaderType(ctx context.Context, spaceId string) {
+// backfillHeader fills the set-once tech-space row fields that come
+// from the now-loaded space's header: `type` and, for a child space,
+// `parentSpaceId`. Rows registered on join/track are created before the
+// header is readable and carry neither until the first successful load
+// lands here. Best-effort: a miss retries on the next load, and the
+// handler's set-once rule absorbs races.
+func (s *Service) backfillHeader(ctx context.Context, spaceId string) {
 	rec, ok := s.tsp.Get(ctx, spaceId)
 	if !ok || rec.Type != "" {
 		return
 	}
-	ht := s.headerTypeFromHeader(ctx, spaceId)
-	if ht == "" {
+	hdr := s.residentHeader(ctx, spaceId)
+	if hdr == nil || hdr.SpaceType == "" {
 		return
 	}
+	// The parent id goes first: a row with a type is not read again, so
+	// a pass cut short after it retries both on the next load.
+	if hdr.ParentSpaceId != "" && rec.ParentSpaceId == "" {
+		if _, err := s.tsp.SetParentSpaceId(ctx, spaceId, hdr.ParentSpaceId); err != nil {
+			return
+		}
+	}
 	// Failure just leaves the row unknown; the next load retries.
-	_, _ = s.tsp.SetType(ctx, spaceId, ht)
+	_, _ = s.tsp.SetType(ctx, spaceId, hdr.SpaceType)
 }
 
 // SyncSpaceList forces an immediate head-sync round on the tech space
@@ -1103,25 +1111,29 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	}
 	// An empty row type (joined/tracked space not yet loaded on any
 	// device) falls back to the header when the space happens to be
-	// resident; the durable backfill happens in load.
-	typ := r.Type
+	// resident, and so does the parent id; the durable backfill happens
+	// in load.
+	typ, parentSpaceId := r.Type, r.ParentSpaceId
 	if typ == "" {
-		typ = s.headerTypeFromHeader(peekCtx, r.Id)
+		if hdr := s.residentHeader(peekCtx, r.Id); hdr != nil {
+			typ, parentSpaceId = hdr.SpaceType, hdr.ParentSpaceId
+		}
 	}
 	info := space.SpaceInfo{
-		Id:           r.Id,
-		Type:         typ,
-		SpaceType:    s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
-		Author:       author,
-		Name:         r.Name,
-		Description:  r.Description,
-		IconCID:      r.IconCID,
-		Status:       mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
-		OwnRole:      r.OwnRole,
-		Settings:     r.Settings,
-		PushKeys:     r.PushKeys,
-		Derived:      r.Derived,
-		P2PAdvertise: r.P2PAdvertise,
+		Id:            r.Id,
+		Type:          typ,
+		SpaceType:     s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
+		Author:        author,
+		Name:          r.Name,
+		Description:   r.Description,
+		IconCID:       r.IconCID,
+		Status:        mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		OwnRole:       r.OwnRole,
+		Settings:      r.Settings,
+		PushKeys:      r.PushKeys,
+		Derived:       r.Derived,
+		P2PAdvertise:  r.P2PAdvertise,
+		ParentSpaceId: parentSpaceId,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

@@ -102,6 +102,11 @@ type SpaceIndexRecord struct {
 	// tracked / 1-1 rows.
 	Derived bool
 
+	// ParentSpaceId is the parent of a child space (FieldParentSpaceId,
+	// synced, set-once), as the space header names it. Empty on a
+	// top-level space, and on a joined row until its first load.
+	ParentSpaceId string
+
 	// P2PAdvertise is the per-space p2p advertising switch
 	// (FieldP2PAdvertise, synced): true (the default, absent field
 	// included) publishes this account's devices into the space's global
@@ -145,6 +150,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		OwnRole:             space.ParsePermission(v.GetString(FieldOwnRole)),
 		GuestKey:            v.GetString(FieldGuestKey),
 		Derived:             v.GetBool(FieldDerived),
+		ParentSpaceId:       v.GetString(FieldParentSpaceId),
 		P2PAdvertise:        v.Get(FieldP2PAdvertise) == nil || v.GetBool(FieldP2PAdvertise),
 		// The stamp is a TypeDateTime instant; rows written before that
 		// carried epoch seconds and read the old way until the re-index
@@ -235,6 +241,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.Derived {
 		obj.Set(FieldDerived, a.NewTrue())
+	}
+	if r.ParentSpaceId != "" {
+		obj.Set(FieldParentSpaceId, a.NewString(r.ParentSpaceId))
 	}
 	// CreatedAt is intentionally NOT written here — it's handler-derived
 	// (ScopeDerived; BeforeCreate stamps it from the change timestamp)

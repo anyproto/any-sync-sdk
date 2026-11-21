@@ -92,6 +92,10 @@ type SpaceInfo struct {
 	// the account's discovery record either way. Synced account-wide;
 	// written via Space.SetP2PAdvertise.
 	P2PAdvertise bool
+	// ParentSpaceId is the parent of a child space, as the space header
+	// names it; empty for a top-level space. A joined space carries it
+	// from its first load on.
+	ParentSpaceId string
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

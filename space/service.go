@@ -244,7 +244,9 @@ type Service interface {
 	// The list is read from the coordinator on every call and kept
 	// nowhere: ErrOffline when it cannot be reached. The account needs
 	// no row for the parent, and none is created for a child.
-	// ErrBadSpaceId for an id that is not a space id.
+	// ErrBadSpaceId for an id that is not a space id. A parent that is
+	// not on the network yet reads ErrSpaceUnknown, then
+	// ErrParentSpaceNotAvailable until its ACL is there.
 	Children(ctx context.Context, parentSpaceId string) ([]ChildSpace, error)
 
 	// ChildMembers lists the accounts of the child space childSpaceId

@@ -608,6 +608,20 @@ func TestSDK_Children(t *testing.T) {
 	require.ErrorIs(t, err, space.ErrParentPermissionDenied)
 	require.NotErrorIs(t, err, space.ErrOffline)
 
+	// A parent that is not on the network yet: the coordinator does not
+	// know it, then knows it while its ACL has not arrived.
+	for _, tc := range []struct{ answer, want error }{
+		{coordinatorproto.ErrSpaceNotExists, space.ErrSpaceUnknown},
+		{coordinatorproto.ErrParentSpaceNotAvailable, space.ErrParentSpaceNotAvailable},
+	} {
+		coord.set(func() {
+			coord.children = func(string) ([]*coordinatorproto.SpaceChild, error) { return nil, tc.answer }
+		})
+		_, err = spaces.Children(ctx, foreignSpaceA)
+		require.ErrorIs(t, err, tc.want)
+		require.NotErrorIs(t, err, space.ErrOffline)
+	}
+
 	var asked string
 	coord.set(func() {
 		coord.children = func(spaceId string) ([]*coordinatorproto.SpaceChild, error) {

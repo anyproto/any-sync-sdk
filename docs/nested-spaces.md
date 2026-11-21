@@ -165,9 +165,11 @@ carries its parent id.
 This restricts the list, not the link: a child's header names its parent,
 and its id shares the parent's replication key.
 
-The parent's Admins and Owner can also read a child's accounts with their
-roles from the child's ACL. Names need the child's key and are not
-readable.
+With a child's id, the parent's Admins and Owner can read its accounts and
+their roles from the child's ACL. Names need the child's key and are not
+readable. The network serves the ACL of a space to any account that knows
+its id, so this read is not restricted by role: the list of children is
+what gives the ids.
 
 ## Removing a member without the read key
 

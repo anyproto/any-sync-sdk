@@ -12,7 +12,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_ChildSpaces_RemovalFromTheParent: the parent's Owner, who is
+// childSpacesRemovalFromTheParent: the parent's Owner, who is
 // no member of the child and never loads it, lists the children, reads
 // a child's members and removes one. The removal reaches the child's
 // devices, and the parent's side, as a pending rotation; a new device of
@@ -22,9 +22,7 @@ import (
 // nothing after it. A parent Admin removes the same way, and a device
 // of the child's Owner, started again, rotates with no call on it. A
 // parent Writer and an outsider are refused.
-func TestE2E_ChildSpaces_RemovalFromTheParent(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesRemovalFromTheParent(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
@@ -150,7 +148,7 @@ func TestE2E_ChildSpaces_RemovalFromTheParent(t *testing.T) {
 	assert.False(t, held, "the parent's owner never holds the child")
 }
 
-// TestE2E_ChildSpaces_OwnerAndDeletionFromTheParent: the parent's Owner
+// childSpacesOwnerAndDeletionFromTheParent: the parent's Owner
 // hands a child to another member of it, naming each role the previous
 // owner keeps; the new owner acts as the owner, and must be a member of
 // the parent. A parent Admin is refused both. The parent's Owner then
@@ -158,9 +156,7 @@ func TestE2E_ChildSpaces_RemovalFromTheParent(t *testing.T) {
 // that, and every member's device sees the child go. The parent-side
 // calls answer ErrSpaceUnknown for a child the network does not know and
 // ErrSpaceDeleted for the deleted one.
-func TestE2E_ChildSpaces_OwnerAndDeletionFromTheParent(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesOwnerAndDeletionFromTheParent(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 

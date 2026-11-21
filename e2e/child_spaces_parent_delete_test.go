@@ -16,17 +16,16 @@ import (
 // deletion final. The SDK asks for the deletion with no waiting period,
 // so the coordinator's next deletion pass makes it final: within its
 // pass interval, 20 seconds on the local networks. The tests wait for
-// the child to leave the coordinator's list instead of for a time.
+// the child to leave the coordinator's list instead of for a time; a
+// check that needs a pending deletion starts right after a pass.
 
-// TestE2E_ChildSpaces_DeleteParent: a parent with children is not
+// childSpacesDeleteParent: a parent with children is not
 // deleted. Delete returns ErrSpaceHasChildren and changes nothing, for
 // a child the owner's index holds and for one only the coordinator
 // knows, and also while the child's deletion is not final. Once the
 // children are gone the parents' deletion goes through and their
 // members see them go.
-func TestE2E_ChildSpaces_DeleteParent(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesDeleteParent(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -66,26 +65,25 @@ func TestE2E_ChildSpaces_DeleteParent(t *testing.T) {
 		assert.Equal(t, space.StatusActive, w.Status, "the member keeps the parent")
 	})
 
+	// The deletion of the owner's child going final marks a deletion
+	// pass of the coordinator: the next one is a pass interval away.
 	require.NoError(t, owner.spaces().DeleteChild(ctx, ownChild.Id()))
-	require.NoError(t, owner.spaces().DeleteChild(ctx, othersChild.Id()))
+	waitDeletionFinal(t, ctx, owner, withOwn.Id(), ownChild.Id())
 
 	t.Run("ChildDeletionNotFinal", func(t *testing.T) {
-		pending := func() bool {
-			return children(t, ctx, owner, withOthers.Id())[othersChild.Id()] == space.ChildStatusDeletionPending
+		require.NoError(t, owner.spaces().DeleteChild(ctx, othersChild.Id()))
+		status := func() space.ChildStatus {
+			return children(t, ctx, owner, withOthers.Id())[othersChild.Id()]
 		}
-		before := pending()
+		require.Equal(t, space.ChildStatusDeletionPending, status(), "the deleted child is pending")
 		err := owner.spaces().Delete(ctx, withOthers.Id())
-		if !before || !pending() {
-			t.Logf("the child's deletion became final during the check; Delete returned %v", err)
-			if err == nil {
-				return
-			}
+		if err == nil {
+			t.Fatalf("Delete took a parent whose child's deletion was pending a moment before; the child reads %s now (unknown: no longer listed)", status())
 		}
 		require.ErrorIs(t, err, space.ErrSpaceHasChildren)
 		unchanged(t, withOthers)
 	})
 
-	waitDeletionFinal(t, ctx, owner, withOwn.Id(), ownChild.Id())
 	waitDeletionFinal(t, ctx, owner, withOthers.Id(), othersChild.Id())
 	for _, p := range []space.Space{withOwn, withOthers} {
 		row, _ := owner.row(ctx, p.Id())
@@ -104,14 +102,12 @@ func TestE2E_ChildSpaces_DeleteParent(t *testing.T) {
 	}
 }
 
-// TestE2E_ChildSpaces_DeleteParentOffline: a parent deleted offline
+// childSpacesDeleteParentOffline: a parent deleted offline
 // leaves the account at once. Back online the coordinator refuses the
 // deletion for a child the owner's device never held, and the deleted
 // row says so. The parent's Owner deletes that child; once its deletion
 // is final the parent's deletion goes through and the refusal clears.
-func TestE2E_ChildSpaces_DeleteParentOffline(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesDeleteParentOffline(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 

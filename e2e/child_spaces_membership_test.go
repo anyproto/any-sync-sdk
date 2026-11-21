@@ -11,7 +11,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_ChildSpaces_Membership: only members of the parent become
+// childSpacesMembership: only members of the parent become
 // members of a child. Members of the parent are added by direct add, by
 // the child's Owner and by its Admin, join on the Admin's invite, and
 // read the child. An account outside the parent is refused on every way
@@ -20,9 +20,7 @@ import (
 // devices), the acceptance of a request whose author left the parent
 // since, and a guest identity added by anyone but the child's Owner.
 // The Owner's guest key gives an outsider read-only access.
-func TestE2E_ChildSpaces_Membership(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesMembership(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -136,8 +134,13 @@ func TestE2E_ChildSpaces_Membership(t *testing.T) {
 		})
 		require.ErrorIs(t, err, space.ErrNotParentMember, "a child's Admin adds a guest from outside the parent")
 		notIn(t, guestIdentity)
+		// CreateGuestKey is documented as Owner only, with no typed
+		// error: the refusal is read from its message and from the ACL.
 		_, err = memberChild.ACL().CreateGuestKey(ctx)
-		assert.Error(t, err, "a child's Admin creates no guest key")
+		assert.ErrorContains(t, err, "owner only", "a child's Admin creates no guest key")
+		for id, m := range childMembers(t, ctx, owner, child.Id()) {
+			assert.NotEqual(t, space.PermissionGuest, m.Permission, "no guest identity in the child: %s", id)
+		}
 	})
 
 	t.Run("GuestKeyForAnOutsider", func(t *testing.T) {

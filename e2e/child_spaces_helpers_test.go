@@ -29,11 +29,36 @@ import (
 // network without the feature fails it.
 const childSpacesNetworkEnv = "ANYSYNC_E2E_CHILD_SPACES_NETWORK"
 
-// childSpacesCadences shortens the SDK's background cadences for the
-// rest of the process: the suite waits on conditions those loops
-// produce. Never restored, so parallel tests of the suite cannot undo
-// each other's setting.
-var childSpacesCadences sync.Once
+// TestE2E_ChildSpaces runs the child-spaces tests as parallel subtests.
+// It shortens the deletion-reconcile and inbox-poll cadences, process-wide
+// seams a device reads when it opens, and restores them after the
+// subtests. It is not parallel itself, so no other test of the package
+// runs while the cadences are changed.
+func TestE2E_ChildSpaces(t *testing.T) {
+	net := childSpacesNetwork(t)
+	t.Cleanup(spaceimpl.SetDeletionReconcileIntervalForTest(2 * time.Second))
+	t.Cleanup(spaceimpl.SetOneToOneInboxIntervalsForTest(time.Second, time.Second))
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, *childNet)
+	}{
+		{"CreateAndLimit", childSpacesCreateAndLimit},
+		{"CreateOffline", childSpacesCreateOffline},
+		{"SharedSpacesLimitUntouched", childSpacesSharedSpacesLimitUntouched},
+		{"Membership", childSpacesMembership},
+		{"RemovalFromTheParent", childSpacesRemovalFromTheParent},
+		{"OwnerAndDeletionFromTheParent", childSpacesOwnerAndDeletionFromTheParent},
+		{"ParentTransfer", childSpacesParentTransfer},
+		{"Scopes", childSpacesScopes},
+		{"DeleteParent", childSpacesDeleteParent},
+		{"DeleteParentOffline", childSpacesDeleteParentOffline},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tc.run(t, net)
+		})
+	}
+}
 
 // childNet is the network the child-spaces suite runs against.
 type childNet struct {
@@ -51,10 +76,6 @@ func childSpacesNetwork(t *testing.T) *childNet {
 	}
 	data, err := os.ReadFile(path)
 	require.NoError(t, err, "network file named by %s", childSpacesNetworkEnv)
-	childSpacesCadences.Do(func() {
-		spaceimpl.SetDeletionReconcileIntervalForTest(2 * time.Second)
-		spaceimpl.SetOneToOneInboxIntervalsForTest(time.Second, time.Second)
-	})
 	n := &childNet{yaml: data}
 	var conf struct {
 		Nodes []struct {

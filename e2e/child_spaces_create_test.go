@@ -11,7 +11,7 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_ChildSpaces_CreateAndLimit: the Owner, an Admin and a Writer
+// childSpacesCreateAndLimit: the Owner, an Admin and a Writer
 // of a parent create children with no approval. A child syncs to a
 // second device of its creator and to a member added to it, and names
 // its parent on both. The children of one owner fill its limit across
@@ -20,9 +20,7 @@ import (
 // accepted by RetryPush once a place frees up. A Reader's child is
 // refused for the role. A creator is not charged: the Writer's own
 // limit stays whole.
-func TestE2E_ChildSpaces_CreateAndLimit(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
@@ -153,14 +151,12 @@ func TestE2E_ChildSpaces_CreateAndLimit(t *testing.T) {
 	waitNote(t, ctx, ownerB.name, ownerB.get(t, ctx, over.Id()), overNote, "written while refused")
 }
 
-// TestE2E_ChildSpaces_CreateOffline: a child created offline under a
+// childSpacesCreateOffline: a child created offline under a
 // parent the network holds is pushed when the network returns, and a
 // parent and its child created together offline both arrive, with no
 // refusal on the way. The offline device reaches the network through
 // local proxies; a second device of the account reads what arrived.
-func TestE2E_ChildSpaces_CreateOffline(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesCreateOffline(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
@@ -233,13 +229,11 @@ func TestE2E_ChildSpaces_CreateOffline(t *testing.T) {
 	assert.Empty(t, refusalsB.entries(), "no refusal on the second device")
 }
 
-// TestE2E_ChildSpaces_SharedSpacesLimitUntouched: a child takes no place
+// childSpacesSharedSpacesLimitUntouched: a child takes no place
 // in anybody's shared-spaces limit. The Writer of a parent fills its own
 // limit of shared spaces, then creates a child, which is signed and
 // shared all the same.
-func TestE2E_ChildSpaces_SharedSpacesLimitUntouched(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesSharedSpacesLimitUntouched(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 

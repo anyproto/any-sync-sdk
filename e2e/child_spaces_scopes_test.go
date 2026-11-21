@@ -11,14 +11,12 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_ChildSpaces_Scopes: a parent with three children used as
+// childSpacesScopes: a parent with three children used as
 // access scopes. A member of two of them sees and reads exactly those
 // two. The parent's Owner sees all three in Children and reads none of
 // them, a copy it pulls included. Each child changes its read key on
 // its own.
-func TestE2E_ChildSpaces_Scopes(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesScopes(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -73,16 +71,35 @@ func TestE2E_ChildSpaces_Scopes(t *testing.T) {
 			_, held := owner.row(ctx, c.Id())
 			assert.False(t, held, "the parent's owner holds no row of %s", c.Info().Name)
 		}
-		// A copy pulled by id stays sealed.
-		require.NoError(t, owner.spaces().Track(ctx, teamA.Id()))
-		pullCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		sealed, err := owner.spaces().Get(pullCtx, teamA.Id())
-		if err != nil {
-			t.Logf("the parent's owner does not load Team A: %v", err)
-			return
+		// Copies pulled by id hold the trees of the notes and read none.
+		sealed := make([]space.Space, len(scopes))
+		for i, c := range scopes {
+			require.NoError(t, owner.spaces().Track(ctx, c.Id()))
+			sealed[i] = owner.get(t, ctx, c.Id())
+			require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
+				_ = sealed[i].SyncHeads(ctx)
+				heads, err := sealed[i].TreeHeads(ctx)
+				if err != nil {
+					return false
+				}
+				for _, h := range heads {
+					if h.TreeId == notes[i] {
+						return true
+					}
+				}
+				return false
+			}), "the parent's owner pulls the tree of the note in %s", c.Info().Name)
 		}
-		neverNote(t, ctx, owner.name, sealed, notes[0], "inside Team A", 10*time.Second)
+		if waitFor(ctx, 5*time.Second, time.Second, func() bool {
+			for i, c := range scopes {
+				if readsNote(ctx, sealed[i], notes[i], "inside "+c.Info().Name) {
+					return true
+				}
+			}
+			return false
+		}) {
+			t.Fatalf("the parent's owner reads a child it is no member of")
+		}
 	})
 
 	t.Run("KeysRotateOnTheirOwn", func(t *testing.T) {

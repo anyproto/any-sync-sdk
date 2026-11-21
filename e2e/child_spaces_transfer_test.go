@@ -11,15 +11,13 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_ChildSpaces_ParentTransfer: once the parent's ownership moves
+// childSpacesParentTransfer: once the parent's ownership moves
 // to another account, the count of its children against the limit
 // moves with it, and the new owner governs the children at once: it
 // lists them, removes a member and deletes one. The old owner, now a
 // Writer of the parent, is refused. A child refused for the limit is
 // asked for again by the SDK, with no call, once a place is free.
-func TestE2E_ChildSpaces_ParentTransfer(t *testing.T) {
-	t.Parallel()
-	net := childSpacesNetwork(t)
+func childSpacesParentTransfer(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
 
@@ -54,7 +52,10 @@ func TestE2E_ChildSpaces_ParentTransfer(t *testing.T) {
 
 	require.NoError(t, parent.ACL().OwnershipChange(ctx, heir.id(), space.PermissionWriter), "the parent changes owner")
 
-	var over space.Space
+	var (
+		over      space.Space
+		refusedAt time.Time
+	)
 	t.Run("LimitCountMoves", func(t *testing.T) {
 		require.NoError(t, old.spaces().RetryPush(ctx, blocked.Id()), "the old owner's place is free")
 		waitSigned(t, ctx, old, oldOther.Id(), blocked.Id())
@@ -62,6 +63,7 @@ func TestE2E_ChildSpaces_ParentTransfer(t *testing.T) {
 		row := heir.waitRow(t, ctx, over.Id(), "the new owner is at its limit", func(si space.SpaceInfo) bool {
 			return si.Refusal != space.RefusalNone
 		})
+		refusedAt = time.Now()
 		assert.Equal(t, space.RefusalChildLimitReached, row.Refusal)
 	})
 
@@ -96,12 +98,19 @@ func TestE2E_ChildSpaces_ParentTransfer(t *testing.T) {
 	})
 
 	// The deletion of the old owner's child frees a place of the new
-	// owner. The SDK asks for the refused child again by itself, a
-	// minute after the refusal, on a head-sync round of the space.
+	// owner. The SDK asks for the refused child again by itself on a
+	// head-sync round of the space (every 30 s), once a wait is over: a
+	// minute after the refusal, then two more after a second one. A place
+	// freed less than three minutes after the refusal is asked for at the
+	// latest at the second ask: two minutes and a head-sync period after
+	// the first one, which can fall just before the place is free.
 	t.Run("RefusedChildAskedAgainByItself", func(t *testing.T) {
 		require.NotNil(t, over)
 		waitDeletionFinal(t, ctx, heir, parent.Id(), c1.Id())
-		if !waitFor(ctx, 150*time.Second, time.Second, func() bool {
+		freed := time.Since(refusedAt)
+		require.Less(t, freed, 3*time.Minute, "the place is free before the SDK's third ask")
+		const worst = 2*time.Minute + 30*time.Second
+		if !waitFor(ctx, worst+30*time.Second, time.Second, func() bool {
 			row, _ := heir.row(ctx, over.Id())
 			return row.Refusal == space.RefusalNone
 		}) {

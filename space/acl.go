@@ -33,14 +33,21 @@ var (
 	// (or pending request) the ACL does not hold.
 	ErrAclRecordNotFound = list.ErrNoSuchRecord
 
+	// ErrAccountNotFound is returned by ACL ops, and by
+	// Service.RemoveChildMembers and Service.ChangeChildOwner, for an
+	// identity the space's ACL holds no account of.
+	ErrAccountNotFound = list.ErrNoSuchAccount
+
 	// ErrInviteNotFound is returned by Join when the space's ACL holds
-	// no such invite (revoked, replaced, or never minted), and by
+	// no such invite (revoked or never minted), and by
 	// RevokeInvite for an unknown invite record.
 	ErrInviteNotFound = list.ErrNoSuchInvite
 
 	// ErrCoordinatorForbidden is the coordinator refusing an operation
-	// for this account. CreateInvite, CreateGuestKey and AddAccounts
-	// return it from make-shareable, which is owner-only.
+	// for this account. The Owner's CreateInvite, CreateGuestKey and
+	// AddAccounts first make the space shareable, which only the Owner
+	// may do: they return it when the coordinator holds another account
+	// as the owner. An Admin's calls skip that step.
 	ErrCoordinatorForbidden = coordinatorproto.ErrForbidden
 
 	// ErrCoordinatorLimitReached is the coordinator refusing an
@@ -67,12 +74,21 @@ var (
 //
 // Scope: only RequestToJoin invites are supported. AnyoneCanJoin is
 // deferred until any-sync ships v2 of that invite type.
+//
+// The Owner's CreateInvite, AddAccounts and CreateGuestKey need the
+// space on the network. For a space the coordinator does not know yet
+// they wait for its first push, and return ErrSpaceUnknown when it has
+// not landed in time. A child space the coordinator refused to sign
+// (SpaceInfo.Refusal) is not waited for: they return the error of that
+// refusal, one of ErrParentSpaceNotAvailable, ErrParentSpaceInvalid,
+// ErrParentPermissionDenied and ErrChildSpacesLimitReached.
 type ACL interface {
-	// CreateInvite mints a new RequestToJoin invite, revoking any
-	// prior invite on this space (mirrors AclSpaceClient.ReplaceInvite
-	// semantics — only one active invite at a time). The returned
-	// Invite is share-friendly (base58-encoded via Invite.Encode()
-	// equivalents on space.EncodeInvite).
+	// CreateInvite mints a RequestToJoin invite. A space holds one at a
+	// time: ErrDuplicateInvite while one is active, until it is revoked
+	// (RevokeInvite, RevokeAllInvites). An active invite of another
+	// type, which this SDK does not mint, is revoked by the same
+	// record. The returned Invite is share-friendly (base58 via
+	// space.EncodeInvite).
 	CreateInvite(ctx context.Context) (Invite, error)
 
 	// RevokeInvite revokes a single invite by record id. The record id
@@ -84,7 +100,9 @@ type ACL interface {
 
 	// AcceptRequest approves a pending join request and grants the
 	// joiner the given permission. requestRecordId is the id from
-	// MembersAPI.JoinRequests. Owner / admin only.
+	// MembersAPI.JoinRequests. Owner / admin only. In a child space
+	// ErrNotParentMember for a joiner who is no longer a member of the
+	// parent.
 	AcceptRequest(ctx context.Context, requestRecordId string, perm Permission) error
 
 	// DeclineRequest rejects a pending join request from identity.
@@ -111,6 +129,9 @@ type ACL interface {
 	// StatusInvitePending for them to AcceptInvite / DeclineInvite.
 	// Without the transport (headless deployments) the ACL write still
 	// happens but no notification is sent.
+	//
+	// In a child space every added account is a member of the parent:
+	// ErrNotParentMember otherwise, and nobody of the batch is added.
 	AddAccounts(ctx context.Context, accounts []MemberAdd) error
 
 	// OwnershipChange transfers ownership to newOwner; the old owner's
@@ -142,6 +163,18 @@ type ACL interface {
 	// Owner only: custody lives in the owner's tech space, so admins
 	// can neither fetch nor reissue it.
 	CreateGuestKey(ctx context.Context) (Invite, error)
+
+	// RotationPending reports that members were removed from this
+	// space without a read key change and still hold the current read
+	// key. An Admin or the Owner of the parent space removes members of
+	// a child this way (Service.RemoveChildMembers): they are members
+	// no longer, and read what is written until the key changes.
+	//
+	// No call ends it. A device of an Admin or the Owner of this space
+	// that holds the read key changes the key by itself, while the
+	// space is loaded and the network reachable; RotationPending reads
+	// false once that record is applied here.
+	RotationPending(ctx context.Context) (bool, error)
 
 	// RevokeGuestKey removes the guest identity from the ACL and
 	// rotates the read key, cutting every guest off from new content

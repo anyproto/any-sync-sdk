@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -738,4 +739,65 @@ func TestSpaceIndexHandler_DerivedRefusesDeletedStatus(t *testing.T) {
 	)))
 	rec = techspace.DecodeSpaceIndexRecord(ctrl.Get(context.Background(), techspace.SpaceIndexDataset, spaceId))
 	assert.Equal(t, techspace.StatusArchived, rec.RemoteStatus)
+}
+
+// The parent id is written with the row by the creating device, filled
+// once on a joined row, and pinned from then on.
+func TestSpaceIndexHandler_ParentSpaceIdSetOnce(t *testing.T) {
+	ctrl := newSpaceIndexController(t)
+	arena := &anyenc.Arena{}
+	ctx := context.Background()
+
+	created := techspace.SpaceIndexRecord{Id: "child-created", Type: "any.space", ParentSpaceId: "parent-a"}
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v1", created.Id, true,
+		crdt.Op{Type: crdt.OpSet, Payload: created.EncodeCreate(arena)})))
+	rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, created.Id))
+	assert.Equal(t, "parent-a", rec.ParentSpaceId)
+
+	const joined = "child-joined"
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v2", joined, true,
+		setMulti(arena, map[string]string{techspace.FieldRemoteStatus: techspace.StatusActive}))))
+	assert.Empty(t, techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, joined)).ParentSpaceId)
+	require.NoError(t, ctrl.ApplyChange(ctx, makeChange("v3", joined, false,
+		crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldParentSpaceId}, Payload: arena.NewString("parent-a")})))
+
+	for i, id := range []string{created.Id, joined} {
+		res, err := ctrl.ApplyChangeWithResult(ctx, makeChange(crdt.VersionId("v4"+string(rune('a'+i))), id, false,
+			crdt.Op{Type: crdt.OpSet, Path: []string{techspace.FieldParentSpaceId}, Payload: arena.NewString("parent-b")}))
+		require.NoError(t, err)
+		require.Len(t, res.Rejections, 1)
+		assert.ErrorIs(t, res.Rejections[0].Err, techspace.ErrParentImmutable)
+		rec := techspace.DecodeSpaceIndexRecord(ctrl.Get(ctx, techspace.SpaceIndexDataset, id))
+		assert.Equal(t, "parent-a", rec.ParentSpaceId)
+	}
+
+	// A top-level row carries no parent field at all.
+	top := techspace.SpaceIndexRecord{Id: "top", Type: "any.space"}.EncodeCreate(arena)
+	assert.Nil(t, top.Get(techspace.FieldParentSpaceId))
+}
+
+// The refusal is a synced field: every device of the account reads it.
+func TestSpaceIndexSchema_RefusalIsSynced(t *testing.T) {
+	for _, f := range techspace.SpaceIndexSchema().Fields {
+		if f.Id == techspace.FieldRefusal {
+			assert.Equal(t, schema.ScopeSynced, f.Scope)
+			return
+		}
+	}
+	t.Fatal("no refusal field in the schema")
+}
+
+func TestSpaceIndexRecord_DecodeRefusal(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldRefusal, arena.NewString("child_limit_reached"))
+	assert.Equal(t, space.RefusalChildLimitReached, techspace.DecodeSpaceIndexRecord(v).Refusal)
+
+	// A cleared refusal and a row never refused read the same.
+	v.Set(techspace.FieldRefusal, arena.NewString("none"))
+	assert.Equal(t, space.RefusalNone, techspace.DecodeSpaceIndexRecord(v).Refusal)
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Equal(t, space.RefusalNone, techspace.DecodeSpaceIndexRecord(bare).Refusal)
 }

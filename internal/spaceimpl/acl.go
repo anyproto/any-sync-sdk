@@ -37,8 +37,10 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 	return handle.Inner().AclClient(), nil
 }
 
-// CreateInvite mints a fresh RequestToJoin invite, replacing any
-// prior invite. Output is a share-friendly base58 token.
+// CreateInvite mints a RequestToJoin invite. ReplaceInvite refuses it
+// with ErrDuplicateInvites while one is active, and revokes the active
+// invites of other types in the same record. Output is a
+// share-friendly base58 token.
 //
 // The space must be registered with the coordinator before any ACL
 // record can be published — otherwise the node returns
@@ -51,7 +53,8 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 // custody (synced tech-space row), so every device of the minting
 // account can re-encode the same token — Members.Invites returns it
 // on the matching row. Persist failure fails the call: the ACL invite
-// stands, but an unrecoverable token defeats the contract; re-mint.
+// stands with a token nobody holds, and the next mint is refused as a
+// duplicate until that invite is revoked.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := ensureShareable(ctx, a.s); err != nil {
 		return space.Invite{}, err
@@ -132,15 +135,24 @@ func isLogNotReady(err error) bool {
 // the first tick fires immediately, but peer connections may not be
 // established yet, so the first attempt is best-effort).
 //
+// Only the space's Owner makes the call: the coordinator refuses it
+// from any other account, and an account that is not the Owner acts in
+// a space that is shared already, or it would not be a member of it.
+//
 // Idempotent on the coordinator — calling it many times is cheap.
 //
 // Total retry window ≈ 35s — long enough to clear the worst case of
 // peer-connect-then-syncperiod-tick.
+//
+// A child the coordinator refused to sign is on no node: once the
+// coordinator answers that it does not know the space, a refusal its
+// row holds is returned with no further wait. A wait that runs out
+// returns space.ErrSpaceUnknown.
 func ensureShareable(ctx context.Context, s *spaceImpl) error {
-	const (
-		maxAttempts = 35
-		backoff     = time.Second
-	)
+	const maxAttempts = 35
+	if !s.localIdentityIsOwner(ctx) {
+		return nil
+	}
 	coord := s.app.Coordinator()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
@@ -149,16 +161,47 @@ func ensureShareable(ctx context.Context, s *spaceImpl) error {
 			if !isSpaceNotPushedYet(err) {
 				return fmt.Errorf("acl: make shareable: %w", err)
 			}
+			// Read after the coordinator's answer: the row can still hold
+			// a refusal for a child another device got signed.
+			if refused := s.signRefusal(ctx); refused != nil {
+				return refused
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(backoff):
+			case <-time.After(time.Duration(makeShareableBackoff.Load())):
 			}
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("acl: make shareable (after %d attempts): %w", maxAttempts, lastErr)
+	return fmt.Errorf("acl: make shareable (after %d attempts): %w: %w", maxAttempts, space.ErrSpaceUnknown, lastErr)
+}
+
+// makeShareableBackoff is the pause between two make-shareable requests
+// for a space the coordinator does not know yet.
+var makeShareableBackoff = newAtomicInterval(time.Second)
+
+// SetMakeShareableBackoffForTest overrides that pause and returns a
+// func that restores it. Test seam.
+func SetMakeShareableBackoffForTest(d time.Duration) (restore func()) {
+	prev := makeShareableBackoff.Swap(int64(d))
+	return func() { makeShareableBackoff.Store(prev) }
+}
+
+// signRefusal returns the error of the check this space failed when
+// the coordinator refused to sign it, nil when its row holds no such
+// refusal.
+func (s *spaceImpl) signRefusal(ctx context.Context) error {
+	rec, ok := s.tsp.Get(ctx, s.id)
+	if !ok {
+		return nil
+	}
+	cause := refusalErr(rec.Refusal)
+	if cause == nil {
+		return nil
+	}
+	return fmt.Errorf("acl: space %q is on no node, the coordinator refused it (%s): %w", s.id, rec.Refusal, cause)
 }
 
 // isSpaceNotPushedYet matches the coordinator's "space not exists"
@@ -512,6 +555,22 @@ func (a *aclAPI) removeAllGuestIdentities(ctx context.Context) error {
 		return fmt.Errorf("acl: remove guest accounts: %w", err)
 	}
 	return nil
+}
+
+// RotationPending reads the ACL's pending rotation — see
+// space.ACL.RotationPending.
+func (a *aclAPI) RotationPending(ctx context.Context) (bool, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return false, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false, errors.New("acl: space has no acl")
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().RotationPending(), nil
 }
 
 func (a *aclAPI) StopSharing(ctx context.Context) error {

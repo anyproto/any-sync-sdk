@@ -356,6 +356,15 @@ func (s *Service) SetType(ctx context.Context, spaceId, typ string) (object.Writ
 	})
 }
 
+// SetParentSpaceId fills the parent of a child space onto a row created
+// before the space's header was readable (FieldParentSpaceId, synced).
+// Set-once, like SetType.
+func (s *Service) SetParentSpaceId(ctx context.Context, spaceId, parentSpaceId string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldParentSpaceId, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(parentSpaceId)
+	})
+}
+
 // SetDerived flags a row as seed-derived (FieldDerived, synced) — the
 // heal path for rows that predate the flag (Derive stamps it at row
 // create otherwise). Set-once: the handler pins it after the first
@@ -404,6 +413,15 @@ func (s *Service) SetPushKeys(ctx context.Context, spaceId string, keys space.Pu
 func (s *Service) SetOwnRole(ctx context.Context, spaceId string, role space.Permission) (object.WriteResult, error) {
 	return s.setRowField(ctx, spaceId, FieldOwnRole, true, func(a *anyenc.Arena) *anyenc.Value {
 		return a.NewString(role.String())
+	})
+}
+
+// SetRefusal records on the space's row what the coordinator last
+// refused for it (FieldRefusal, synced account-wide), RefusalNone once
+// that is over. The caller skips no-op writes.
+func (s *Service) SetRefusal(ctx context.Context, spaceId string, refusal space.Refusal) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldRefusal, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(refusal.String())
 	})
 }
 

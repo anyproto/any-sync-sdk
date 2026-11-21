@@ -92,6 +92,20 @@ type SpaceInfo struct {
 	// the account's discovery record either way. Synced account-wide;
 	// written via Space.SetP2PAdvertise.
 	P2PAdvertise bool
+	// ParentSpaceId is the parent of a child space, as the space header
+	// names it; empty for a top-level space. A joined space carries it
+	// from its first load on.
+	ParentSpaceId string
+	// Refusal is set on a child space the coordinator refused to sign:
+	// it names the failed check. The space stays usable on a device
+	// that holds it and exists on no node. Synced account-wide, so a
+	// device with no copy of the space reads it too, and back to
+	// RefusalNone once the coordinator signs the space
+	// (Service.RetryPush asks it now). Status is not affected.
+	//
+	// On a deleted space RefusalHasChildren says that its deletion on
+	// the network waits for its child spaces (Service.Delete).
+	Refusal Refusal
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

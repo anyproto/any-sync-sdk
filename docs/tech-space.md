@@ -102,6 +102,8 @@ shape (tombstone, offload markers, ended join) surfaces as `Removed`.
 | `guestKey` | synced | Guest identity private key on a guest-mode row; presence marks guest mode |
 | `issuedInviteKeys` | synced | Invite private keys this account issued, below |
 | `derived` | synced | Row written by this account's `Derive`, below |
+| `parentSpaceId` | synced | Parent of a child space, from the space header. Set once: written with the row by the creating device, filled with `type` on a joined row's first load (docs/child-spaces.md) |
+| `refusal` | synced | What the coordinator last refused for the space: the check a child space failed when it was not signed, or `has_children` on a deleted space whose deletion waits for its children; `none` or absent otherwise (docs/child-spaces.md) |
 | `oneToOnePeer` | synced | The other identity on a 1-1 row (needed to materialize storage; a spaceId doesn't encode it invertibly) |
 | `oneToOneInviteState` | local | `toSend` while this device owes the peer a 1-1 inbox notification |
 | `inviteNotifyPending` | local | Identities this device still owes a direct-add inbox notification after `AddAccounts` |

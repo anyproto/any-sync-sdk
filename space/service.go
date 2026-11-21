@@ -27,7 +27,9 @@ var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 // Service.OneToOne, an ended join via Join; the synced tombstone Delete
 // writes is terminal. Children and the child-space calls made from the
 // parent side return it for a space the coordinator holds as deleted or
-// in deletion; DeleteChild of such a child is done and returns nil.
+// in deletion; DeleteChild of such a child is done and returns nil. It
+// is no proof that the space is gone for good: the coordinator lets the
+// space's own owner take back a deletion that owner started.
 var ErrSpaceDeleted = errors.New("space: deleted")
 
 // ErrReadOnlySpace rejects synced writes into a space this account
@@ -95,7 +97,8 @@ var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pen
 // has no row in the account's space index, and by the calls that ask
 // the network about a space the index need not hold (Children and the
 // child-space calls made from the parent side) when the coordinator
-// does not know the space.
+// does not know the space. That includes a space this account created
+// and has not pushed yet: the error passes once the space is pushed.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was

@@ -185,8 +185,8 @@ Errors of these calls:
 | `ErrAccountNotFound` | An identity is no member of the child: one of the removed, or the new owner. |
 | `ErrInsufficientPermissions` | The ACL forbids the record: the child's Owner or the caller among the removed identities; a new owner who is the Owner already or a guest identity; an `oldOwnerPerm` of `none`, `guest` or `owner`. |
 | any other error from `RemoveChildMembers` or `ChangeChildOwner` | The record names the ACL head it was built on, and another record reached the child's ACL first (`records conflict`, `incorrect prev id of a record`). Nothing was written: call again. |
-| `ErrSpaceUnknown` | The coordinator does not know the space. |
-| `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. |
+| `ErrSpaceUnknown` | The coordinator does not know the space. That includes a space this account created and has not pushed yet, a parent given to `Children` for example: the error passes once the space is pushed. |
+| `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. The error is no proof that the space is gone for good: the coordinator lets the space's own owner take back a deletion that owner started. |
 | `ErrNotChildSpace` | The index shows the space has no parent. |
 | `ErrBadSpaceId`, `ErrBadIdentity` | Malformed input. |
 

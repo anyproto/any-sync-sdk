@@ -339,7 +339,8 @@ type Service interface {
 	// ErrOffline when the coordinator cannot be reached (nothing
 	// changes), ErrParentPermissionDenied for a caller who is neither
 	// the parent's Owner nor the child's, ErrNotChildSpace for a space
-	// the index shows has no parent, ErrBadSpaceId for a malformed id.
+	// the index shows has no parent and for an active regular top-level
+	// space of another account, ErrBadSpaceId for a malformed id.
 	DeleteChild(ctx context.Context, childSpaceId string) error
 
 	// Join a space via an invite. Depending on the invite key mode the

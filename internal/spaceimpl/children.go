@@ -308,6 +308,11 @@ func (s *Service) DeleteChild(ctx context.Context, childSpaceId string) error {
 		return err
 	}
 	err = s.app.SpaceDelete(ctx, childSpaceId)
+	if errors.Is(err, coordinatorproto.ErrSpaceIsCreated) {
+		// The coordinator's answer to a delete of an active regular
+		// space with no parent that another account owns.
+		return fmt.Errorf("spaceimpl: DeleteChild: space %q: %w: %w", childSpaceId, space.ErrNotChildSpace, err)
+	}
 	if err != nil && !errors.Is(err, coordinatorproto.ErrSpaceDeletionPending) && !errors.Is(err, coordinatorproto.ErrSpaceIsDeleted) {
 		return networkErr("DeleteChild", err)
 	}

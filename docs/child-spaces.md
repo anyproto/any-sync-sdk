@@ -207,7 +207,7 @@ Errors of these calls:
 | any other error from `RemoveChildMembers` or `ChangeChildOwner` | The record names the ACL head it was built on, and another record reached the child's ACL first (`records conflict`, `incorrect prev id of a record`). Nothing was written: call again. |
 | `ErrSpaceUnknown` | The coordinator does not know the space. That includes a space this account created and has not pushed yet, a parent given to `Children` for example: the error passes once the space is pushed. |
 | `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. The error is no proof that the space is gone for good: the coordinator lets the space's own owner take back a deletion that owner started. |
-| `ErrNotChildSpace` | The index shows the space has no parent. |
+| `ErrNotChildSpace` | The space has no parent. The index shows it for a space the account holds, the tech space and a 1-1 space included, and nothing is sent. `DeleteChild` also returns it for an active regular top-level space of another account, which the coordinator shows; `RemoveChildMembers` and `ChangeChildOwner` see only the ACL of such a space and answer `ErrInsufficientPermissions`, or `ErrAccountNotFound` for an identity that is no account of it. Not covered: for the tech space of another account, or a 1-1 space the account does not hold, `DeleteChild` returns the coordinator's untyped error, and for a space of another account that is deleted or in deletion it returns `nil`, as for any space the coordinator holds so. |
 | `ErrBadSpaceId`, `ErrBadIdentity` | Malformed input. |
 
 ## Rotation pending

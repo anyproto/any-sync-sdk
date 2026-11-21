@@ -907,7 +907,12 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	})
 	derived, err := spaces.Derive(ctx, space.DeriveRequest{Seed: []byte("test/child/governance")})
 	require.NoError(t, err)
-	for _, notChild := range []string{parent.Id(), derived.Id(), sdk.TechSpaceId()} {
+	const oneToOne = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.1onetoone"
+	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id: oneToOne, Type: space.SpaceTypeOneToOne, RemoteStatus: techspace.StatusActive, OneToOnePeer: "peer",
+	})
+	require.NoError(t, err)
+	for _, notChild := range []string{parent.Id(), derived.Id(), sdk.TechSpaceId(), oneToOne} {
 		require.ErrorIs(t, spaces.RemoveChildMembers(ctx, notChild, []string{member}), space.ErrNotChildSpace)
 		require.ErrorIs(t, spaces.ChangeChildOwner(ctx, notChild, newOwner, space.PermissionAdmin), space.ErrNotChildSpace)
 		require.ErrorIs(t, spaces.DeleteChild(ctx, notChild), space.ErrNotChildSpace)
@@ -1746,6 +1751,33 @@ func TestSDK_ChildCalls_UnknownAndDeletedSpaces(t *testing.T) {
 		require.NoError(t, spaces.DeleteChild(ctx, child.id))
 	}
 	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// DeleteChild of a top-level space of another account: the
+// coordinator's answer to a delete from an account that owns neither
+// the space nor a parent of it reads as no child space.
+func TestSDK_DeleteChild_TopLevelSpaceOfAnotherAccount(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	net.coord.del = func(string) error { return coordinatorproto.ErrSpaceIsCreated }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	err := spaces.DeleteChild(ctx, foreignSpaceB)
+	require.ErrorIs(t, err, space.ErrNotChildSpace)
+	require.ErrorIs(t, err, coordinatorproto.ErrSpaceIsCreated, "the coordinator's answer stays in the chain")
+	requireNothingHeld(t, ctx, sdk, foreignSpaceB)
+
+	// The same for a row whose header was never read: the index cannot
+	// tell, the coordinator does, and the row stays as it was.
+	require.NoError(t, spaces.Track(ctx, foreignSpaceC))
+	require.ErrorIs(t, spaces.DeleteChild(ctx, foreignSpaceC), space.ErrNotChildSpace)
+	rec, ok := sdk.tsp.Get(ctx, foreignSpaceC)
+	require.True(t, ok)
+	assert.False(t, rec.IsDeleted())
+	net.coord.set(func() { assert.Equal(t, []string{foreignSpaceB, foreignSpaceC}, net.coord.deleted) })
 }
 
 // The parent side reads whether a child rotated its key after a

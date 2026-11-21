@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -155,7 +156,8 @@ func childSpacesRemovalFromTheParent(t *testing.T, net *childNet) {
 // deletes the child it could never read; the child's owner cannot undo
 // that, and every member's device sees the child go. The parent-side
 // calls answer ErrSpaceUnknown for a child the network does not know and
-// ErrSpaceDeleted for the deleted one.
+// ErrSpaceDeleted for the deleted one, and DeleteChild ErrNotChildSpace
+// for a top-level space of another account.
 func childSpacesOwnerAndDeletionFromTheParent(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -201,6 +203,18 @@ func childSpacesOwnerAndDeletionFromTheParent(t *testing.T, net *childNet) {
 		assert.ErrorIs(t, err, space.ErrSpaceUnknown, "Children")
 		parentSideCalls(t, ctx, owner, unknown, cadmin.id(), space.ErrSpaceUnknown)
 		assert.ErrorIs(t, owner.spaces().DeleteChild(ctx, unknown), space.ErrSpaceUnknown, "DeleteChild")
+	})
+
+	t.Run("DeleteChildOfATopLevelSpace", func(t *testing.T) {
+		foreign := cmember.create(t, ctx, "Top-level space of another account")
+		var err error
+		require.True(t, waitFor(ctx, 60*time.Second, time.Second, func() bool {
+			err = owner.spaces().DeleteChild(ctx, foreign.Id())
+			return !errors.Is(err, space.ErrSpaceUnknown)
+		}), "the space reaches the network")
+		assert.ErrorIs(t, err, space.ErrNotChildSpace)
+		assert.Equal(t, coordinatorproto.SpaceStatus_SpaceStatusCreated, net.coordinatorStatus(t, ctx, cmember, foreign.Id()),
+			"the space is not deleted")
 	})
 
 	// Each transfer names the role the previous owner keeps.

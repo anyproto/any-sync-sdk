@@ -298,6 +298,16 @@ func (a *App) treeNodeAnswered(spaceId string) {
 	if a.cred != nil {
 		a.cred.networkHolds(spaceId)
 	}
+	if fn := a.onNodeRound.Load(); fn != nil {
+		(*fn)(spaceId)
+	}
+}
+
+// OnNodeRound registers fn for every head-sync round of a space that
+// one of its tree nodes answered: the network is in reach for it. fn
+// runs on the sync path.
+func (a *App) OnNodeRound(fn func(spaceId string)) {
+	a.onNodeRound.Store(&fn)
 }
 
 // NodeAnsweredForTest stands for a head-sync round of spaceId that one

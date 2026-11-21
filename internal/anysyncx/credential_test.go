@@ -364,3 +364,19 @@ func TestCredentialProvider_ForeignParentIsNotWaitedFor(t *testing.T) {
 	assert.Equal(t, 1, f.coord.calls)
 	assert.Equal(t, []signAnswer{{child.Id, space.RefusalParentNotAvailable}}, f.answers)
 }
+
+// Only a round with a tree node of the space says the network holds
+// it and is in reach: a LAN peer or another node does not.
+func TestApp_NodeAnsweredMarksTheSpace(t *testing.T) {
+	a := &App{cred: newCredentialProvider(newLocalOnlySpaces()), nodeConf: &fakeNodeConf{nodeIds: []string{"node-1", "node-2"}}}
+	var rounds []string
+	a.OnNodeRound(func(spaceId string) { rounds = append(rounds, spaceId) })
+	a.nodeAnswered("space.1", "lan-peer")
+	assert.False(t, a.cred.holds("space.1"))
+	assert.Empty(t, rounds)
+	a.nodeAnswered("space.1", "node-2")
+	a.nodeAnswered("space.1", "node-1")
+	assert.True(t, a.cred.holds("space.1"))
+	assert.False(t, a.cred.holds("space.2"))
+	assert.Equal(t, []string{"space.1", "space.1"}, rounds, "every round with a tree node is reported")
+}

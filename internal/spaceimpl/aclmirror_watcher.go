@@ -1,6 +1,7 @@
 // Per-space ACL mirror: ACL-derived state → tech-space row. Mirrors
 // the pattern of anytype-heart's SetAclInfo → space-view details
-// write. Two row fields today:
+// write. Each pass also ends a pending read key rotation when this
+// device can (rotation.go). Two row fields today:
 //
 //   - push keys — clients that must decrypt
 //     push payloads while the SDK process is down (mobile
@@ -18,13 +19,15 @@
 // scheduleRetry) because on a quiet space no further ACL record will
 // re-kick it. No periodic poll beyond that: keys only change when an
 // ACL record applies, and applying requires the loaded space this
-// watcher is wired to.
+// watcher is wired to. A rotation this device could not publish is the
+// exception: it is retried for as long as it is pending.
 
 package spaceimpl
 
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
@@ -53,6 +56,11 @@ const (
 	// case — resets the budget.
 	aclMirrorRetryDelay = 30 * time.Second
 	aclMirrorRetryMax   = 5
+	// aclRotationRetryDelay spaces the retries of a rotation that
+	// could not be published once the budget above is spent: the
+	// network may stay away for long, and the removed members read
+	// until the key changes.
+	aclRotationRetryDelay = 5 * time.Minute
 )
 
 type aclMirrorWatcher struct {
@@ -78,6 +86,10 @@ type aclMirrorWatcher struct {
 	retryMu    sync.Mutex
 	retryTimer *time.Timer
 	attempts   int
+
+	// awaitsNetwork is set while a rotation was not published because
+	// no node or coordinator was in reach (rotation.go).
+	awaitsNetwork atomic.Bool
 }
 
 func newAclMirrorWatcher(s *Service, spaceId string) *aclMirrorWatcher {
@@ -136,8 +148,10 @@ func (w *aclMirrorWatcher) loop() {
 		case <-w.stopCh:
 			return
 		case <-w.kickCh:
-			if !w.mirror() {
-				w.scheduleRetry()
+			mirrored := w.mirror()
+			rotated := w.completeRotation()
+			if !mirrored || !rotated {
+				w.scheduleRetry(!rotated)
 			}
 		}
 	}
@@ -148,15 +162,25 @@ func (w *aclMirrorWatcher) loop() {
 // "the next ACL kick retries" alone would leave a transient failure
 // (store busy at boot, row not written yet) sticking until restart.
 // Bounded by aclMirrorRetryMax so an expected-persistent failure
-// (pending joiner) doesn't spin; UpdateAcl resets the budget.
-func (w *aclMirrorWatcher) scheduleRetry() {
+// (pending joiner) doesn't spin; UpdateAcl resets the budget. With
+// rotationOwed the retries go on past the budget, aclRotationRetryDelay
+// apart.
+func (w *aclMirrorWatcher) scheduleRetry(rotationOwed bool) {
 	w.retryMu.Lock()
 	defer w.retryMu.Unlock()
-	if w.retryTimer != nil || w.attempts >= aclMirrorRetryMax {
+	if w.retryTimer != nil {
 		return
 	}
-	w.attempts++
-	w.retryTimer = time.AfterFunc(aclMirrorRetryDelay, func() {
+	delay := aclMirrorRetryDelay
+	switch {
+	case w.attempts < aclMirrorRetryMax:
+		w.attempts++
+	case rotationOwed:
+		delay = aclRotationRetryDelay
+	default:
+		return
+	}
+	w.retryTimer = time.AfterFunc(delay, func() {
 		w.retryMu.Lock()
 		w.retryTimer = nil
 		w.retryMu.Unlock()

@@ -521,6 +521,22 @@ func (a *aclAPI) removeAllGuestIdentities(ctx context.Context) error {
 	return nil
 }
 
+// RotationPending reads the ACL's pending rotation — see
+// space.ACL.RotationPending.
+func (a *aclAPI) RotationPending(ctx context.Context) (bool, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return false, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false, errors.New("acl: space has no acl")
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().RotationPending(), nil
+}
+
 func (a *aclAPI) StopSharing(ctx context.Context) error {
 	change, err := newReadKeyChange()
 	if err != nil {

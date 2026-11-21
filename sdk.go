@@ -680,6 +680,12 @@ func (s *SDK) bootstrap(ctx context.Context) {
 		// anything the forward catch-up or a lazy Get re-materialized.
 		warn("reconcile deletions", spacesync.ReconcileDeletions(ctx, s.app, s.db, s.spaces.StoreFor(rec.Id), rec.Id),
 			zap.String("spaceId", rec.Id))
+		// A child space can wait for this device to change its read
+		// key. The watcher that does it starts here for a child, not at
+		// its first Get.
+		if rec.ParentSpaceId != "" {
+			s.spaces.StartAclMirror(ctx, rec.Id)
+		}
 	}
 
 	// Replay published read frontiers through the idempotent merge —

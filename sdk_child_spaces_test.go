@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
@@ -22,6 +23,7 @@ import (
 	"github.com/anyproto/any-sync/consensus/consensusproto/consensuserr"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	anynet "github.com/anyproto/any-sync/net"
 	"github.com/anyproto/any-sync/node/nodeclient"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/stretchr/testify/assert"
@@ -684,6 +686,44 @@ func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string)
 	}
 }
 
+// heldBy makes the device of sdk hold the child with its account as a
+// member of role perm: the storage a pull leaves, the ACL record that
+// adds the account, and the row an accepted invite leaves. It returns
+// the child's ACL on that device.
+func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, parentSpaceId string, perm list.AclPermissions) list.AclList {
+	t.Helper()
+	rec, err := c.ownerAcl(t).RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
+		{Identity: sdk.app.AccountKeys().SignKey.GetPublic(), Permissions: perm},
+	}})
+	require.NoError(t, err)
+	added := c.accept(rec)
+
+	create := context.WithValue(ctx, commonspace.AddSpaceCtxKey, commonspace.SpaceDescription{
+		SpaceHeader:          c.storage.SpaceHeaderWithId,
+		AclId:                c.storage.AclWithId.Id,
+		AclPayload:           c.storage.AclWithId.Payload,
+		SpaceSettingsId:      c.storage.SpaceSettingsWithId.Id,
+		SpaceSettingsPayload: c.storage.SpaceSettingsWithId.RawChange,
+	})
+	handle, err := sdk.app.GetSpaceCreating(create, c.id)
+	require.NoError(t, err)
+	acl := handle.Inner().Acl()
+	acl.Lock()
+	err = acl.AddRawRecord(added)
+	acl.Unlock()
+	require.NoError(t, err)
+
+	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id:            c.id,
+		Type:          space.SpaceTypeAny,
+		SpaceType:     space.SpaceTypeAny,
+		RemoteStatus:  techspace.StatusActive,
+		ParentSpaceId: parentSpaceId,
+	})
+	require.NoError(t, err)
+	return acl
+}
+
 // ownerAcl is the child's ACL on a device of its owner.
 func (c *foreignChild) ownerAcl(t *testing.T) list.AclList {
 	t.Helper()
@@ -981,6 +1021,106 @@ func (n testNetworkKey) accept(rec *consensusproto.RawRecord) *consensusproto.Ra
 	return listtest.WrapAclRecord(rec)
 }
 
+// An Admin of the parent removes a member of a child without the read
+// key. The Owner's device, which holds the key, sees the rotation
+// pending when the record is applied and ends it by itself.
+func TestSDK_ChildSpace_RotationCompletedByTheWatcher(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	handle, err := sdk.app.GetSpace(ctx, child.Id())
+	require.NoError(t, err)
+	acl := handle.Inner().Acl()
+	apply := func(rec *consensusproto.RawRecord) {
+		acl.Lock()
+		defer acl.Unlock()
+		require.NoError(t, acl.AddRawRecord(network.accept(rec)))
+	}
+
+	// The network takes the records the SDK posts and counts them,
+	// once it is in reach.
+	var posted, unreached atomic.Int32
+	var inReach atomic.Bool
+	net.nodes.set(func() {
+		net.nodes.add = func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+			assert.Equal(t, child.Id(), spaceId)
+			if !inReach.Load() {
+				unreached.Add(1)
+				return nil, anynet.ErrUnableToConnect
+			}
+			posted.Add(1)
+			return network.accept(rec), nil
+		}
+	})
+
+	member, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	acl.Lock()
+	add, err := acl.RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
+		{Identity: member.SignKey.GetPublic(), Permissions: list.AclPermissionsWriter},
+	}})
+	acl.Unlock()
+	require.NoError(t, err)
+	apply(add)
+	pending, err := child.ACL().RotationPending(ctx)
+	require.NoError(t, err)
+	require.False(t, pending)
+	acl.RLock()
+	keyBefore := acl.AclState().CurrentReadKeyId()
+	acl.RUnlock()
+
+	// The removal as an account outside the child writes it.
+	parentAdmin, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	records, err := acl.RecordsAfter(ctx, "")
+	require.NoError(t, err)
+	st, err := list.NewInMemoryStorage(records[0].Id, records)
+	require.NoError(t, err)
+	outside, err := list.BuildAclListWithIdentity(parentAdmin, st, recordverifier.NewValidateFull())
+	require.NoError(t, err)
+	removal, err := outside.RecordBuilder().BuildAccountRemoveNoRotate([]crypto.PubKey{member.SignKey.GetPublic()})
+	require.NoError(t, err)
+	apply(removal)
+
+	// No network: the change is not published and the rotation stays
+	// pending.
+	require.Eventually(t, func() bool { return unreached.Load() == 1 },
+		20*time.Second, 10*time.Millisecond, "the watcher tries at once")
+	pending, err = child.ACL().RotationPending(ctx)
+	require.NoError(t, err)
+	require.True(t, pending)
+
+	// The network is back: tree nodes answer the rounds of the space.
+	inReach.Store(true)
+	require.Eventually(t, func() bool {
+		sdk.app.NodeAnsweredForTest(child.Id())
+		pending, err := child.ACL().RotationPending(ctx)
+		return err == nil && !pending && posted.Load() > 0
+	}, 20*time.Second, 10*time.Millisecond, "the watcher rotates the read key")
+	assert.EqualValues(t, 1, posted.Load(), "one read key change")
+	acl.RLock()
+	state := acl.AclState()
+	assert.NotEqual(t, keyBefore, state.CurrentReadKeyId())
+	assert.True(t, state.Permissions(member.SignKey.GetPublic()).NoPermissions())
+	acl.RUnlock()
+
+	// Nothing more is written once the rotation is done.
+	time.Sleep(200 * time.Millisecond)
+	assert.EqualValues(t, 1, posted.Load())
+}
+
 // The refusal is on the synced row: a device of the account with no
 // copy of the child reads why no node holds it, and is told that the
 // push is another device's to retry.
@@ -1258,6 +1398,67 @@ func TestSDK_ChildRotationPending(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, pending)
 	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// A device of an Admin of a child that starts with a rotation pending
+// ends it by itself: the boot pass loads the child and starts the
+// watcher that rotates, with no Get of the space.
+func TestSDK_ChildSpace_RotationAfterRestartWithoutGet(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+
+	// A child another account owns, held here by one of its Admins,
+	// with a member that an Admin of the parent removes without the
+	// read key. The space is never opened with Get, so nothing here
+	// rotates in this run.
+	parent := foreignSpaceA
+	require.NoError(t, sdk.Spaces().Track(ctx, parent))
+	child := newForeignChild(t, network, parent)
+	acl := child.heldBy(t, ctx, sdk, parent, list.AclPermissionsAdmin)
+	member := child.addMember(t, list.AclPermissionsWriter)
+	parentAdmin, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	st, err := list.NewInMemoryStorage(child.records[0].Id, child.records)
+	require.NoError(t, err)
+	outside, err := list.BuildAclListWithIdentity(parentAdmin, st, recordverifier.NewValidateAcceptedLog())
+	require.NoError(t, err)
+	removal, err := outside.RecordBuilder().BuildAccountRemoveNoRotate([]crypto.PubKey{member})
+	require.NoError(t, err)
+	child.accept(removal)
+	acl.Lock()
+	err = acl.AddRawRecords(child.records)
+	pending := acl.AclState().RotationPending()
+	acl.Unlock()
+	require.NoError(t, err)
+	require.True(t, pending)
+	require.NoError(t, sdk.Close())
+
+	var posted atomic.Int32
+	child.serve(t, &net.nodes, func(*consensusproto.RawRecord) error {
+		posted.Add(1)
+		return nil
+	})
+	sdk, err = Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+
+	require.Eventually(t, func() bool {
+		handle, ok := sdk.app.PickSpace(ctx, child.id)
+		if !ok {
+			return false
+		}
+		acl := handle.Inner().Acl()
+		acl.RLock()
+		defer acl.RUnlock()
+		return !acl.AclState().RotationPending() && posted.Load() == 1
+	}, 20*time.Second, 10*time.Millisecond, "the device rotates the read key at start")
+	assert.EqualValues(t, 1, posted.Load(), "one read key change")
 }
 
 // An id that is not a space id is refused as one by every child-space

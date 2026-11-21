@@ -259,9 +259,12 @@ type Service interface {
 	// ChildRotationPending reports, from the ACL the nodes serve,
 	// whether members removed from the child space childSpaceId still
 	// hold its current read key: true from a RemoveChildMembers until
-	// an Admin or the Owner of the child has changed the key. Nothing
-	// of the child is tracked or stored. Like ChildMembers it checks no
-	// role, and its errors are the same.
+	// an Admin or the Owner of the child has changed the key. It is
+	// ACL.RotationPending for the parent's Admins and Owner, who are no
+	// members of the child. A child that stays pending has no device of
+	// an Admin or the Owner left to change the key; DeleteChild is what
+	// remains. Nothing of the child is tracked or stored. Like
+	// ChildMembers it checks no role, and its errors are the same.
 	ChildRotationPending(ctx context.Context, childSpaceId string) (bool, error)
 
 	// RemoveChildMembers removes members of the child space
@@ -274,9 +277,10 @@ type Service interface {
 	//
 	// The removal takes effect at once; the removed members keep the
 	// current read key until an Admin or the Owner of the child changes
-	// it. The child's Owner cannot be removed, and an Admin of the
-	// parent does not remove an account that is an Admin or the Owner
-	// of the parent.
+	// it, which the SDK does by itself on a device of such a member
+	// (ACL.RotationPending). The child's Owner cannot be removed, and
+	// an Admin of the parent does not remove an account that is an
+	// Admin or the Owner of the parent.
 	//
 	// The record is built from the ACL the nodes serve and posted
 	// through them: the child is not added to the index, loaded or

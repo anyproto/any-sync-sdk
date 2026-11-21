@@ -130,6 +130,8 @@ type App struct {
 
 	// cred asks the coordinator for space receipts.
 	cred *credentialProvider
+	// onNodeRound is told each head-sync round a tree node answered.
+	onNodeRound atomic.Pointer[func(spaceId string)]
 
 	// pubsub is the commonspace/pubsub engine (ephemeral, ACL-gated
 	// pub/sub). Registered as an app component; reached through the

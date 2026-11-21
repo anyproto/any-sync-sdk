@@ -296,6 +296,7 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
 	app.OnChildSign(s.childSignAnswered, s.recordedRefusal)
 	app.SetOwnStoredFn(s.ownsStored)
+	app.OnNodeRound(s.nodeRound)
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
@@ -709,58 +710,83 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 	}
 
 	// ACL mirror: ACL state → this space's tech-space row `push` +
-	// `ownRole` fields (aclmirror_watcher.go). Same dedup dance; the
-	// initial mirror pass is primed inside newAclMirrorWatcher.
-	// Registered on the space's ACL kick fan-out so read-key rotations
-	// and permission changes land promptly.
-	if s.tsp != nil {
-		s.mu.Lock()
-		_, dup := s.aclMirrorWatchers[spaceId]
-		s.mu.Unlock()
-		if !dup {
-			w := newAclMirrorWatcher(s, spaceId)
-			s.mu.Lock()
-			if _, raced := s.aclMirrorWatchers[spaceId]; raced {
-				s.mu.Unlock()
-				w.stop()
-			} else {
-				s.aclMirrorWatchers[spaceId] = w
-				s.watchers.register(w)
-				s.mu.Unlock()
-				var mux *aclKickMux
-				if acl := handle.Inner().Acl(); acl != nil {
-					mux = s.aclKickFanout(spaceId, acl)
-					mux.add(w)
-					// Close the wiring gap: the primed mirror pass may
-					// already have read ACL state BEFORE the mux
-					// subscription above — an ACL record applied in that
-					// window produced no kick, and on a quiet space
-					// nothing else ever would. One post-subscribe kick
-					// re-mirrors from current state; coalescing makes it
-					// free when the primed pass hasn't run yet.
-					w.kick()
-				}
-				// Re-check against a concurrent offload: closeSpaceRuntime
-				// stops watchers and clears the maps under s.mu, but this
-				// wiring ran outside it — if the space was torn down
-				// meanwhile (spaceIndexIds entry gone), unwind so no live
-				// watcher survives against a closed space.
-				s.mu.Lock()
-				if _, live := s.spaceIndexIds[spaceId]; !live {
-					delete(s.aclMirrorWatchers, spaceId)
-					s.mu.Unlock()
-					if mux != nil {
-						mux.remove(w)
-					}
-					s.watchers.unregister(w)
-					w.stop()
-				} else {
-					s.mu.Unlock()
-				}
-			}
-		}
-	}
+	// `ownRole` fields (aclmirror_watcher.go). Unwound when the space
+	// was torn down while it was wired (spaceIndexIds entry gone).
+	s.ensureAclMirror(spaceId, handle.Inner().Acl(), func() bool {
+		_, live := s.spaceIndexIds[spaceId]
+		return live
+	})
 	return objectId, nil
+}
+
+// ensureAclMirror starts spaceId's ACL mirror watcher, once per loaded
+// lifetime of the space, and registers it on the space's ACL kick
+// fan-out so read-key rotations and permission changes land promptly.
+// The initial mirror pass is primed inside newAclMirrorWatcher. live is
+// asked under s.mu once the watcher is wired: the wiring runs outside
+// the lock, and closeSpaceRuntime stops watchers and clears the maps
+// under it, so a watcher wired for a space torn down meanwhile is
+// unwound.
+func (s *Service) ensureAclMirror(spaceId string, acl list.AclList, live func() bool) {
+	if s.tsp == nil {
+		return
+	}
+	s.mu.Lock()
+	_, dup := s.aclMirrorWatchers[spaceId]
+	s.mu.Unlock()
+	if dup {
+		return
+	}
+	w := newAclMirrorWatcher(s, spaceId)
+	s.mu.Lock()
+	if _, raced := s.aclMirrorWatchers[spaceId]; raced {
+		s.mu.Unlock()
+		w.stop()
+		return
+	}
+	s.aclMirrorWatchers[spaceId] = w
+	s.watchers.register(w)
+	s.mu.Unlock()
+	var mux *aclKickMux
+	if acl != nil {
+		mux = s.aclKickFanout(spaceId, acl)
+		mux.add(w)
+		// Close the wiring gap: the primed mirror pass may already have
+		// read ACL state BEFORE the mux subscription above — an ACL
+		// record applied in that window produced no kick, and on a
+		// quiet space nothing else ever would. One post-subscribe kick
+		// re-mirrors from current state; coalescing makes it free when
+		// the primed pass hasn't run yet.
+		w.kick()
+	}
+	s.mu.Lock()
+	if live() {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.aclMirrorWatchers, spaceId)
+	s.mu.Unlock()
+	if mux != nil {
+		mux.remove(w)
+	}
+	s.watchers.unregister(w)
+	w.stop()
+}
+
+// StartAclMirror starts the ACL mirror watcher of a loaded space
+// without the rest of the wiring a Get does. The boot pass calls it for
+// the child spaces it loads, after it built their store: the watcher is
+// what ends a pending key rotation (rotation.go), and a device of an
+// Admin or the Owner of a child ends one without waiting for a Get.
+func (s *Service) StartAclMirror(ctx context.Context, spaceId string) {
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
+		return
+	}
+	s.ensureAclMirror(spaceId, handle.Inner().Acl(), func() bool {
+		_, live := s.stores[spaceId]
+		return live
+	})
 }
 
 // spaceIndexTreeId is the id of spaceId's derived spaceIndex tree, a

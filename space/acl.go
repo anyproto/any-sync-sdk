@@ -150,6 +150,18 @@ type ACL interface {
 	// can neither fetch nor reissue it.
 	CreateGuestKey(ctx context.Context) (Invite, error)
 
+	// RotationPending reports that members were removed from this
+	// space without a read key change and still hold the current read
+	// key. An Admin or the Owner of the parent space removes members of
+	// a child this way (Service.RemoveChildMembers): they are members
+	// no longer, and read what is written until the key changes.
+	//
+	// No call ends it. A device of an Admin or the Owner of this space
+	// that holds the read key changes the key by itself, while the
+	// space is loaded and the network reachable; RotationPending reads
+	// false once that record is applied here.
+	RotationPending(ctx context.Context) (bool, error)
+
 	// RevokeGuestKey removes the guest identity from the ACL and
 	// rotates the read key, cutting every guest off from new content
 	// (already-synced local copies stay readable on their devices).

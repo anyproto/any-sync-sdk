@@ -74,6 +74,9 @@ func (unsupportedACL) CancelJoinRequest(context.Context) error {
 	return errUnsupported("ACL().CancelJoinRequest")
 }
 func (unsupportedACL) StopSharing(context.Context) error { return errUnsupported("ACL().StopSharing") }
+func (unsupportedACL) RotationPending(context.Context) (bool, error) {
+	return false, errUnsupported("ACL().RotationPending")
+}
 func (unsupportedACL) CreateGuestKey(context.Context) (space.Invite, error) {
 	return space.Invite{}, errUnsupported("ACL().CreateGuestKey")
 }

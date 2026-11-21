@@ -37,6 +37,7 @@ func TestRefusalStringRoundTrip(t *testing.T) {
 		RefusalParentInvalid:          "parent_invalid",
 		RefusalParentPermissionDenied: "parent_permission_denied",
 		RefusalChildLimitReached:      "child_limit_reached",
+		RefusalHasChildren:            "has_children",
 	}
 	for r, label := range labels {
 		assert.Equal(t, label, r.String())

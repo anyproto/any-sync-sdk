@@ -235,7 +235,8 @@ const (
 	FieldOwnRole = "ownRole"
 	// FieldRefusal (SYNCED) is what the coordinator last refused for the
 	// space, in the space.Refusal wire vocabulary: the check a child
-	// space failed when the coordinator refused to sign it. Synced so
+	// space failed when the coordinator refused to sign it, or the
+	// deletion of a space that still has children. Synced so
 	// every device of the account reads why no node holds the space,
 	// also one that has no copy of it. Written by the device the
 	// coordinator answered, via Service.SetRefusal; absent or "none" on

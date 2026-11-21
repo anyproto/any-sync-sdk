@@ -102,6 +102,9 @@ type SpaceInfo struct {
 	// device with no copy of the space reads it too, and back to
 	// RefusalNone once the coordinator signs the space
 	// (Service.RetryPush asks it now). Status is not affected.
+	//
+	// On a deleted space RefusalHasChildren says that its deletion on
+	// the network waits for its child spaces (Service.Delete).
 	Refusal Refusal
 }
 

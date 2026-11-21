@@ -26,6 +26,11 @@ var (
 	// ErrChildSpacesLimitReached: the parent's Owner has as many child
 	// spaces as the network allows that account.
 	ErrChildSpacesLimitReached = coordinatorproto.ErrChildSpacesLimitReached
+
+	// ErrSpaceHasChildren: a space that still has child spaces is not
+	// deleted. Delete returns it for a space the account owns when the
+	// index holds a child of it or the coordinator says so.
+	ErrSpaceHasChildren = coordinatorproto.ErrSpaceHasChildren
 )
 
 // ErrNotChildSpace is returned by the calls that act on a child space
@@ -95,8 +100,9 @@ func (s ChildStatus) String() string {
 	}
 }
 
-// Refusal names the check a child space failed when the coordinator
-// refused to sign it at its push.
+// Refusal names what the coordinator refused for a space: the check a
+// child space failed when it was not signed at its push, or the
+// deletion of a space that still has children.
 type Refusal uint8
 
 const (
@@ -114,12 +120,16 @@ const (
 	// RefusalChildLimitReached: the parent's Owner is at its child
 	// spaces limit (ErrChildSpacesLimitReached).
 	RefusalChildLimitReached
+	// RefusalHasChildren: the coordinator does not delete the space
+	// while it has child spaces (ErrSpaceHasChildren). Set on a deleted
+	// space whose deletion on the network waits for its children.
+	RefusalHasChildren
 )
 
 // String returns the canonical wire label for the refusal — "none" /
 // "parent_not_available" / "parent_invalid" /
-// "parent_permission_denied" / "child_limit_reached". Unknown values
-// stringify as "none".
+// "parent_permission_denied" / "child_limit_reached" / "has_children".
+// Unknown values stringify as "none".
 func (r Refusal) String() string {
 	switch r {
 	case RefusalParentNotAvailable:
@@ -130,6 +140,8 @@ func (r Refusal) String() string {
 		return "parent_permission_denied"
 	case RefusalChildLimitReached:
 		return "child_limit_reached"
+	case RefusalHasChildren:
+		return "has_children"
 	default:
 		return "none"
 	}
@@ -138,7 +150,7 @@ func (r Refusal) String() string {
 // ParseRefusal maps a canonical wire label back onto the enum. Unknown
 // labels (including "") parse as RefusalNone.
 func ParseRefusal(s string) Refusal {
-	for r := RefusalParentNotAvailable; r <= RefusalChildLimitReached; r++ {
+	for r := RefusalParentNotAvailable; r <= RefusalHasChildren; r++ {
 		if r.String() == s {
 			return r
 		}

@@ -295,6 +295,9 @@ func (s *Service) DeleteChild(ctx context.Context, childSpaceId string) error {
 	if err != nil && !errors.Is(err, coordinatorproto.ErrSpaceDeletionPending) && !errors.Is(err, coordinatorproto.ErrSpaceIsDeleted) {
 		return networkErr("DeleteChild", err)
 	}
+	// A deletion of the parent that waits for its children is sent
+	// again now.
+	s.kickDeletionReconciler()
 	if !held || rec.IsDeleted() {
 		return nil
 	}

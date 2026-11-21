@@ -24,6 +24,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
 
@@ -1264,7 +1265,10 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 //
 // The tech space (system-owned, never in the list) and seed-derived
 // spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
-// refused outright.
+// refused outright, and so is a space with children
+// (space.ErrSpaceHasChildren): for a space the account owns the signed
+// delete goes to the coordinator on the call path when it answers,
+// before anything local is written.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
 	if spaceId == s.tsp.SpaceId() {
 		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrIsTechSpace)
@@ -1313,12 +1317,78 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// silently succeed while writing nothing (strict-skip modify).
 		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
+	// The coordinator refuses to delete a space that has children, and
+	// only its owner's delete reaches the coordinator. The tombstone is
+	// not taken back, so a space the account owns, or may own, and that
+	// can have children is settled before it is written: with the index
+	// for the children it holds, and with the coordinator when it
+	// answers. Without an answer the delete is deferred as before.
+	if settlesDelete(rec) {
+		if child, ok := s.heldChildOf(ctx, spaceId); ok {
+			return fmt.Errorf("spaceimpl: Delete: space %q has the child space %q: %w", spaceId, child, space.ErrSpaceHasChildren)
+		}
+		switch err := s.askDelete(ctx, spaceId); {
+		case errors.Is(err, coordinatorproto.ErrSpaceHasChildren):
+			return fmt.Errorf("spaceimpl: Delete: space %q: %w", spaceId, space.ErrSpaceHasChildren)
+		case err == nil:
+			// The network delete is under way: the local half follows
+			// whatever becomes of the caller's context.
+			ctx = context.WithoutCancel(ctx)
+		}
+	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
 	s.OffloadSpace(ctx, spaceId)
 	s.kickDeletionReconciler()
 	return nil
+}
+
+// settlesDelete reports a row whose delete is settled with the
+// coordinator before it is written: a space that can have children and
+// that the account owns, or may own while the ACL mirror has not
+// written its role. A row whose header was never read (no type) says
+// neither that the space is top-level nor, without a mirrored role,
+// whose it is. It could be a child of a space the account owns, which
+// a signed delete would delete for all its members, so such a row is
+// only removed from the account.
+func settlesDelete(rec techspace.SpaceIndexRecord) bool {
+	if notAParent(rec) != "" {
+		return false
+	}
+	if rec.OwnRole == space.PermissionOwner {
+		return true
+	}
+	return rec.Type != "" && rec.OwnRole == space.PermissionNone
+}
+
+// deleteSettleTimeout bounds how long Delete waits for the coordinator
+// before it defers the network delete to the reconciler.
+const deleteSettleTimeout = 5 * time.Second
+
+// askDelete sends the signed delete of spaceId to the coordinator on
+// the call path. An error other than the coordinator's refusal for
+// children leaves the delete to the reconciler: the coordinator is out
+// of reach, does not know the space yet, or knows another owner.
+func (s *Service) askDelete(ctx context.Context, spaceId string) error {
+	ctx, cancel := context.WithTimeout(ctx, deleteSettleTimeout)
+	defer cancel()
+	return s.app.SpaceDelete(ctx, spaceId)
+}
+
+// heldChildOf returns a child of parentSpaceId the index holds as a
+// live row.
+func (s *Service) heldChildOf(ctx context.Context, parentSpaceId string) (string, bool) {
+	rows, err := s.tsp.List(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, r := range rows {
+		if r.ParentSpaceId == parentSpaceId && !r.IsDeleted() {
+			return r.Id, true
+		}
+	}
+	return "", false
 }
 
 // Subscribe delivers live space-list deltas. It registers a sub on the

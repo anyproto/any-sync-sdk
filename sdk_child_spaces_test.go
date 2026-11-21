@@ -1121,6 +1121,37 @@ func TestSDK_ChildSpace_RotationCompletedByTheWatcher(t *testing.T) {
 	assert.EqualValues(t, 1, posted.Load())
 }
 
+// A space the account owns is not deleted while the index holds a child
+// of it: the coordinator would refuse the deletion, and Delete removes
+// the local copy before the coordinator answers.
+func TestSDK_Delete_OwnedSpaceWithHeldChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return parent.Info().OwnRole == space.PermissionOwner },
+		20*time.Second, 10*time.Millisecond, "the ACL mirror records the role")
+	first, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	second, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+
+	require.ErrorIs(t, spaces.Delete(ctx, parent.Id()), space.ErrSpaceHasChildren)
+	require.NoError(t, spaces.Delete(ctx, first.Id()))
+	require.ErrorIs(t, spaces.Delete(ctx, parent.Id()), space.ErrSpaceHasChildren, "one child is left")
+	assert.Equal(t, space.StatusActive, parent.Info().Status)
+	assert.True(t, sdk.app.SpaceExists(parent.Id()), "nothing of the parent is removed")
+	wmWrite(t, ctx, parent, 1)
+
+	require.NoError(t, spaces.Delete(ctx, second.Id()))
+	require.NoError(t, spaces.Delete(ctx, parent.Id()))
+	assert.Equal(t, space.StatusDeleted, parent.Info().Status)
+}
+
 // The refusal is on the synced row: a device of the account with no
 // copy of the child reads why no node holds it, and is told that the
 // push is another device's to retry.
@@ -1203,6 +1234,180 @@ func TestSDK_ChildSpace_SignWaitsForItsOwnParent(t *testing.T) {
 	assert.Equal(t, space.RefusalParentNotAvailable, foreign.Info().Refusal, "there it is a refusal")
 }
 
+func spaceInfoOf(t *testing.T, ctx context.Context, sdk *SDK, spaceId string) space.SpaceInfo {
+	t.Helper()
+	list, err := sdk.Spaces().List(ctx)
+	require.NoError(t, err)
+	for _, info := range list {
+		if info.Id == spaceId {
+			return info
+		}
+	}
+	t.Fatalf("no row for %s", spaceId)
+	return space.SpaceInfo{}
+}
+
+// The owner of a space is usually no member of the children others
+// created under it, so the index does not show them. With the
+// coordinator in reach, Delete asks it before anything is written: a
+// space with children is not deleted and stays as it is.
+func TestSDK_Delete_OwnedSpaceAsksTheCoordinatorFirst(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	coord.del = func(string) error { return coordinatorproto.ErrSpaceHasChildren }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	// Right after Create the ACL mirror may not have written the role.
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	require.ErrorIs(t, spaces.Delete(ctx, parent.Id()), space.ErrSpaceHasChildren)
+	assert.Equal(t, []string{parent.Id()}, coord.deleted, "the coordinator was asked")
+	info := parent.Info()
+	assert.Equal(t, space.StatusActive, info.Status)
+	assert.Equal(t, space.RefusalNone, info.Refusal)
+	assert.True(t, sdk.app.SpaceExists(parent.Id()), "nothing of the space is removed")
+	wmWrite(t, ctx, parent, 1)
+
+	// The coordinator finished deleting the last child.
+	coord.set(func() { coord.del = func(string) error { return nil } })
+	require.NoError(t, spaces.Delete(ctx, parent.Id()))
+	assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, parent.Id()).Status)
+	assert.False(t, sdk.app.SpaceExists(parent.Id()))
+
+	// A child cannot have children: its delete does not ask first.
+	other, err := spaces.Create(ctx, space.CreateRequest{Name: "Other"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: other.Id()})
+	require.NoError(t, err)
+	asked := len(coord.deleted)
+	coord.set(func() { coord.del = func(string) error { return anynet.ErrUnableToConnect } })
+	require.NoError(t, spaces.Delete(ctx, child.Id()))
+	assert.Len(t, coord.deleted, asked)
+}
+
+// parentDelete is a fake coordinator's side of the signed delete of one
+// space, the parent: the test says what it answers. Every other delete
+// is accepted, and the parent's status follows its own.
+type parentDelete struct {
+	id       atomic.Pointer[string]
+	answer   atomic.Pointer[error]
+	sent     atomic.Int32
+	accepted atomic.Bool
+}
+
+func (p *parentDelete) answers(err error) { p.answer.Store(&err) }
+
+func newParentDelete(coord *fakeCoordinator, first error) *parentDelete {
+	p := &parentDelete{}
+	p.answers(first)
+	isParent := func(spaceId string) bool {
+		id := p.id.Load()
+		return id != nil && *id == spaceId
+	}
+	coord.status = func(spaceId string) *coordinatorproto.SpaceStatusPayload {
+		st := &coordinatorproto.SpaceStatusPayload{
+			Status:      coordinatorproto.SpaceStatus_SpaceStatusCreated,
+			Permissions: coordinatorproto.SpacePermissions_SpacePermissionsOwner,
+		}
+		if isParent(spaceId) && p.accepted.Load() {
+			st.Status = coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+		}
+		return st
+	}
+	coord.del = func(spaceId string) error {
+		if !isParent(spaceId) {
+			return nil
+		}
+		p.sent.Add(1)
+		err := *p.answer.Load()
+		if err == nil {
+			p.accepted.Store(true)
+		}
+		return err
+	}
+	return p
+}
+
+// With no coordinator in reach the delete is deferred: the space leaves
+// the account at once. When the coordinator then refuses it for
+// children, the deleted row says so. The owner deletes the children,
+// and the delete goes through once the coordinator has finished
+// deleting them: until then they are children still.
+func TestSDK_Delete_DeferredDeleteWaitsForChildren(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	defer spaceimpl.SetDeletionReconcileIntervalForTest(50 * time.Millisecond)()
+	coord := &installFakeNetwork(t).coord
+	parentDelete := newParentDelete(coord, anynet.ErrUnableToConnect)
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	parentId := parent.Id()
+	parentDelete.id.Store(&parentId)
+	firstChild, lastChild := foreignChildId(t, parentId), foreignChildId(t, parentId)
+	refusal := func() space.Refusal { return spaceInfoOf(t, ctx, sdk, parentId).Refusal }
+
+	require.NoError(t, spaces.Delete(ctx, parentId), "out of reach: deferred")
+	info := spaceInfoOf(t, ctx, sdk, parentId)
+	assert.Equal(t, space.StatusDeleted, info.Status)
+	assert.Equal(t, space.RefusalNone, info.Refusal)
+	assert.False(t, sdk.app.SpaceExists(parentId))
+
+	// The coordinator is back and holds two children of the space.
+	parentDelete.answers(coordinatorproto.ErrSpaceHasChildren)
+	require.Eventually(t, func() bool { return refusal() == space.RefusalHasChildren },
+		10*time.Second, 10*time.Millisecond, "the deleted row says what its deletion waits for")
+	assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, parentId).Status)
+
+	// Deleted children are children until their deletion is final.
+	require.NoError(t, spaces.DeleteChild(ctx, firstChild))
+	require.NoError(t, spaces.DeleteChild(ctx, lastChild))
+	sent := parentDelete.sent.Load()
+	require.Eventually(t, func() bool { return parentDelete.sent.Load() >= sent+2 },
+		10*time.Second, 10*time.Millisecond, "the delete is sent again on every pass")
+	assert.Equal(t, space.RefusalHasChildren, refusal())
+
+	// The coordinator finished deleting them.
+	parentDelete.answers(nil)
+	require.Eventually(t, func() bool {
+		return parentDelete.accepted.Load() && refusal() == space.RefusalNone
+	}, 10*time.Second, 10*time.Millisecond, "the waiting delete goes through")
+}
+
+// An accepted DeleteChild starts a pass of the deletion reconciler: a
+// delete of the parent that waits for its children is sent again
+// without waiting for the next pass.
+func TestSDK_DeleteChild_SendsAWaitingParentDeleteAgain(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	// Only a kick starts a pass of the reconciler.
+	defer spaceimpl.SetDeletionReconcileIntervalForTest(time.Hour)()
+	coord := &installFakeNetwork(t).coord
+	parentDelete := newParentDelete(coord, anynet.ErrUnableToConnect)
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	parentId := parent.Id()
+	parentDelete.id.Store(&parentId)
+	require.NoError(t, spaces.Delete(ctx, parentId), "out of reach: deferred")
+
+	parentDelete.answers(coordinatorproto.ErrSpaceHasChildren)
+	sent := parentDelete.sent.Load()
+	require.NoError(t, spaces.DeleteChild(ctx, foreignChildId(t, parentId)))
+	require.Eventually(t, func() bool {
+		return parentDelete.sent.Load() > sent && spaceInfoOf(t, ctx, sdk, parentId).Refusal == space.RefusalHasChildren
+	}, 10*time.Second, 10*time.Millisecond)
+}
+
 // An Admin or the Owner of a parent reads who is in a child it is no
 // member of, removes one of them and hands the child to another: each
 // over the ACL the nodes serve, with nothing of the child kept here.
@@ -1279,6 +1484,49 @@ func TestSDK_ChildMembers_AndTheRecordsBuiltOnThem(t *testing.T) {
 	}, members)
 	assert.True(t, child.ownerAcl(t).AclState().RotationPending(), "the removal left the read key as it was")
 	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// A row whose header was never read says neither what the space is nor
+// whose. It can be a child of a space the account owns, and the
+// coordinator takes a signed delete of a child from the parent's Owner:
+// Delete only removes such a row from the account.
+func TestSDK_Delete_RowWithUnreadHeaderSendsNoSignedDelete(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	defer spaceimpl.SetDeletionReconcileIntervalForTest(50 * time.Millisecond)()
+	coord := &installFakeNetwork(t).coord
+	var asked atomic.Int32
+	coord.del = func(string) error {
+		asked.Add(1)
+		return nil
+	}
+	// The coordinator tells the caller's own place in each space: no
+	// owner of the child.
+	coord.status = func(string) *coordinatorproto.SpaceStatusPayload {
+		return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusCreated}
+	}
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	childId := foreignChildId(t, parent.Id())
+	require.NoError(t, spaces.Track(ctx, childId))
+	rec, ok := sdk.tsp.Get(ctx, childId)
+	require.True(t, ok)
+	require.Empty(t, rec.Type)
+	require.Empty(t, rec.ParentSpaceId)
+	require.Equal(t, space.PermissionNone, rec.OwnRole)
+
+	require.NoError(t, spaces.Delete(ctx, childId))
+	assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, childId).Status)
+
+	passes := spaceimpl.DeletionReconcilePassesForTest()
+	require.Eventually(t, func() bool { return spaceimpl.DeletionReconcilePassesForTest() >= passes+2 },
+		10*time.Second, 10*time.Millisecond)
+	assert.Zero(t, asked.Load(), "no signed delete, on the call path or from the reconciler")
+	assert.Equal(t, space.StatusActive, spaceInfoOf(t, ctx, sdk, parent.Id()).Status)
 }
 
 // A space the coordinator does not know, and one it holds as deleted or

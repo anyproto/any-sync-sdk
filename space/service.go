@@ -512,6 +512,18 @@ type Service interface {
 	// request pending and the space unjoinable for this account forever.
 	// If the owner accepted meanwhile, the delete proceeds as for any
 	// member's space.
+	//
+	// A space is deleted after its child spaces: the coordinator
+	// refuses it while one is left. For a space the account owns,
+	// Delete returns ErrSpaceHasChildren and changes nothing when the
+	// index holds a child of it, or when the coordinator is in reach
+	// and holds one: the signed delete is then sent before anything
+	// local is written. With no coordinator in reach the delete is
+	// deferred as for any space; if the coordinator later refuses it
+	// for children, the deleted row reads RefusalHasChildren until they
+	// are gone (Children, DeleteChild) and the delete went through. A
+	// deleted child counts until the coordinator has finished deleting
+	// it: Children lists it until then.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings

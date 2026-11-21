@@ -58,6 +58,8 @@ type fakeCoordinator struct {
 	signs int
 	// status answers StatusCheckMany for one space.
 	status func(spaceId string) *coordinatorproto.SpaceStatusPayload
+	// children answers SpaceChildren.
+	children func(spaceId string) ([]*coordinatorproto.SpaceChild, error)
 }
 
 func (f *fakeCoordinator) set(fn func()) {
@@ -92,6 +94,16 @@ func (f *fakeCoordinator) StatusCheckMany(ctx context.Context, spaceIds []string
 		out[i] = status(id)
 	}
 	return out, &coordinatorproto.AccountLimits{}, nil
+}
+
+func (f *fakeCoordinator) SpaceChildren(ctx context.Context, spaceId string) ([]*coordinatorproto.SpaceChild, error) {
+	f.mu.Lock()
+	children := f.children
+	f.mu.Unlock()
+	if children == nil {
+		return f.CoordinatorClient.SpaceChildren(ctx, spaceId)
+	}
+	return children(spaceId)
 }
 
 // childTestConfig is wmConfig with every node address on a closed port
@@ -444,7 +456,70 @@ func TestSDK_ChildSpace_RefusalClearedByCoordinatorStatus(t *testing.T) {
 // A space id no account of the test holds.
 const (
 	foreignSpaceA = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.2a5s8kx60jkm"
+	foreignSpaceB = "bafybeibwzifw52ttrkqlikfzext5akxu7lz4xiwjgwzmqcpdzmp3n5vnbe.2a5s8kx60jkm"
+	foreignSpaceC = "bafybeihdwdcefgh4dqkjv67uzcmw7ojee6xedzdetojuzjevtenxquvyku.2a5s8kx60jkm"
 )
+
+// Children comes from the coordinator and from nowhere else: no answer
+// offline, a typed error for a caller without the role, and no row or
+// storage for the spaces it lists.
+func TestSDK_Children(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	_, err := spaces.Children(ctx, foreignSpaceA)
+	require.ErrorIs(t, err, space.ErrOffline)
+
+	_, err = spaces.Children(ctx, "not-a-space-id")
+	require.ErrorIs(t, err, space.ErrBadSpaceId)
+
+	coord.set(func() {
+		coord.children = func(string) ([]*coordinatorproto.SpaceChild, error) {
+			return nil, coordinatorproto.ErrParentPermissionDenied
+		}
+	})
+	_, err = spaces.Children(ctx, foreignSpaceA)
+	require.ErrorIs(t, err, space.ErrParentPermissionDenied)
+	require.NotErrorIs(t, err, space.ErrOffline)
+
+	var asked string
+	coord.set(func() {
+		coord.children = func(spaceId string) ([]*coordinatorproto.SpaceChild, error) {
+			asked = spaceId
+			return []*coordinatorproto.SpaceChild{
+				{SpaceId: foreignSpaceB, Status: coordinatorproto.SpaceStatus_SpaceStatusCreated},
+				{SpaceId: foreignSpaceC, Status: coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion},
+			}, nil
+		}
+	})
+	before, err := spaces.List(ctx)
+	require.NoError(t, err)
+	children, err := spaces.Children(ctx, foreignSpaceA)
+	require.NoError(t, err)
+	assert.Equal(t, foreignSpaceA, asked)
+	assert.Equal(t, []space.ChildSpace{
+		{Id: foreignSpaceB, Status: space.ChildStatusActive},
+		{Id: foreignSpaceC, Status: space.ChildStatusDeletionPending},
+	}, children)
+
+	after, err := spaces.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, after, len(before), "listing children adds no row")
+	for _, id := range []string{foreignSpaceA, foreignSpaceB, foreignSpaceC} {
+		assert.False(t, sdk.app.SpaceExists(id), "and no storage")
+	}
+
+	coord.set(func() {
+		coord.children = func(string) ([]*coordinatorproto.SpaceChild, error) { return nil, nil }
+	})
+	children, err = spaces.Children(ctx, foreignSpaceA)
+	require.NoError(t, err)
+	assert.Empty(t, children)
+}
 
 // foreignChildId is the id of a child space of parentSpaceId that
 // another account created: this device holds nothing of it.

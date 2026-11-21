@@ -223,6 +223,18 @@ type Service interface {
 	// removed with Delete.
 	RetryPush(ctx context.Context, spaceId string) error
 
+	// Children lists the child spaces of parentSpaceId as the
+	// coordinator holds them, the ones this account is not a member of
+	// included. Only an Admin or the Owner of the parent gets the list:
+	// ErrParentPermissionDenied for any other caller. A member finds
+	// the children it belongs to in List, by SpaceInfo.ParentSpaceId.
+	//
+	// The list is read from the coordinator on every call and kept
+	// nowhere: ErrOffline when it cannot be reached. The account needs
+	// no row for the parent, and none is created for a child.
+	// ErrBadSpaceId for an id that is not a space id.
+	Children(ctx context.Context, parentSpaceId string) ([]ChildSpace, error)
+
 	// Join a space via an invite. Depending on the invite key mode the
 	// space is either immediately active or pending approval. The
 	// pending join is account-wide: the row reads StatusJoining on every

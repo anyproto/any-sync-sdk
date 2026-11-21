@@ -52,6 +52,40 @@ type CreateChildRequest struct {
 	IconCID     string
 }
 
+// ChildSpace is a child of a parent space as the coordinator lists it.
+// A deleted child is listed until its deletion is final.
+type ChildSpace struct {
+	Id     string
+	Status ChildStatus
+}
+
+// ChildStatus is the state of a child space on the network.
+type ChildStatus uint8
+
+const (
+	ChildStatusUnknown ChildStatus = iota
+	ChildStatusActive
+	// ChildStatusDeletionPending: the deletion of the child was
+	// requested and is not finished.
+	ChildStatusDeletionPending
+	ChildStatusDeleted
+)
+
+// String returns the canonical wire label for the status — "unknown" /
+// "active" / "deletion_pending" / "deleted".
+func (s ChildStatus) String() string {
+	switch s {
+	case ChildStatusActive:
+		return "active"
+	case ChildStatusDeletionPending:
+		return "deletion_pending"
+	case ChildStatusDeleted:
+		return "deleted"
+	default:
+		return "unknown"
+	}
+}
+
 // Refusal names the check a child space failed when the coordinator
 // refused to sign it at its push.
 type Refusal uint8

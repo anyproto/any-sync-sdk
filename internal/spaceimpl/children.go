@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	anynet "github.com/anyproto/any-sync/net"
 	"go.uber.org/zap"
 
@@ -133,6 +134,36 @@ func (s *Service) RetryPush(ctx context.Context, spaceId string) error {
 		return fmt.Errorf("spaceimpl: RetryPush: space %q: %w", spaceId, space.ErrSpaceNotStored)
 	}
 	return networkErr("RetryPush", s.app.SignSpace(ctx, spaceId))
+}
+
+// Children lists the children of parentSpaceId from the coordinator —
+// see space.Service.Children.
+func (s *Service) Children(ctx context.Context, parentSpaceId string) ([]space.ChildSpace, error) {
+	if err := validateSpaceId(parentSpaceId); err != nil {
+		return nil, err
+	}
+	children, err := s.app.Coordinator().SpaceChildren(ctx, parentSpaceId)
+	if err != nil {
+		return nil, networkErr("Children", err)
+	}
+	out := make([]space.ChildSpace, 0, len(children))
+	for _, child := range children {
+		out = append(out, space.ChildSpace{Id: child.SpaceId, Status: childStatus(child.Status)})
+	}
+	return out, nil
+}
+
+func childStatus(st coordinatorproto.SpaceStatus) space.ChildStatus {
+	switch st {
+	case coordinatorproto.SpaceStatus_SpaceStatusCreated:
+		return space.ChildStatusActive
+	case coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
+		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted:
+		return space.ChildStatusDeletionPending
+	case coordinatorproto.SpaceStatus_SpaceStatusDeleted:
+		return space.ChildStatusDeleted
+	}
+	return space.ChildStatusUnknown
 }
 
 // networkErr wraps the error of a call that needs an answer from the

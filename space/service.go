@@ -686,10 +686,12 @@ type SpaceListEvent struct {
 // AccountLimits is what the network grants the account. Returned by
 // Account().Limits. A part is nil while the network has never answered
 // for it on this device; Storage also on a network that has no file
-// nodes or keeps no account pool.
+// nodes or keeps no account pool. SharedSpaces and ChildSpaces are one
+// answer of the coordinator.
 type AccountLimits struct {
 	Storage      *StorageLimits
 	SharedSpaces *SharedSpacesLimits
+	ChildSpaces  *ChildSpacesLimits
 }
 
 // StorageLimits is the account's file-storage pool: every file is
@@ -707,6 +709,14 @@ type StorageLimits struct {
 
 // SharedSpacesLimits bounds the shared spaces the account owns.
 type SharedSpacesLimits struct {
+	Limit uint32
+	// FetchedAt is when the network gave this answer.
+	FetchedAt time.Time
+}
+
+// ChildSpacesLimits bounds the child spaces of all the spaces the
+// account owns, whoever created them.
+type ChildSpacesLimits struct {
 	Limit uint32
 	// FetchedAt is when the network gave this answer.
 	FetchedAt time.Time

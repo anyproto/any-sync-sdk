@@ -1087,7 +1087,8 @@ type AccountAPI interface {
 	OpenIcon(ctx context.Context) (space.FileReader, error)
 
 	// Limits returns what the network grants the account: the
-	// file-storage pool with its usage, and the shared-spaces limit.
+	// file-storage pool with its usage, the shared-spaces limit and the
+	// child-spaces limit.
 	// Each part is asked from the network, no more often than every
 	// ten seconds, and kept on the device. A call waits for the
 	// network no longer than five seconds, and not at all while the
@@ -1114,10 +1115,10 @@ type accountImpl struct {
 	tsp    *techspace.Service
 	spaces *spaceimpl.Service
 	// limits is the network side of Limits; limitsKV keeps its answers.
-	limits             limitsSource
-	limitsKV           limitsKV
-	storageLimits      limitsPart[space.StorageLimits]
-	sharedSpacesLimits limitsPart[space.SharedSpacesLimits]
+	limits        limitsSource
+	limitsKV      limitsKV
+	storageLimits limitsPart[space.StorageLimits]
+	spacesLimits  limitsPart[spacesLimits]
 	// pushMu serializes each local-profile-read/write → IdentityRepoPut
 	// sequence. The boot republish runs on the bootstrap goroutine,
 	// concurrent with user calls; without the lock its in-flight put of
@@ -1173,7 +1174,7 @@ func (a *accountImpl) close() {
 	a.closeOnce.Do(a.closeCancel)
 	a.stopIconWatch()
 	a.storageLimits.stop()
-	a.sharedSpacesLimits.stop()
+	a.spacesLimits.stop()
 	a.wg.Wait()
 }
 

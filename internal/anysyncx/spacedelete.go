@@ -46,15 +46,15 @@ func (a *App) SpaceStatuses(ctx context.Context, spaceIds []string) ([]*coordina
 	return statuses, nil
 }
 
-// SharedSpacesLimit fetches how many shared spaces the network lets
-// this account own.
-func (a *App) SharedSpacesLimit(ctx context.Context) (uint32, error) {
+// SpacesLimits fetches how many shared spaces the network lets this
+// account own, and how many child spaces the spaces it owns can have.
+func (a *App) SpacesLimits(ctx context.Context) (shared, children uint32, err error) {
 	_, limits, err := a.coord.StatusCheckMany(ctx, nil)
 	if err != nil {
-		return 0, fmt.Errorf("anysyncx: StatusCheckMany: %w", err)
+		return 0, 0, fmt.Errorf("anysyncx: StatusCheckMany: %w", err)
 	}
 	if limits == nil {
-		return 0, errors.New("anysyncx: coordinator reported no account limits")
+		return 0, 0, errors.New("anysyncx: coordinator reported no account limits")
 	}
-	return limits.SharedSpacesLimit, nil
+	return limits.SharedSpacesLimit, limits.ChildSpacesLimit, nil
 }

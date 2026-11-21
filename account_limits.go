@@ -44,7 +44,7 @@ type limitsSource interface {
 	// hasFileNodes is false on a network that stores no files.
 	hasFileNodes() bool
 	storage(ctx context.Context) (limitBytes, usageBytes uint64, err error)
-	sharedSpaces(ctx context.Context) (limit uint32, err error)
+	spaces(ctx context.Context) (shared, children uint32, err error)
 }
 
 // limitsKV keeps the last answers on the device.
@@ -56,14 +56,25 @@ type limitsKV interface {
 // storedLimits is an answer as kept on the device. Its field names are
 // its own, so the stored form does not follow the public types.
 type storedLimits struct {
-	LimitBytes uint64    `json:"limitBytes,omitempty"`
-	UsageBytes uint64    `json:"usageBytes,omitempty"`
-	Limit      uint32    `json:"limit,omitempty"`
+	LimitBytes uint64 `json:"limitBytes,omitempty"`
+	UsageBytes uint64 `json:"usageBytes,omitempty"`
+	Limit      uint32 `json:"limit,omitempty"`
+	// ChildLimit is absent in an answer stored before the coordinator
+	// gave one.
+	ChildLimit *uint32   `json:"childLimit,omitempty"`
 	FetchedAt  time.Time `json:"fetchedAt"`
 }
 
-// networkLimits reads the shared-spaces limit from the coordinator and
-// the storage pool from the file nodes. The pool is account-wide, so any
+// spacesLimits is the coordinator's answer: the shared-spaces and the
+// child-spaces limit come together.
+type spacesLimits struct {
+	shared   uint32
+	children *uint32
+	fetched  time.Time
+}
+
+// networkLimits reads the shared-spaces and child-spaces limits from
+// the coordinator and the storage pool from the file nodes. The pool is account-wide, so any
 // space reports it; the tech space is the one every account has.
 type networkLimits struct {
 	app     *anysyncx.App
@@ -91,8 +102,8 @@ func (n networkLimits) storage(ctx context.Context) (uint64, uint64, error) {
 	return quota.GetAccountLimitBytes(), quota.GetAccountUsageBytes(), nil
 }
 
-func (n networkLimits) sharedSpaces(ctx context.Context) (uint32, error) {
-	return n.app.SharedSpacesLimit(ctx)
+func (n networkLimits) spaces(ctx context.Context) (uint32, uint32, error) {
+	return n.app.SpacesLimits(ctx)
 }
 
 // hasAccountPool is false for a node that holds no pool view: it runs on
@@ -134,7 +145,7 @@ type limitsRun struct {
 }
 
 func (a *accountImpl) initLimits() {
-	st, sh := &a.storageLimits, &a.sharedSpacesLimits
+	st, sh := &a.storageLimits, &a.spacesLimits
 	st.key, sh.key = storageLimitsKey, sharedSpacesLimitsKey
 	st.fetch = func(ctx context.Context) (*space.StorageLimits, error) {
 		limit, usage, err := a.limits.storage(ctx)
@@ -149,24 +160,25 @@ func (a *accountImpl) initLimits() {
 	st.decode = func(s storedLimits) *space.StorageLimits {
 		return &space.StorageLimits{LimitBytes: s.LimitBytes, UsageBytes: s.UsageBytes, FetchedAt: s.FetchedAt}
 	}
-	sh.fetch = func(ctx context.Context) (*space.SharedSpacesLimits, error) {
-		limit, err := a.limits.sharedSpaces(ctx)
+	sh.fetch = func(ctx context.Context) (*spacesLimits, error) {
+		shared, children, err := a.limits.spaces(ctx)
 		if err != nil {
 			return nil, err
 		}
-		return &space.SharedSpacesLimits{Limit: limit, FetchedAt: time.Now().UTC()}, nil
+		return &spacesLimits{shared: shared, children: &children, fetched: time.Now().UTC()}, nil
 	}
-	sh.encode = func(v *space.SharedSpacesLimits) storedLimits {
-		return storedLimits{Limit: v.Limit, FetchedAt: v.FetchedAt}
+	sh.encode = func(v *spacesLimits) storedLimits {
+		return storedLimits{Limit: v.shared, ChildLimit: v.children, FetchedAt: v.fetched}
 	}
-	sh.decode = func(s storedLimits) *space.SharedSpacesLimits {
-		return &space.SharedSpacesLimits{Limit: s.Limit, FetchedAt: s.FetchedAt}
+	sh.decode = func(s storedLimits) *spacesLimits {
+		return &spacesLimits{shared: s.Limit, children: s.ChildLimit, fetched: s.FetchedAt}
 	}
 	st.wait, st.retry, st.fresh = limitsWait, limitsRetry, limitsFresh
 	sh.wait, sh.retry, sh.fresh = limitsWait, limitsRetry, limitsFresh
 }
 
-// Limits reads both parts at once. See AccountAPI.Limits.
+// Limits reads the file nodes and the coordinator at once. See
+// AccountAPI.Limits.
 func (a *accountImpl) Limits(ctx context.Context) (space.AccountLimits, error) {
 	var (
 		out       space.AccountLimits
@@ -176,7 +188,14 @@ func (a *accountImpl) Limits(ctx context.Context) (space.AccountLimits, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		out.SharedSpaces, sharedErr = a.sharedSpacesLimits.get(ctx, a)
+		var spaces *spacesLimits
+		if spaces, sharedErr = a.spacesLimits.get(ctx, a); spaces == nil {
+			return
+		}
+		out.SharedSpaces = &space.SharedSpacesLimits{Limit: spaces.shared, FetchedAt: spaces.fetched}
+		if spaces.children != nil {
+			out.ChildSpaces = &space.ChildSpacesLimits{Limit: *spaces.children, FetchedAt: spaces.fetched}
+		}
 	}()
 	var storageErr error
 	if a.limits.hasFileNodes() {

@@ -37,8 +37,10 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 	return handle.Inner().AclClient(), nil
 }
 
-// CreateInvite mints a fresh RequestToJoin invite, replacing any
-// prior invite. Output is a share-friendly base58 token.
+// CreateInvite mints a RequestToJoin invite. ReplaceInvite refuses it
+// with ErrDuplicateInvites while one is active, and revokes the active
+// invites of other types in the same record. Output is a
+// share-friendly base58 token.
 //
 // The space must be registered with the coordinator before any ACL
 // record can be published — otherwise the node returns
@@ -51,7 +53,8 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 // custody (synced tech-space row), so every device of the minting
 // account can re-encode the same token — Members.Invites returns it
 // on the matching row. Persist failure fails the call: the ACL invite
-// stands, but an unrecoverable token defeats the contract; re-mint.
+// stands with a token nobody holds, and the next mint is refused as a
+// duplicate until that invite is revoked.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := ensureShareable(ctx, a.s); err != nil {
 		return space.Invite{}, err

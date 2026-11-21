@@ -39,7 +39,7 @@ var (
 	ErrAccountNotFound = list.ErrNoSuchAccount
 
 	// ErrInviteNotFound is returned by Join when the space's ACL holds
-	// no such invite (revoked, replaced, or never minted), and by
+	// no such invite (revoked or never minted), and by
 	// RevokeInvite for an unknown invite record.
 	ErrInviteNotFound = list.ErrNoSuchInvite
 
@@ -75,11 +75,12 @@ var (
 // Scope: only RequestToJoin invites are supported. AnyoneCanJoin is
 // deferred until any-sync ships v2 of that invite type.
 type ACL interface {
-	// CreateInvite mints a new RequestToJoin invite, revoking any
-	// prior invite on this space (mirrors AclSpaceClient.ReplaceInvite
-	// semantics — only one active invite at a time). The returned
-	// Invite is share-friendly (base58-encoded via Invite.Encode()
-	// equivalents on space.EncodeInvite).
+	// CreateInvite mints a RequestToJoin invite. A space holds one at a
+	// time: ErrDuplicateInvite while one is active, until it is revoked
+	// (RevokeInvite, RevokeAllInvites). An active invite of another
+	// type, which this SDK does not mint, is revoked by the same
+	// record. The returned Invite is share-friendly (base58 via
+	// space.EncodeInvite).
 	CreateInvite(ctx context.Context) (Invite, error)
 
 	// RevokeInvite revokes a single invite by record id. The record id

@@ -175,6 +175,24 @@ type Service interface {
 	// Create a new regular space owned by the authenticated account.
 	Create(ctx context.Context, req CreateRequest) (Space, error)
 
+	// CreateChild creates a regular space under req.ParentSpaceId, a
+	// space of the account's index. Like Create it is local and needs
+	// no network: the child's header names the parent, the child takes
+	// the parent's replication key, and nothing is written to the
+	// parent. The caller owns the child; membership in the parent gives
+	// no access to it.
+	//
+	// The network accepts the child at its first push: the account must
+	// then be a Writer, an Admin or the Owner of the parent, and the
+	// parent's Owner below its child spaces limit.
+	//
+	// ErrBadSpaceId for a parent id that is not a space id;
+	// ErrSpaceUnknown, ErrSpaceDeleted or ErrSpaceNotAccepted for a
+	// parent the account does not hold as an accepted space;
+	// ErrParentSpaceInvalid for one the index already shows cannot be a
+	// parent.
+	CreateChild(ctx context.Context, req CreateChildRequest) (Space, error)
+
 	// Join a space via an invite. Depending on the invite key mode the
 	// space is either immediately active or pending approval. The
 	// pending join is account-wide: the row reads StatusJoining on every

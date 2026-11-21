@@ -793,6 +793,14 @@ func (s *Service) spaceIndexObjectIdFor(ctx context.Context, spaceId string) (st
 // Create creates a new regular space owned by the authenticated
 // account, and writes its space-index entry into the tech space.
 func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Space, error) {
+	return s.create(ctx, req, "")
+}
+
+// create builds a regular space owned by the authenticated account and
+// its space-index entry. With parentSpaceId the space is a child of
+// that space: the header names it and the space takes its replication
+// key.
+func (s *Service) create(ctx context.Context, req space.CreateRequest, parentSpaceId string) (space.Space, error) {
 	keys := s.app.AccountKeys()
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
@@ -816,7 +824,11 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	// account land on the same coordinator shard. The tech space is
 	// derived deterministically from the account key, so its repKey
 	// is the canonical per-account value (per docs/space.md
-	// § "Replication key").
+	// § "Replication key"). A child lives on its parent's nodes instead.
+	replicationKeySource := s.tsp.SpaceId()
+	if parentSpaceId != "" {
+		replicationKeySource = parentSpaceId
+	}
 	// Owner metadata in the ACL root is the owner's metadata symkey only,
 	// so joiners learn the key and resolve the owner's profile from
 	// identityRepo (no inline name/icon on the ACL).
@@ -833,7 +845,8 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		SpaceType:   spaceType,
 		// any.* headers are files-v2 only (coordinator-enforced).
 		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
-		ReplicationKey:   replicationKeyFromSpaceId(s.tsp.SpaceId()),
+		ReplicationKey:   replicationKeyFromSpaceId(replicationKeySource),
+		ParentSpaceId:    parentSpaceId,
 	}
 	spaceId, err := s.app.SpaceService().CreateSpace(ctx, payload)
 	if err != nil {
@@ -841,13 +854,14 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	}
 
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
-		Id:           spaceId,
-		Type:         spaceType,
-		SpaceType:    spaceType,
-		Name:         req.Name,
-		Description:  req.Description,
-		IconCID:      req.IconCID,
-		RemoteStatus: techspace.StatusActive,
+		Id:            spaceId,
+		Type:          spaceType,
+		SpaceType:     spaceType,
+		Name:          req.Name,
+		Description:   req.Description,
+		IconCID:       req.IconCID,
+		RemoteStatus:  techspace.StatusActive,
+		ParentSpaceId: parentSpaceId,
 	}); err != nil {
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 	}

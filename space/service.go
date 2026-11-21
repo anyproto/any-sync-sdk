@@ -184,7 +184,11 @@ type Service interface {
 	//
 	// The network accepts the child at its first push: the account must
 	// then be a Writer, an Admin or the Owner of the parent, and the
-	// parent's Owner below its child spaces limit.
+	// parent's Owner below its child spaces limit. A child the
+	// coordinator refuses stays a usable local space with
+	// SpaceInfo.Refusal naming the failed check; see RetryPush. A child
+	// of a parent the account owns is pushed once the network holds the
+	// parent.
 	//
 	// ErrBadSpaceId for a parent id that is not a space id;
 	// ErrSpaceUnknown, ErrSpaceDeleted or ErrSpaceNotAccepted for a
@@ -192,6 +196,32 @@ type Service interface {
 	// ErrParentSpaceInvalid for one the index already shows cannot be a
 	// parent.
 	CreateChild(ctx context.Context, req CreateChildRequest) (Space, error)
+
+	// RetryPush asks the coordinator to sign the child space spaceId
+	// now and returns its answer. Call it for a space whose
+	// SpaceInfo.Refusal is set, once the cause is gone. Left alone, the
+	// SDK asks again by itself, a minute after a refusal and then less
+	// and less often, up to once an hour, and once after a restart; it
+	// never asks again by itself after RefusalParentInvalid.
+	//
+	// nil: the coordinator signed, the refusal is cleared and the space
+	// is pushed to the nodes in the background. One of
+	// ErrParentSpaceNotAvailable, ErrParentSpaceInvalid,
+	// ErrParentPermissionDenied, ErrChildSpacesLimitReached: it refused
+	// again, and SpaceInfo.Refusal names that check. ErrOffline: it
+	// could not be reached and nothing changed.
+	// ErrParentSpaceNotAvailable with no refusal recorded: the parent is
+	// the account's own and the network does not hold it yet; the SDK
+	// asks when it does.
+	//
+	// ErrBadSpaceId for an id that is not a space id, ErrSpaceUnknown,
+	// ErrSpaceDeleted or ErrSpaceNotAccepted for a
+	// space the account does not hold as an accepted space,
+	// ErrNotChildSpace for a top-level space, ErrSpaceNotStored on a
+	// device that has no copy of the space: the push is retried from a
+	// device that holds it. A refused child that is no longer wanted is
+	// removed with Delete.
+	RetryPush(ctx context.Context, spaceId string) error
 
 	// Join a space via an invite. Depending on the invite key mode the
 	// space is either immediately active or pending approval. The

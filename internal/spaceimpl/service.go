@@ -294,6 +294,8 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
+	app.OnChildSign(s.childSignAnswered, s.recordedRefusal)
+	app.SetOwnStoredFn(s.ownsStored)
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
@@ -1148,6 +1150,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Derived:       r.Derived,
 		P2PAdvertise:  r.P2PAdvertise,
 		ParentSpaceId: parentSpaceId,
+		Refusal:       r.Refusal,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band

@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/internal/crdt"
+	"github.com/anyproto/any-sync-sdk/internal/schema"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
@@ -773,4 +774,30 @@ func TestSpaceIndexHandler_ParentSpaceIdSetOnce(t *testing.T) {
 	// A top-level row carries no parent field at all.
 	top := techspace.SpaceIndexRecord{Id: "top", Type: "any.space"}.EncodeCreate(arena)
 	assert.Nil(t, top.Get(techspace.FieldParentSpaceId))
+}
+
+// The refusal is a synced field: every device of the account reads it.
+func TestSpaceIndexSchema_RefusalIsSynced(t *testing.T) {
+	for _, f := range techspace.SpaceIndexSchema().Fields {
+		if f.Id == techspace.FieldRefusal {
+			assert.Equal(t, schema.ScopeSynced, f.Scope)
+			return
+		}
+	}
+	t.Fatal("no refusal field in the schema")
+}
+
+func TestSpaceIndexRecord_DecodeRefusal(t *testing.T) {
+	arena := &anyenc.Arena{}
+	v := arena.NewObject()
+	v.Set("id", arena.NewString("s1"))
+	v.Set(techspace.FieldRefusal, arena.NewString("child_limit_reached"))
+	assert.Equal(t, space.RefusalChildLimitReached, techspace.DecodeSpaceIndexRecord(v).Refusal)
+
+	// A cleared refusal and a row never refused read the same.
+	v.Set(techspace.FieldRefusal, arena.NewString("none"))
+	assert.Equal(t, space.RefusalNone, techspace.DecodeSpaceIndexRecord(v).Refusal)
+	bare := arena.NewObject()
+	bare.Set("id", arena.NewString("s2"))
+	assert.Equal(t, space.RefusalNone, techspace.DecodeSpaceIndexRecord(bare).Refusal)
 }

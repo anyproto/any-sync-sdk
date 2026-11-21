@@ -96,6 +96,13 @@ type SpaceInfo struct {
 	// names it; empty for a top-level space. A joined space carries it
 	// from its first load on.
 	ParentSpaceId string
+	// Refusal is set on a child space the coordinator refused to sign:
+	// it names the failed check. The space stays usable on a device
+	// that holds it and exists on no node. Synced account-wide, so a
+	// device with no copy of the space reads it too, and back to
+	// RefusalNone once the coordinator signs the space
+	// (Service.RetryPush asks it now). Status is not affected.
+	Refusal Refusal
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

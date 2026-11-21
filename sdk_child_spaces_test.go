@@ -4,20 +4,95 @@ import (
 	"bytes"
 	"context"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/anyproto/any-sync-sdk/config"
 	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
+	"github.com/anyproto/any-sync-sdk/internal/spaceimpl"
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
 	"github.com/anyproto/any-sync-sdk/space"
 )
+
+// fakeNetwork answers in place of a network that is not there: the
+// coordinator. A call it has no answer for goes to the real client,
+// which reaches nobody.
+type fakeNetwork struct {
+	coord fakeCoordinator
+}
+
+// installFakeNetwork puts a fakeNetwork in front of the network clients
+// of every SDK opened until the test ends.
+func installFakeNetwork(t *testing.T) *fakeNetwork {
+	t.Helper()
+	n := &fakeNetwork{}
+	t.Cleanup(anysyncx.WrapComponentsForTest(func(c app.Component) app.Component {
+		switch real := c.(type) {
+		case coordinatorclient.CoordinatorClient:
+			n.coord.CoordinatorClient = real
+			return &n.coord
+		}
+		return c
+	}))
+	return n
+}
+
+type fakeCoordinator struct {
+	coordinatorclient.CoordinatorClient
+
+	mu sync.Mutex
+	// sign answers SpaceSign: nil signs.
+	sign  func() error
+	signs int
+	// status answers StatusCheckMany for one space.
+	status func(spaceId string) *coordinatorproto.SpaceStatusPayload
+}
+
+func (f *fakeCoordinator) set(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn()
+}
+
+func (f *fakeCoordinator) SpaceSign(ctx context.Context, payload coordinatorclient.SpaceSignPayload) (*coordinatorproto.SpaceReceiptWithSignature, error) {
+	f.mu.Lock()
+	sign := f.sign
+	f.signs++
+	f.mu.Unlock()
+	if sign == nil {
+		return f.CoordinatorClient.SpaceSign(ctx, payload)
+	}
+	if err := sign(); err != nil {
+		return nil, err
+	}
+	return &coordinatorproto.SpaceReceiptWithSignature{}, nil
+}
+
+func (f *fakeCoordinator) StatusCheckMany(ctx context.Context, spaceIds []string) ([]*coordinatorproto.SpaceStatusPayload, *coordinatorproto.AccountLimits, error) {
+	f.mu.Lock()
+	status := f.status
+	f.mu.Unlock()
+	if status == nil {
+		return f.CoordinatorClient.StatusCheckMany(ctx, spaceIds)
+	}
+	out := make([]*coordinatorproto.SpaceStatusPayload, len(spaceIds))
+	for i, id := range spaceIds {
+		out[i] = status(id)
+	}
+	return out, &coordinatorproto.AccountLimits{}, nil
+}
 
 // childTestConfig is wmConfig with every node address on a closed port
 // and no LAN peer: the network is not there.
@@ -232,7 +307,243 @@ func TestSDK_CreateChild_RefusedParents(t *testing.T) {
 	assert.Len(t, after, len(before), "a refused CreateChild adds no row")
 }
 
+// A child the coordinator refuses to sign stays a usable local space
+// that names the failed check. The reason survives a restart and is
+// cleared when the coordinator signs.
+func TestSDK_ChildSpace_RefusalRecordedAndCleared(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	dataDir := t.TempDir()
+	sdk := openChildTestSDK(t, ctx, dataDir)
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	sdk.app.NodeAnsweredForTest(parent.Id())
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	childId := child.Id()
+	assert.Equal(t, space.RefusalNone, child.Info().Refusal)
+
+	// The coordinator out of reach is no refusal.
+	require.ErrorIs(t, spaces.RetryPush(ctx, childId), space.ErrOffline)
+	assert.Equal(t, space.RefusalNone, child.Info().Refusal)
+
+	cases := []struct {
+		answer error
+		want   space.Refusal
+		err    error
+	}{
+		{coordinatorproto.ErrParentSpaceNotAvailable, space.RefusalParentNotAvailable, space.ErrParentSpaceNotAvailable},
+		{coordinatorproto.ErrParentSpaceInvalid, space.RefusalParentInvalid, space.ErrParentSpaceInvalid},
+		{coordinatorproto.ErrParentPermissionDenied, space.RefusalParentPermissionDenied, space.ErrParentPermissionDenied},
+		{coordinatorproto.ErrChildSpacesLimitReached, space.RefusalChildLimitReached, space.ErrChildSpacesLimitReached},
+	}
+	for _, tc := range cases {
+		coord.set(func() { coord.sign = func() error { return tc.answer } })
+		require.ErrorIs(t, spaces.RetryPush(ctx, childId), tc.err)
+		info := child.Info()
+		assert.Equal(t, tc.want, info.Refusal)
+		assert.Equal(t, space.StatusActive, info.Status, "a refused child stays a local space")
+	}
+	wmWrite(t, ctx, child, 1)
+	assert.Equal(t, space.RefusalNone, parent.Info().Refusal)
+
+	// Out of reach again: the recorded reason stays.
+	coord.set(func() { coord.sign = nil })
+	require.ErrorIs(t, spaces.RetryPush(ctx, childId), space.ErrOffline)
+	assert.Equal(t, space.RefusalChildLimitReached, child.Info().Refusal)
+	require.NoError(t, sdk.Close())
+
+	sdk = openChildTestSDK(t, ctx, dataDir)
+	spaces = sdk.Spaces()
+	list, err := spaces.List(ctx)
+	require.NoError(t, err)
+	refusals := map[string]space.Refusal{}
+	for _, info := range list {
+		refusals[info.Id] = info.Refusal
+	}
+	assert.Equal(t, space.RefusalChildLimitReached, refusals[childId], "the reason survives a restart")
+
+	sdk.app.NodeAnsweredForTest(parent.Id())
+	coord.set(func() { coord.sign = func() error { return nil } })
+	require.NoError(t, spaces.RetryPush(ctx, childId))
+	child, err = spaces.Get(ctx, childId)
+	require.NoError(t, err)
+	assert.Equal(t, space.RefusalNone, child.Info().Refusal)
+	require.NoError(t, sdk.Close())
+
+	sdk = openChildTestSDK(t, ctx, dataDir)
+	defer func() { _ = sdk.Close() }()
+	rec, ok := sdk.tsp.Get(ctx, childId)
+	require.True(t, ok)
+	assert.Equal(t, space.RefusalNone, rec.Refusal, "and stays cleared")
+}
+
+// RetryPush is for a child space the account holds.
+func TestSDK_RetryPush_RefusedSpaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	coord.sign = func() error { return nil }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+
+	require.ErrorIs(t, spaces.RetryPush(ctx, parent.Id()), space.ErrNotChildSpace)
+	require.ErrorIs(t, spaces.RetryPush(ctx, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.4unknown"), space.ErrSpaceUnknown)
+	require.NoError(t, spaces.Delete(ctx, child.Id()))
+	require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), space.ErrSpaceDeleted)
+	assert.Zero(t, coord.signs, "none of them reaches the coordinator")
+}
+
+// A refusal recorded on this device is over once the coordinator
+// reports the space registered: another device pushed it.
+func TestSDK_ChildSpace_RefusalClearedByCoordinatorStatus(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	defer spaceimpl.SetDeletionReconcileIntervalForTest(50 * time.Millisecond)()
+	coord := &installFakeNetwork(t).coord
+	coord.sign = func() error { return coordinatorproto.ErrChildSpacesLimitReached }
+	var registered atomic.Bool
+	coord.status = func(string) *coordinatorproto.SpaceStatusPayload {
+		if registered.Load() {
+			return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusCreated}
+		}
+		return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusNotExists}
+	}
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	sdk.app.NodeAnsweredForTest(parent.Id())
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), space.ErrChildSpacesLimitReached)
+
+	// Not registered: the refusal stands over any number of passes.
+	passes := spaceimpl.DeletionReconcilePassesForTest()
+	require.Eventually(t, func() bool { return spaceimpl.DeletionReconcilePassesForTest() >= passes+3 },
+		10*time.Second, 10*time.Millisecond)
+	assert.Equal(t, space.RefusalChildLimitReached, child.Info().Refusal)
+
+	registered.Store(true)
+	require.Eventually(t, func() bool { return child.Info().Refusal == space.RefusalNone },
+		10*time.Second, 10*time.Millisecond)
+	assert.Equal(t, space.StatusActive, child.Info().Status)
+}
+
 // A space id no account of the test holds.
 const (
 	foreignSpaceA = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.2a5s8kx60jkm"
 )
+
+// foreignChildId is the id of a child space of parentSpaceId that
+// another account created: this device holds nothing of it.
+func foreignChildId(t *testing.T, parentSpaceId string) string {
+	t.Helper()
+	keys, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	payload, err := spacepayloads.StoragePayloadForSpaceCreateV1(spacepayloads.SpaceCreatePayload{
+		SigningKey:    keys.SignKey,
+		MasterKey:     keys.SignKey,
+		ReadKey:       crypto.NewAES(),
+		MetadataKey:   metadataKey,
+		SpaceType:     space.SpaceTypeAny,
+		ParentSpaceId: parentSpaceId,
+	})
+	require.NoError(t, err)
+	return payload.SpaceHeaderWithId.Id
+}
+
+// The refusal is on the synced row: a device of the account with no
+// copy of the child reads why no node holds it, and is told that the
+// push is another device's to retry.
+func TestSDK_ChildSpace_RefusalOnADeviceWithoutTheSpace(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	coord.sign = func() error { return nil }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	// The row as it syncs in from the device that created the child
+	// and was refused.
+	childId := foreignChildId(t, parent.Id())
+	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id:            childId,
+		Type:          space.SpaceTypeAny,
+		SpaceType:     space.SpaceTypeAny,
+		RemoteStatus:  techspace.StatusActive,
+		ParentSpaceId: parent.Id(),
+	})
+	require.NoError(t, err)
+	_, err = sdk.tsp.SetRefusal(ctx, childId, space.RefusalChildLimitReached)
+	require.NoError(t, err)
+
+	list, err := spaces.List(ctx)
+	require.NoError(t, err)
+	var info space.SpaceInfo
+	for _, in := range list {
+		if in.Id == childId {
+			info = in
+		}
+	}
+	assert.Equal(t, space.RefusalChildLimitReached, info.Refusal)
+	assert.Equal(t, space.StatusActive, info.Status)
+
+	require.ErrorIs(t, spaces.RetryPush(ctx, childId), space.ErrSpaceNotStored)
+	assert.Zero(t, coord.signs, "the coordinator is not asked")
+	assert.False(t, sdk.app.SpaceExists(childId), "and nothing is pulled")
+}
+
+// A parent and its child created with no network reach it together.
+// The child is not asked for before the network holds the parent, so
+// the coordinator's "parent not available" is never an answer nobody
+// caused. A child of a parent the account does not own is asked for at
+// once.
+func TestSDK_ChildSpace_SignWaitsForItsOwnParent(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	coord.sign = func() error { return nil }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+
+	require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), space.ErrParentSpaceNotAvailable)
+	assert.Zero(t, coord.signs, "the coordinator is not asked")
+	assert.Equal(t, space.RefusalNone, child.Info().Refusal, "and no refusal is recorded")
+
+	// A tree node answered a head-sync round of the parent.
+	sdk.app.NodeAnsweredForTest(parent.Id())
+	require.NoError(t, spaces.RetryPush(ctx, child.Id()))
+	assert.Equal(t, 1, coord.signs)
+
+	// Someone else's parent, known here as a row with no storage.
+	require.NoError(t, spaces.Track(ctx, foreignSpaceA))
+	foreign, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: foreignSpaceA})
+	require.NoError(t, err)
+	coord.set(func() { coord.sign = func() error { return coordinatorproto.ErrParentSpaceNotAvailable } })
+	require.ErrorIs(t, spaces.RetryPush(ctx, foreign.Id()), space.ErrParentSpaceNotAvailable)
+	assert.Equal(t, 2, coord.signs, "asked at once")
+	assert.Equal(t, space.RefusalParentNotAvailable, foreign.Info().Refusal, "there it is a refusal")
+}

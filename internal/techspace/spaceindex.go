@@ -65,6 +65,8 @@ func SpaceIndexSchema() schema.Dataset {
 			Description: "Push-notification key material mirrored from the ACL."},
 		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal,
 			Description: "This account's ACL permission in the space; absent means not mirrored yet."},
+		{Id: FieldRefusal, Name: "Refusal", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "What the coordinator last refused for the space; absent or none when nothing."},
 		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Guest identity key of a public-access space."},
 		// Free-form object like `settings`: subkeys are the issued-key
@@ -231,6 +233,14 @@ const (
 	// Object.LocalSet; absent until the mirror first runs, which
 	// readers must treat as "unknown yet", not as no-access.
 	FieldOwnRole = "ownRole"
+	// FieldRefusal (SYNCED) is what the coordinator last refused for the
+	// space, in the space.Refusal wire vocabulary: the check a child
+	// space failed when the coordinator refused to sign it. Synced so
+	// every device of the account reads why no node holds the space,
+	// also one that has no copy of it. Written by the device the
+	// coordinator answered, via Service.SetRefusal; absent or "none" on
+	// a space that was not refused or has been signed since.
+	FieldRefusal = "refusal"
 	// FieldGuestKey marks a guest-mode (public-access) space: the shared
 	// read-only guest identity's private key, string-encoded, written
 	// once by Service (JoinGuest path) when the account adds the space

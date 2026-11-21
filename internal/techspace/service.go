@@ -416,6 +416,15 @@ func (s *Service) SetOwnRole(ctx context.Context, spaceId string, role space.Per
 	})
 }
 
+// SetRefusal records on the space's row what the coordinator last
+// refused for it (FieldRefusal, synced account-wide), RefusalNone once
+// that is over. The caller skips no-op writes.
+func (s *Service) SetRefusal(ctx context.Context, spaceId string, refusal space.Refusal) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldRefusal, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(refusal.String())
+	})
+}
+
 // SetAclHeadId records the ACL head id from RequestJoin on the joining
 // row via the local-set path (device-local; never enters the DAG). Read
 // back by the joiner-side post-acceptance waiter to detect a decline.

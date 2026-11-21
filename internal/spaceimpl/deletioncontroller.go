@@ -200,6 +200,9 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 	if st == nil {
 		return
 	}
+	if refusalOver(row.Refusal, st.Status) {
+		s.setRefusal(ctx, row.Id, space.RefusalNone)
+	}
 	if row.Derived {
 		// Derived rows never participate in deletion reconciliation
 		// (space.ErrIsDerivedSpace), and this return is the only guard:
@@ -237,6 +240,13 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 		delLog.Info("offloading remotely-deleted space", zap.String("spaceId", row.Id))
 		s.OffloadSpace(ctx, row.Id)
 	}
+}
+
+// refusalOver reports that the coordinator's status shows what a
+// recorded refusal was about: a child it would not sign is registered,
+// whichever device pushed it.
+func refusalOver(refusal space.Refusal, status coordinatorproto.SpaceStatus) bool {
+	return refusal != space.RefusalNone && status == coordinatorproto.SpaceStatus_SpaceStatusCreated
 }
 
 // reconcileAction is the decision reconcileOne acts on for one space.

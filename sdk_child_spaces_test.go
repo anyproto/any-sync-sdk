@@ -83,6 +83,8 @@ type fakeCoordinator struct {
 	// to delete.
 	del     func(spaceId string) error
 	deleted []string
+	// shareable answers SpaceMakeShareable.
+	shareable func(spaceId string) error
 }
 
 func (f *fakeCoordinator) set(fn func()) {
@@ -140,6 +142,16 @@ func (f *fakeCoordinator) SpaceDelete(ctx context.Context, spaceId string, conf 
 		return f.CoordinatorClient.SpaceDelete(ctx, spaceId, conf)
 	}
 	return del(spaceId)
+}
+
+func (f *fakeCoordinator) SpaceMakeShareable(ctx context.Context, spaceId string) error {
+	f.mu.Lock()
+	shareable := f.shareable
+	f.mu.Unlock()
+	if shareable == nil {
+		return f.CoordinatorClient.SpaceMakeShareable(ctx, spaceId)
+	}
+	return shareable(spaceId)
 }
 
 type fakeJoiningClient struct {
@@ -741,6 +753,15 @@ func (c *foreignChild) accept(rec *consensusproto.RawRecord) *consensusproto.Raw
 	return accepted
 }
 
+// invite adds a request-to-join invite and returns its key.
+func (c *foreignChild) invite(t *testing.T) crypto.PrivKey {
+	t.Helper()
+	invite, err := c.ownerAcl(t).RecordBuilder().BuildInvite()
+	require.NoError(t, err)
+	c.accept(invite.InviteRec)
+	return invite.InviteKey
+}
+
 // addMember makes a new account a member and returns its identity.
 func (c *foreignChild) addMember(t *testing.T, perm list.AclPermissions) crypto.PubKey {
 	t.Helper()
@@ -1150,6 +1171,98 @@ func TestSDK_Delete_OwnedSpaceWithHeldChild(t *testing.T) {
 	require.NoError(t, spaces.Delete(ctx, second.Id()))
 	require.NoError(t, spaces.Delete(ctx, parent.Id()))
 	assert.Equal(t, space.StatusDeleted, parent.Info().Status)
+}
+
+// A child space admits only members of its parent. The coordinator's
+// refusal reads ErrNotParentMember on every way in: a direct add, an
+// accepted join request, a join by invite. A guest key is not a member
+// and is added as before.
+func TestSDK_ChildSpace_OnlyParentMembersAreAdmitted(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	handle, err := sdk.app.GetSpace(ctx, child.Id())
+	require.NoError(t, err)
+	acl := handle.Inner().Acl()
+
+	net.coord.set(func() { net.coord.shareable = func(string) error { return nil } })
+	accept := func(_ string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+		return network.accept(rec), nil
+	}
+	refuse := func(string, *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+		return nil, coordinatorproto.ErrNotParentMember
+	}
+
+	// A direct add.
+	net.nodes.set(func() { net.nodes.add = refuse })
+	outsider := randomIdentity(t)
+	err = child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: outsider, Permission: space.PermissionWriter}})
+	require.ErrorIs(t, err, space.ErrNotParentMember)
+	rec, ok := sdk.tsp.Get(ctx, child.Id())
+	require.True(t, ok)
+	assert.Empty(t, rec.InviteNotifyPending, "nobody is notified of an add that did not happen")
+
+	// An accepted join request.
+	net.nodes.set(func() { net.nodes.add = accept })
+	invite, err := child.ACL().CreateInvite(ctx)
+	require.NoError(t, err)
+	joiner, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	records, err := acl.RecordsAfter(ctx, "")
+	require.NoError(t, err)
+	st, err := list.NewInMemoryStorage(records[0].Id, records)
+	require.NoError(t, err)
+	joinerAcl, err := list.BuildAclListWithIdentity(joiner, st, recordverifier.NewValidateFull())
+	require.NoError(t, err)
+	requestRec, err := joinerAcl.RecordBuilder().BuildRequestJoin(list.RequestJoinPayload{InviteKey: invite.InviteKey})
+	require.NoError(t, err)
+	request := network.accept(requestRec)
+	acl.Lock()
+	err = acl.AddRawRecord(request)
+	acl.Unlock()
+	require.NoError(t, err)
+
+	net.nodes.set(func() { net.nodes.add = refuse })
+	err = child.ACL().AcceptRequest(ctx, request.Id, space.PermissionWriter)
+	require.ErrorIs(t, err, space.ErrNotParentMember)
+
+	// A join by invite, from the joiner's side: the account reads the
+	// ACL of another account's child off the nodes and posts its join
+	// request, which the network refuses.
+	foreign := newForeignChild(t, network, parent.Id())
+	foreignInvite := foreign.invite(t)
+	var requests atomic.Int32
+	foreign.serve(t, &net.nodes, func(*consensusproto.RawRecord) error {
+		requests.Add(1)
+		return coordinatorproto.ErrNotParentMember
+	})
+	token, err := space.EncodeInvite(space.Invite{SpaceId: foreign.id, InviteKey: foreignInvite})
+	require.NoError(t, err)
+	_, err = spaces.Join(ctx, space.JoinRequest{Invite: token})
+	require.ErrorIs(t, err, space.ErrNotParentMember)
+	assert.EqualValues(t, 1, requests.Load(), "the request was posted and refused")
+	requireNothingHeld(t, ctx, sdk, foreign.id)
+
+	// A guest key.
+	net.nodes.set(func() { net.nodes.add = accept })
+	guest, err := child.ACL().CreateGuestKey(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, space.InviteKindGuest, guest.Kind)
+	acl.RLock()
+	assert.True(t, acl.AclState().Permissions(guest.InviteKey.GetPublic()).IsGuest())
+	acl.RUnlock()
 }
 
 // The refusal is on the synced row: a device of the account with no

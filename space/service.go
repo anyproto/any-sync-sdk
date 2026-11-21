@@ -311,10 +311,11 @@ type Service interface {
 	// Nothing is added to the index, loaded or synced. Errors as for
 	// RemoveChildMembers, the refusal of a record built on a head that
 	// moved included; ErrParentPermissionDenied for a caller who is
-	// neither of the two, ErrAccountNotFound for a new owner who is no
-	// member of the child, ErrInsufficientPermissions for one who is
-	// the Owner already or a guest identity, and for an oldOwnerPerm of
-	// none, guest or owner.
+	// neither of the two, ErrNotParentMember for a new owner who is no
+	// member of the parent, ErrAccountNotFound for one who is no member
+	// of the child, ErrInsufficientPermissions for one who is the Owner
+	// already or a guest identity, and for an oldOwnerPerm of none,
+	// guest or owner.
 	ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm Permission) error
 
 	// DeleteChild deletes the child space childSpaceId on the network.
@@ -346,7 +347,9 @@ type Service interface {
 	// surfaced as StatusDeleted) is revived: the request is posted again
 	// and the row returns to StatusJoining. A synced tombstone (Delete)
 	// is sticky and refused with ErrSpaceDeleted before anything reaches
-	// the network.
+	// the network. A child space admits only members of its parent:
+	// ErrNotParentMember when the network refuses the join request of
+	// an account that is not one, with no row written.
 	Join(ctx context.Context, req JoinRequest) (Space, error)
 
 	// CancelJoin withdraws this account's pending join request for

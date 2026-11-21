@@ -91,7 +91,9 @@ type ACL interface {
 
 	// AcceptRequest approves a pending join request and grants the
 	// joiner the given permission. requestRecordId is the id from
-	// MembersAPI.JoinRequests. Owner / admin only.
+	// MembersAPI.JoinRequests. Owner / admin only. In a child space
+	// ErrNotParentMember for a joiner who is no longer a member of the
+	// parent.
 	AcceptRequest(ctx context.Context, requestRecordId string, perm Permission) error
 
 	// DeclineRequest rejects a pending join request from identity.
@@ -118,6 +120,9 @@ type ACL interface {
 	// StatusInvitePending for them to AcceptInvite / DeclineInvite.
 	// Without the transport (headless deployments) the ACL write still
 	// happens but no notification is sent.
+	//
+	// In a child space every added account is a member of the parent:
+	// ErrNotParentMember otherwise, and nobody of the batch is added.
 	AddAccounts(ctx context.Context, accounts []MemberAdd) error
 
 	// OwnershipChange transfers ownership to newOwner; the old owner's

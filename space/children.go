@@ -27,6 +27,14 @@ var (
 	// spaces as the network allows that account.
 	ErrChildSpacesLimitReached = coordinatorproto.ErrChildSpacesLimitReached
 
+	// ErrNotParentMember: only a member of the parent space becomes a
+	// member of a child. Join returns it when this account is not one
+	// and its join request is refused, ACL.AddAccounts when one of the
+	// added accounts is not, ACL.AcceptRequest when the joiner left the
+	// parent after asking. The guest identity of ACL.CreateGuestKey is
+	// exempt.
+	ErrNotParentMember = coordinatorproto.ErrNotParentMember
+
 	// ErrSpaceHasChildren: a space that still has child spaces is not
 	// deleted. Delete returns it for a space the account owns when the
 	// index holds a child of it or the coordinator says so.

@@ -10,11 +10,19 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/app"
+	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list/listtest"
+	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
+	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/consensus/consensusproto"
+	"github.com/anyproto/any-sync/consensus/consensusproto/consensuserr"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	"github.com/anyproto/any-sync/node/nodeclient"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,10 +35,13 @@ import (
 )
 
 // fakeNetwork answers in place of a network that is not there: the
-// coordinator. A call it has no answer for goes to the real client,
-// which reaches nobody.
+// coordinator, and the nodes the joining client posts ACL records
+// through. A call it has no answer for goes to the real client, which
+// reaches nobody.
 type fakeNetwork struct {
-	coord fakeCoordinator
+	coord   fakeCoordinator
+	joining fakeJoiningClient
+	nodes   fakeNodeClient
 }
 
 // installFakeNetwork puts a fakeNetwork in front of the network clients
@@ -43,6 +54,12 @@ func installFakeNetwork(t *testing.T) *fakeNetwork {
 		case coordinatorclient.CoordinatorClient:
 			n.coord.CoordinatorClient = real
 			return &n.coord
+		case aclclient.AclJoiningClient:
+			n.joining.AclJoiningClient = real
+			return &n.joining
+		case nodeclient.NodeClient:
+			n.nodes.NodeClient = real
+			return &n.nodes
 		}
 		return c
 	}))
@@ -60,6 +77,10 @@ type fakeCoordinator struct {
 	status func(spaceId string) *coordinatorproto.SpaceStatusPayload
 	// children answers SpaceChildren.
 	children func(spaceId string) ([]*coordinatorproto.SpaceChild, error)
+	// del answers SpaceDelete; deleted lists the spaces it was asked
+	// to delete.
+	del     func(spaceId string) error
+	deleted []string
 }
 
 func (f *fakeCoordinator) set(fn func()) {
@@ -104,6 +125,93 @@ func (f *fakeCoordinator) SpaceChildren(ctx context.Context, spaceId string) ([]
 		return f.CoordinatorClient.SpaceChildren(ctx, spaceId)
 	}
 	return children(spaceId)
+}
+
+func (f *fakeCoordinator) SpaceDelete(ctx context.Context, spaceId string, conf *coordinatorproto.DeletionConfirmPayloadWithSignature) error {
+	f.mu.Lock()
+	del := f.del
+	if del != nil {
+		f.deleted = append(f.deleted, spaceId)
+	}
+	f.mu.Unlock()
+	if del == nil {
+		return f.CoordinatorClient.SpaceDelete(ctx, spaceId, conf)
+	}
+	return del(spaceId)
+}
+
+type fakeJoiningClient struct {
+	aclclient.AclJoiningClient
+
+	mu sync.Mutex
+	// remove answers RemoveChildMembers, owner ChangeChildOwner.
+	remove func(spaceId string, identities []string) error
+	owner  func(spaceId, newOwner string, oldOwnerPerm list.AclPermissions) error
+}
+
+func (f *fakeJoiningClient) set(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn()
+}
+
+func (f *fakeJoiningClient) RemoveChildMembers(ctx context.Context, spaceId string, identities []crypto.PubKey) (string, error) {
+	f.mu.Lock()
+	remove := f.remove
+	f.mu.Unlock()
+	if remove == nil {
+		return f.AclJoiningClient.RemoveChildMembers(ctx, spaceId, identities)
+	}
+	accounts := make([]string, len(identities))
+	for i, pk := range identities {
+		accounts[i] = pk.Account()
+	}
+	return "", remove(spaceId, accounts)
+}
+
+func (f *fakeJoiningClient) ChangeChildOwner(ctx context.Context, spaceId string, newOwner crypto.PubKey, oldOwnerPermissions list.AclPermissions) (string, error) {
+	f.mu.Lock()
+	owner := f.owner
+	f.mu.Unlock()
+	if owner == nil {
+		return f.AclJoiningClient.ChangeChildOwner(ctx, spaceId, newOwner, oldOwnerPermissions)
+	}
+	return "", owner(spaceId, newOwner.Account(), oldOwnerPermissions)
+}
+
+type fakeNodeClient struct {
+	nodeclient.NodeClient
+
+	mu sync.Mutex
+	// add answers AclAddRecord, get AclGetRecords.
+	add func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error)
+	get func(spaceId string) ([]*consensusproto.RawRecordWithId, error)
+}
+
+func (f *fakeNodeClient) AclGetRecords(ctx context.Context, spaceId, aclHead string) ([]*consensusproto.RawRecordWithId, error) {
+	f.mu.Lock()
+	get := f.get
+	f.mu.Unlock()
+	if get == nil {
+		return f.NodeClient.AclGetRecords(ctx, spaceId, aclHead)
+	}
+	return get(spaceId)
+}
+
+func (f *fakeNodeClient) set(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	fn()
+}
+
+func (f *fakeNodeClient) AclAddRecord(ctx context.Context, spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+	f.mu.Lock()
+	add := f.add
+	f.mu.Unlock()
+	if add == nil {
+		return f.NodeClient.AclAddRecord(ctx, spaceId, rec)
+	}
+	return add(spaceId, rec)
 }
 
 // childTestConfig is wmConfig with every node address on a closed port
@@ -541,6 +649,338 @@ func foreignChildId(t *testing.T, parentSpaceId string) string {
 	return payload.SpaceHeaderWithId.Id
 }
 
+// foreignChild is a child space another account owns, as the network
+// holds its ACL: this device holds nothing of it.
+type foreignChild struct {
+	id      string
+	owner   *accountdata.AccountKeys
+	records []*consensusproto.RawRecordWithId
+	network testNetworkKey
+	// storage is what a device creates the child's storage from.
+	storage spacestorage.SpaceStorageCreatePayload
+}
+
+func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string) *foreignChild {
+	t.Helper()
+	owner, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	payload, err := spacepayloads.StoragePayloadForSpaceCreateV1(spacepayloads.SpaceCreatePayload{
+		SigningKey:    owner.SignKey,
+		MasterKey:     owner.SignKey,
+		ReadKey:       crypto.NewAES(),
+		MetadataKey:   metadataKey,
+		SpaceType:     space.SpaceTypeAny,
+		ParentSpaceId: parentSpaceId,
+	})
+	require.NoError(t, err)
+	return &foreignChild{
+		id:      payload.SpaceHeaderWithId.Id,
+		owner:   owner,
+		records: []*consensusproto.RawRecordWithId{payload.AclWithId},
+		network: network,
+		storage: payload,
+	}
+}
+
+// ownerAcl is the child's ACL on a device of its owner.
+func (c *foreignChild) ownerAcl(t *testing.T) list.AclList {
+	t.Helper()
+	st, err := list.NewInMemoryStorage(c.records[0].Id, c.records)
+	require.NoError(t, err)
+	acl, err := list.BuildAclListWithIdentity(c.owner, st, recordverifier.NewValidateAcceptedLog())
+	require.NoError(t, err)
+	return acl
+}
+
+// accept takes a record into the child's ACL as the network does.
+func (c *foreignChild) accept(rec *consensusproto.RawRecord) *consensusproto.RawRecordWithId {
+	accepted := c.network.accept(rec)
+	c.records = append(c.records, accepted)
+	return accepted
+}
+
+// addMember makes a new account a member and returns its identity.
+func (c *foreignChild) addMember(t *testing.T, perm list.AclPermissions) crypto.PubKey {
+	t.Helper()
+	member, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	rec, err := c.ownerAcl(t).RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
+		{Identity: member.SignKey.GetPublic(), Permissions: perm},
+	}})
+	require.NoError(t, err)
+	c.accept(rec)
+	return member.SignKey.GetPublic()
+}
+
+// serve makes the fake nodes serve the child's ACL and take the
+// records posted to it. posted receives each of them.
+func (c *foreignChild) serve(t *testing.T, nodes *fakeNodeClient, posted func(*consensusproto.RawRecord) error) {
+	t.Helper()
+	nodes.set(func() {
+		nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
+			assert.Equal(t, c.id, spaceId)
+			return c.records, nil
+		}
+		nodes.add = func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+			assert.Equal(t, c.id, spaceId)
+			if err := posted(rec); err != nil {
+				return nil, err
+			}
+			return c.accept(rec), nil
+		}
+	})
+}
+
+func randomIdentity(t *testing.T) string {
+	t.Helper()
+	keys, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	return keys.SignKey.GetPublic().Account()
+}
+
+// requireNothingHeld fails when the account holds a row or storage for
+// spaceId.
+func requireNothingHeld(t *testing.T, ctx context.Context, sdk *SDK, spaceId string) {
+	t.Helper()
+	_, held := sdk.tsp.Get(ctx, spaceId)
+	require.False(t, held, "no row for %s", spaceId)
+	require.False(t, sdk.app.SpaceExists(spaceId), "no storage for %s", spaceId)
+}
+
+// The Admins and the Owner of a parent act in a child they are not a
+// member of. The child gets no row and no storage on their device, and
+// the network's refusals come back typed.
+func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	childId := foreignChildId(t, parent.Id())
+	member, newOwner := randomIdentity(t), randomIdentity(t)
+	before, err := spaces.List(ctx)
+	require.NoError(t, err)
+
+	calls := map[string]func() error{
+		"RemoveChildMembers": func() error { return spaces.RemoveChildMembers(ctx, childId, []string{member}) },
+		"ChangeChildOwner": func() error {
+			return spaces.ChangeChildOwner(ctx, childId, newOwner, space.PermissionAdmin)
+		},
+		"DeleteChild": func() error { return spaces.DeleteChild(ctx, childId) },
+	}
+
+	// No network: each call says so and changes nothing.
+	for name, call := range calls {
+		require.ErrorIs(t, call(), space.ErrOffline, name)
+	}
+
+	// The network's refusals, and the checks the record builder makes
+	// on this device before anything is sent.
+	answers := []struct {
+		answer error
+		want   error
+	}{
+		{coordinatorproto.ErrParentPermissionDenied, space.ErrParentPermissionDenied},
+		{coordinatorproto.ErrParentSpaceNotAvailable, space.ErrParentSpaceNotAvailable},
+		{list.ErrInsufficientPermissions, space.ErrInsufficientPermissions},
+	}
+	for _, tc := range answers {
+		net.joining.set(func() {
+			net.joining.remove = func(string, []string) error { return tc.answer }
+			net.joining.owner = func(string, string, list.AclPermissions) error { return tc.answer }
+		})
+		net.coord.set(func() { net.coord.del = func(string) error { return tc.answer } })
+		for name, call := range calls {
+			err := call()
+			require.ErrorIs(t, err, tc.want, name)
+			require.NotErrorIs(t, err, space.ErrOffline, name)
+		}
+	}
+
+	// Accepted: what was asked reaches the network as given.
+	var removedIn, ownerIn, removed, owner string
+	var ownerPerm list.AclPermissions
+	net.joining.set(func() {
+		net.joining.remove = func(spaceId string, identities []string) error {
+			removedIn, removed = spaceId, strings.Join(identities, ",")
+			return nil
+		}
+		net.joining.owner = func(spaceId, newOwner string, perm list.AclPermissions) error {
+			ownerIn, owner, ownerPerm = spaceId, newOwner, perm
+			return nil
+		}
+	})
+	net.coord.set(func() {
+		net.coord.deleted = nil
+		net.coord.del = func(string) error { return nil }
+	})
+	for name, call := range calls {
+		require.NoError(t, call(), name)
+	}
+	assert.Equal(t, childId, removedIn)
+	assert.Equal(t, member, removed)
+	assert.Equal(t, childId, ownerIn)
+	assert.Equal(t, newOwner, owner)
+	assert.Equal(t, list.AclPermissionsAdmin, ownerPerm)
+	assert.Equal(t, []string{childId}, net.coord.deleted)
+
+	requireNothingHeld(t, ctx, sdk, childId)
+	after, err := spaces.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, after, len(before), "the child never enters the account's list")
+
+	// Malformed input and a space the index shows is no child never
+	// reach the network.
+	net.joining.set(func() {
+		net.joining.remove = func(string, []string) error { t.Error("RemoveChildMembers sent"); return nil }
+		net.joining.owner = func(string, string, list.AclPermissions) error { t.Error("ChangeChildOwner sent"); return nil }
+	})
+	net.coord.set(func() {
+		net.coord.del = func(string) error { t.Error("SpaceDelete sent"); return nil }
+	})
+	derived, err := spaces.Derive(ctx, space.DeriveRequest{Seed: []byte("test/child/governance")})
+	require.NoError(t, err)
+	for _, notChild := range []string{parent.Id(), derived.Id(), sdk.TechSpaceId()} {
+		require.ErrorIs(t, spaces.RemoveChildMembers(ctx, notChild, []string{member}), space.ErrNotChildSpace)
+		require.ErrorIs(t, spaces.ChangeChildOwner(ctx, notChild, newOwner, space.PermissionAdmin), space.ErrNotChildSpace)
+		require.ErrorIs(t, spaces.DeleteChild(ctx, notChild), space.ErrNotChildSpace)
+	}
+	require.ErrorIs(t, spaces.RemoveChildMembers(ctx, "not-a-space-id", []string{member}), space.ErrBadSpaceId)
+	require.ErrorIs(t, spaces.ChangeChildOwner(ctx, "not-a-space-id", newOwner, space.PermissionAdmin), space.ErrBadSpaceId)
+	require.ErrorIs(t, spaces.DeleteChild(ctx, "not-a-space-id"), space.ErrBadSpaceId)
+	require.ErrorIs(t, spaces.RemoveChildMembers(ctx, childId, []string{"not-an-identity"}), space.ErrBadIdentity)
+	require.ErrorIs(t, spaces.ChangeChildOwner(ctx, childId, "not-an-identity", space.PermissionAdmin), space.ErrBadIdentity)
+	require.Error(t, spaces.RemoveChildMembers(ctx, childId, nil))
+}
+
+// The Owner of a parent who also holds a child in its own index deletes
+// it with DeleteChild: the coordinator answers first, then the row
+// becomes a deleted one and the local copy goes.
+func TestSDK_DeleteChild_HeldByTheAccount(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	newChild := func() string {
+		child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+		require.NoError(t, err)
+		wmWrite(t, ctx, child, 1)
+		return child.Id()
+	}
+	requireDeleted := func(childId string) {
+		rec, ok := sdk.tsp.Get(ctx, childId)
+		require.True(t, ok)
+		assert.Equal(t, techspace.StatusDeleted, rec.RemoteStatus)
+		assert.False(t, sdk.app.SpaceExists(childId), "the local copy is removed")
+		_, err := spaces.Get(ctx, childId)
+		require.ErrorIs(t, err, space.ErrSpaceDeleted)
+	}
+
+	// Refused or out of reach: the account's copy is untouched.
+	childId := newChild()
+	require.ErrorIs(t, spaces.DeleteChild(ctx, childId), space.ErrOffline)
+	net.coord.set(func() {
+		net.coord.del = func(string) error { return coordinatorproto.ErrParentPermissionDenied }
+	})
+	require.ErrorIs(t, spaces.DeleteChild(ctx, childId), space.ErrParentPermissionDenied)
+	child, err := spaces.Get(ctx, childId)
+	require.NoError(t, err)
+	assert.Equal(t, space.StatusActive, child.Info().Status)
+	wmWrite(t, ctx, child, 1)
+
+	net.coord.set(func() { net.coord.del = func(string) error { return nil } })
+	require.NoError(t, spaces.DeleteChild(ctx, childId))
+	requireDeleted(childId)
+	require.NoError(t, spaces.DeleteChild(ctx, childId), "deleting it again is the same answer")
+
+	// A deletion already under way on the network settles the row too.
+	for _, underWay := range []error{coordinatorproto.ErrSpaceDeletionPending, coordinatorproto.ErrSpaceIsDeleted} {
+		childId = newChild()
+		net.coord.set(func() { net.coord.del = func(string) error { return underWay } })
+		require.NoError(t, spaces.DeleteChild(ctx, childId))
+		requireDeleted(childId)
+	}
+	parentSpace, err := spaces.Get(ctx, parent.Id())
+	require.NoError(t, err)
+	assert.Equal(t, space.StatusActive, parentSpace.Info().Status, "the parent stays")
+}
+
+// A child the coordinator holds as being deleted while the account's
+// row is live: the state a DeleteChild leaves when the process dies
+// after the coordinator accepted it, and the state after a delete from
+// another device. The deletion reconciler marks the row deleted and
+// removes the local copy.
+func TestSDK_ChildInDeletionOnTheNetwork_IsRemovedByTheReconciler(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	defer spaceimpl.SetDeletionReconcileIntervalForTest(50 * time.Millisecond)()
+	net := installFakeNetwork(t)
+	var pendingDeletion atomic.Pointer[string]
+	net.coord.status = func(spaceId string) *coordinatorproto.SpaceStatusPayload {
+		if id := pendingDeletion.Load(); id != nil && *id == spaceId {
+			return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion}
+		}
+		return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusCreated}
+	}
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
+	require.NoError(t, err)
+	childId := child.Id()
+
+	pendingDeletion.Store(&childId)
+	require.Eventually(t, func() bool {
+		rec, ok := sdk.tsp.Get(ctx, childId)
+		return ok && rec.RemoteStatus == techspace.StatusDeleted && !sdk.app.SpaceExists(childId)
+	}, 10*time.Second, 10*time.Millisecond)
+	rec, ok := sdk.tsp.Get(ctx, parent.Id())
+	require.True(t, ok)
+	assert.False(t, rec.IsDeleted())
+}
+
+// testNetworkKey makes the test the network of cfg: ACL records are
+// accepted by whoever signs them with the network key.
+type testNetworkKey struct {
+	t   *testing.T
+	key crypto.PrivKey
+}
+
+func newTestNetworkKey(t *testing.T, cfg *config.Config) testNetworkKey {
+	t.Helper()
+	key, pub, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	const networkId = "networkId: N4N1wDHFpFpovXBqdbq2TDXE9tXdXbtV1eTJFpKJW4YeaJqR"
+	require.Contains(t, string(cfg.Network.NodeConfYAML), networkId)
+	cfg.Network.NodeConfYAML = bytes.Replace(cfg.Network.NodeConfYAML, []byte(networkId), []byte("networkId: "+pub.Network()), 1)
+	return testNetworkKey{t: t, key: key}
+}
+
+// accept signs rec as the network's consensus does.
+func (n testNetworkKey) accept(rec *consensusproto.RawRecord) *consensusproto.RawRecordWithId {
+	n.t.Helper()
+	identity, err := n.key.GetPublic().Marshall()
+	require.NoError(n.t, err)
+	rec.AcceptorIdentity = identity
+	rec.AcceptorSignature, err = n.key.Sign(rec.Payload)
+	require.NoError(n.t, err)
+	return listtest.WrapAclRecord(rec)
+}
+
 // The refusal is on the synced row: a device of the account with no
 // copy of the child reads why no node holds it, and is told that the
 // push is another device's to retry.
@@ -621,4 +1061,253 @@ func TestSDK_ChildSpace_SignWaitsForItsOwnParent(t *testing.T) {
 	require.ErrorIs(t, spaces.RetryPush(ctx, foreign.Id()), space.ErrParentSpaceNotAvailable)
 	assert.Equal(t, 2, coord.signs, "asked at once")
 	assert.Equal(t, space.RefusalParentNotAvailable, foreign.Info().Refusal, "there it is a refusal")
+}
+
+// An Admin or the Owner of a parent reads who is in a child it is no
+// member of, removes one of them and hands the child to another: each
+// over the ACL the nodes serve, with nothing of the child kept here.
+func TestSDK_ChildMembers_AndTheRecordsBuiltOnThem(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child := newForeignChild(t, network, parent.Id())
+
+	_, err = spaces.ChildMembers(ctx, child.id)
+	require.ErrorIs(t, err, space.ErrOffline)
+	_, err = spaces.ChildMembers(ctx, parent.Id())
+	require.ErrorIs(t, err, space.ErrNotChildSpace)
+	_, err = spaces.ChildMembers(ctx, "not-a-space-id")
+	require.ErrorIs(t, err, space.ErrBadSpaceId)
+
+	admin := child.addMember(t, list.AclPermissionsAdmin)
+	writer := child.addMember(t, list.AclPermissionsWriter)
+	var posted []*consensusproto.RawRecord
+	var answer error
+	child.serve(t, &net.nodes, func(rec *consensusproto.RawRecord) error {
+		if answer != nil {
+			return answer
+		}
+		posted = append(posted, rec)
+		return nil
+	})
+	owner := child.owner.SignKey.GetPublic().Account()
+
+	members, err := spaces.ChildMembers(ctx, child.id)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []space.ChildMember{
+		{Identity: owner, Permission: space.PermissionOwner, Status: space.MemberStatusActive},
+		{Identity: admin.Account(), Permission: space.PermissionAdmin, Status: space.MemberStatusActive},
+		{Identity: writer.Account(), Permission: space.PermissionWriter, Status: space.MemberStatusActive},
+	}, members)
+
+	// An identity the child's ACL does not hold, and the child's owner.
+	stranger := randomIdentity(t)
+	require.ErrorIs(t, spaces.RemoveChildMembers(ctx, child.id, []string{stranger}), space.ErrAccountNotFound)
+	require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, stranger, space.PermissionAdmin), space.ErrAccountNotFound)
+	require.ErrorIs(t, spaces.RemoveChildMembers(ctx, child.id, []string{owner}), space.ErrInsufficientPermissions)
+	require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, admin.Account(), space.PermissionGuest), space.ErrInsufficientPermissions)
+	assert.Empty(t, posted, "none of them is sent")
+
+	// The child's ACL moved between the read and the post: the network
+	// refuses the record, nothing is written, and the call is repeated.
+	answer = consensuserr.ErrConflict
+	err = spaces.RemoveChildMembers(ctx, child.id, []string{writer.Account()})
+	require.ErrorIs(t, err, consensuserr.ErrConflict)
+	require.NotErrorIs(t, err, space.ErrOffline)
+	answer = nil
+
+	require.NoError(t, spaces.RemoveChildMembers(ctx, child.id, []string{writer.Account()}))
+	require.NoError(t, spaces.ChangeChildOwner(ctx, child.id, admin.Account(), space.PermissionWriter))
+	require.Len(t, posted, 2)
+
+	members, err = spaces.ChildMembers(ctx, child.id)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []space.ChildMember{
+		{Identity: owner, Permission: space.PermissionWriter, Status: space.MemberStatusActive},
+		{Identity: admin.Account(), Permission: space.PermissionOwner, Status: space.MemberStatusActive},
+		{Identity: writer.Account(), Permission: space.PermissionNone, Status: space.MemberStatusRemoved},
+	}, members)
+	assert.True(t, child.ownerAcl(t).AclState().RotationPending(), "the removal left the read key as it was")
+	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// A space the coordinator does not know, and one it holds as deleted or
+// in deletion, read as an unknown and as a deleted space on every call
+// made from the parent side. The nodes pass the coordinator's answer to
+// an ACL read or write on unchanged.
+func TestSDK_ChildCalls_UnknownAndDeletedSpaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child := newForeignChild(t, network, parent.Id())
+	member := child.addMember(t, list.AclPermissionsWriter).Account()
+
+	cases := []struct {
+		name   string
+		answer error
+		want   error
+	}{
+		{"not known", coordinatorproto.ErrSpaceNotExists, space.ErrSpaceUnknown},
+		{"deleted or in deletion", coordinatorproto.ErrSpaceIsDeleted, space.ErrSpaceDeleted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			net.coord.set(func() {
+				net.coord.children = func(string) ([]*coordinatorproto.SpaceChild, error) { return nil, tc.answer }
+			})
+			_, err := spaces.Children(ctx, parent.Id())
+			require.ErrorIs(t, err, tc.want)
+
+			// The ACL cannot be read.
+			net.nodes.set(func() {
+				net.nodes.get = func(string) ([]*consensusproto.RawRecordWithId, error) { return nil, tc.answer }
+				net.nodes.add = func(string, *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+					t.Error("a record was posted")
+					return nil, tc.answer
+				}
+			})
+			_, err = spaces.ChildMembers(ctx, child.id)
+			require.ErrorIs(t, err, tc.want)
+			require.ErrorIs(t, spaces.RemoveChildMembers(ctx, child.id, []string{member}), tc.want)
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin), tc.want)
+
+			// The ACL is read, and the record posted to it is refused.
+			child.serve(t, &net.nodes, func(*consensusproto.RawRecord) error { return tc.answer })
+			require.ErrorIs(t, spaces.RemoveChildMembers(ctx, child.id, []string{member}), tc.want)
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin), tc.want)
+		})
+	}
+
+	net.coord.set(func() { net.coord.del = func(string) error { return coordinatorproto.ErrSpaceNotExists } })
+	require.ErrorIs(t, spaces.DeleteChild(ctx, child.id), space.ErrSpaceUnknown)
+	// A child already in deletion, or deleted, is what DeleteChild asks
+	// for.
+	for _, underWay := range []error{coordinatorproto.ErrSpaceDeletionPending, coordinatorproto.ErrSpaceIsDeleted} {
+		net.coord.set(func() { net.coord.del = func(string) error { return underWay } })
+		require.NoError(t, spaces.DeleteChild(ctx, child.id))
+	}
+	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// The parent side reads whether a child rotated its key after a
+// removal, from the ACL the nodes serve.
+func TestSDK_ChildRotationPending(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	require.NoError(t, err)
+	child := newForeignChild(t, network, parent.Id())
+
+	_, err = spaces.ChildRotationPending(ctx, child.id)
+	require.ErrorIs(t, err, space.ErrOffline)
+	_, err = spaces.ChildRotationPending(ctx, parent.Id())
+	require.ErrorIs(t, err, space.ErrNotChildSpace)
+	_, err = spaces.ChildRotationPending(ctx, "not-a-space-id")
+	require.ErrorIs(t, err, space.ErrBadSpaceId)
+
+	member := child.addMember(t, list.AclPermissionsWriter)
+	child.serve(t, &net.nodes, func(*consensusproto.RawRecord) error { return nil })
+	pending, err := spaces.ChildRotationPending(ctx, child.id)
+	require.NoError(t, err)
+	assert.False(t, pending)
+
+	require.NoError(t, spaces.RemoveChildMembers(ctx, child.id, []string{member.Account()}))
+	pending, err = spaces.ChildRotationPending(ctx, child.id)
+	require.NoError(t, err)
+	assert.True(t, pending, "the removed member still holds the key")
+
+	// A device of the child's owner changes the key.
+	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+	require.NoError(t, err)
+	rotation, err := child.ownerAcl(t).RecordBuilder().BuildReadKeyChange(list.ReadKeyChangePayload{
+		MetadataKey: metadataKey,
+		ReadKey:     crypto.NewAES(),
+	})
+	require.NoError(t, err)
+	child.accept(rotation)
+	pending, err = spaces.ChildRotationPending(ctx, child.id)
+	require.NoError(t, err)
+	assert.False(t, pending)
+	requireNothingHeld(t, ctx, sdk, child.id)
+}
+
+// An id that is not a space id is refused as one by every child-space
+// call, before anything is created or sent.
+func TestSDK_ChildCalls_MalformedSpaceId(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	sent := func(what string) func() { return func() { t.Errorf("%s reached the network", what) } }
+	net.coord.sign = func() error { sent("SpaceSign")(); return nil }
+	net.coord.children = func(string) ([]*coordinatorproto.SpaceChild, error) { sent("SpaceChildren")(); return nil, nil }
+	net.coord.del = func(string) error { sent("SpaceDelete")(); return nil }
+	net.nodes.get = func(string) ([]*consensusproto.RawRecordWithId, error) { sent("AclGetRecords")(); return nil, nil }
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+	identity := randomIdentity(t)
+	before, err := spaces.List(ctx)
+	require.NoError(t, err)
+
+	for _, id := range []string{"", "not-a-space-id", "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi", "nocid.2a5s8kx60jkm"} {
+		calls := map[string]func() error{
+			"CreateChild": func() error {
+				_, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: id})
+				return err
+			},
+			"RetryPush": func() error { return spaces.RetryPush(ctx, id) },
+			"Children": func() error {
+				_, err := spaces.Children(ctx, id)
+				return err
+			},
+			"ChildMembers": func() error {
+				_, err := spaces.ChildMembers(ctx, id)
+				return err
+			},
+			"ChildRotationPending": func() error {
+				_, err := spaces.ChildRotationPending(ctx, id)
+				return err
+			},
+			"RemoveChildMembers": func() error { return spaces.RemoveChildMembers(ctx, id, []string{identity}) },
+			"ChangeChildOwner": func() error {
+				return spaces.ChangeChildOwner(ctx, id, identity, space.PermissionAdmin)
+			},
+			"DeleteChild": func() error { return spaces.DeleteChild(ctx, id) },
+		}
+		for name, call := range calls {
+			require.ErrorIs(t, call(), space.ErrBadSpaceId, "%s(%q)", name, id)
+		}
+	}
+	after, err := spaces.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, after, len(before), "nothing is created")
 }

@@ -33,6 +33,11 @@ var (
 	// (or pending request) the ACL does not hold.
 	ErrAclRecordNotFound = list.ErrNoSuchRecord
 
+	// ErrAccountNotFound is returned by ACL ops, and by
+	// Service.RemoveChildMembers and Service.ChangeChildOwner, for an
+	// identity the space's ACL holds no account of.
+	ErrAccountNotFound = list.ErrNoSuchAccount
+
 	// ErrInviteNotFound is returned by Join when the space's ACL holds
 	// no such invite (revoked, replaced, or never minted), and by
 	// RevokeInvite for an unknown invite record.

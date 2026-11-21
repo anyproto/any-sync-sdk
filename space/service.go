@@ -25,7 +25,9 @@ var ErrSpaceNotAccepted = errors.New("space: not accepted; not materialized")
 // offloaded — loading would SpacePull a space the account removed,
 // which the nodes reject anyway. A deleted 1-1 is re-creatable via
 // Service.OneToOne, an ended join via Join; the synced tombstone Delete
-// writes is terminal.
+// writes is terminal. Children and the child-space calls made from the
+// parent side return it for a space the coordinator holds as deleted or
+// in deletion; DeleteChild of such a child is done and returns nil.
 var ErrSpaceDeleted = errors.New("space: deleted")
 
 // ErrReadOnlySpace rejects synced writes into a space this account
@@ -90,7 +92,10 @@ var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pen
 
 // ErrSpaceUnknown is returned by id-addressed Service methods (Get,
 // Delete, SetSettings, the accept/decline families) when the spaceId
-// has no row in the account's space index.
+// has no row in the account's space index, and by the calls that ask
+// the network about a space the index need not hold (Children and the
+// child-space calls made from the parent side) when the coordinator
+// does not know the space.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was
@@ -130,8 +135,10 @@ var ErrIsOneToOne = errors.New("is a 1-1 space")
 // given identity is the caller's own account.
 var ErrSelfPair = errors.New("cannot pair with self")
 
-// ErrBadSpaceId is returned by Track when the given id does not have
-// the any-sync spaceId shape (`<cid>.<replication key base36>`). A
+// ErrBadSpaceId is returned by Track and by every child-space call
+// (CreateChild for its parent id, RetryPush, Children and the calls
+// made from the parent side) when the given id does not have the
+// any-sync spaceId shape (`<cid>.<replication key base36>`). A
 // malformed id would otherwise sit in the index and fail every Get
 // with an opaque remote error — Track rejects it up front instead.
 var ErrBadSpaceId = errors.New("invalid space id")
@@ -234,6 +241,96 @@ type Service interface {
 	// no row for the parent, and none is created for a child.
 	// ErrBadSpaceId for an id that is not a space id.
 	Children(ctx context.Context, parentSpaceId string) ([]ChildSpace, error)
+
+	// ChildMembers lists the accounts of the child space childSpaceId
+	// with their role and status, from the ACL the nodes serve. It is
+	// the read of the parent's Admins and Owner, who are no members of
+	// the child: ChangeChildOwner takes an active member of it,
+	// RemoveChildMembers the identities to remove. An ACL names its
+	// accounts by identity; their names are not readable without the
+	// child's keys. The nodes serve a space's ACL to any account, so
+	// the call checks no role.
+	//
+	// The child is not added to the index, loaded or stored. ErrOffline
+	// when the nodes cannot be reached, ErrNotChildSpace for a space
+	// the index shows has no parent, ErrBadSpaceId for a malformed id.
+	ChildMembers(ctx context.Context, childSpaceId string) ([]ChildMember, error)
+
+	// ChildRotationPending reports, from the ACL the nodes serve,
+	// whether members removed from the child space childSpaceId still
+	// hold its current read key: true from a RemoveChildMembers until
+	// an Admin or the Owner of the child has changed the key. Nothing
+	// of the child is tracked or stored. Like ChildMembers it checks no
+	// role, and its errors are the same.
+	ChildRotationPending(ctx context.Context, childSpaceId string) (bool, error)
+
+	// RemoveChildMembers removes members of the child space
+	// childSpaceId without its read key. The network accepts it only
+	// from an Admin or the Owner of the parent, who need not be a
+	// member of the child; no role in the child allows it, the child's
+	// Owner's included. An Admin or the Owner of the child removes
+	// members with Space.ACL().RemoveAccounts, which changes the key in
+	// the same record.
+	//
+	// The removal takes effect at once; the removed members keep the
+	// current read key until an Admin or the Owner of the child changes
+	// it. The child's Owner cannot be removed, and an Admin of the
+	// parent does not remove an account that is an Admin or the Owner
+	// of the parent.
+	//
+	// The record is built from the ACL the nodes serve and posted
+	// through them: the child is not added to the index, loaded or
+	// synced. ErrOffline when the network cannot be reached,
+	// ErrParentPermissionDenied for a caller who is not an Admin or the
+	// Owner of the parent, and for an Admin of the parent who removes
+	// one of its Admins or its Owner,
+	// ErrAccountNotFound for an identity the child's ACL holds no
+	// account of, ErrInsufficientPermissions for the child's Owner or
+	// the caller among the identities, ErrNotChildSpace for a space the
+	// index shows has no parent, ErrBadSpaceId / ErrBadIdentity for
+	// malformed input.
+	//
+	// The record names the ACL head it was built on. When another
+	// record lands in the child's ACL first, the network refuses this
+	// one with an error that is none of the above and nothing is
+	// written: call again.
+	RemoveChildMembers(ctx context.Context, childSpaceId string, identities []string) error
+
+	// ChangeChildOwner hands the child space childSpaceId to newOwner,
+	// an active member of it who is a member of the parent too. The
+	// network accepts it from the Owner of the parent, who need not be
+	// a member of the child, and from the child's own Owner, whatever
+	// that account's role in the parent: for it the call does what
+	// Space.ACL().OwnershipChange does. The previous owner stays a
+	// member with oldOwnerPerm; removing them is a separate call.
+	//
+	// Nothing is added to the index, loaded or synced. Errors as for
+	// RemoveChildMembers, the refusal of a record built on a head that
+	// moved included; ErrParentPermissionDenied for a caller who is
+	// neither of the two, ErrAccountNotFound for a new owner who is no
+	// member of the child, ErrInsufficientPermissions for one who is
+	// the Owner already or a guest identity, and for an oldOwnerPerm of
+	// none, guest or owner.
+	ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm Permission) error
+
+	// DeleteChild deletes the child space childSpaceId on the network.
+	// The network accepts it from the Owner of the parent, who need not
+	// be a member of the child, and from the child's own owner,
+	// whatever that account's role in the parent. The coordinator
+	// answers before the call returns. When the account holds the child
+	// in its index, the row then becomes a deleted one and the local
+	// copy is removed, as after Delete.
+	//
+	// Delete stays the call for a space of the account's own list: it
+	// deletes on the network only a space the account owns, and for a
+	// member of a child, the parent's Owner included, it removes the
+	// child from the account alone.
+	//
+	// ErrOffline when the coordinator cannot be reached (nothing
+	// changes), ErrParentPermissionDenied for a caller who is neither
+	// the parent's Owner nor the child's, ErrNotChildSpace for a space
+	// the index shows has no parent, ErrBadSpaceId for a malformed id.
+	DeleteChild(ctx context.Context, childSpaceId string) error
 
 	// Join a space via an invite. Depending on the invite key mode the
 	// space is either immediately active or pending approval. The

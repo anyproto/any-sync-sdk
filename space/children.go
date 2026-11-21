@@ -59,6 +59,15 @@ type ChildSpace struct {
 	Status ChildStatus
 }
 
+// ChildMember is an account of a child space as its ACL holds it, read
+// from the parent side: the account's name is not readable without the
+// child's keys.
+type ChildMember struct {
+	Identity   string
+	Permission Permission
+	Status     MemberStatus
+}
+
 // ChildStatus is the state of a child space on the network.
 type ChildStatus uint8
 

@@ -6,8 +6,10 @@ import (
 	"fmt"
 
 	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	anynet "github.com/anyproto/any-sync/net"
+	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
 
 	"github.com/anyproto/any-sync-sdk/internal/techspace"
@@ -166,15 +168,163 @@ func childStatus(st coordinatorproto.SpaceStatus) space.ChildStatus {
 	return space.ChildStatusUnknown
 }
 
+// childTarget checks that spaceId can be acted on as a child space from
+// the parent side, as far as the index can tell, and returns its row
+// when the account holds one. A row whose header was read (it has a
+// type) and names no parent is a top-level space.
+func (s *Service) childTarget(ctx context.Context, op, spaceId string) (rec techspace.SpaceIndexRecord, held bool, err error) {
+	if err := validateSpaceId(spaceId); err != nil {
+		return rec, false, err
+	}
+	notChild := fmt.Errorf("spaceimpl: %s: space %q: %w", op, spaceId, space.ErrNotChildSpace)
+	if spaceId == s.tsp.SpaceId() {
+		return rec, false, notChild
+	}
+	rec, held = s.tsp.Get(ctx, spaceId)
+	if held && rec.Type != "" && rec.ParentSpaceId == "" {
+		return rec, held, notChild
+	}
+	return rec, held, nil
+}
+
+// childAcl builds the ACL of a child space from the records the nodes
+// serve, in memory, like the join controller's snapshot: the child
+// needs no row and no storage here.
+func (s *Service) childAcl(ctx context.Context, op, childSpaceId string) (list.AclList, error) {
+	if _, _, err := s.childTarget(ctx, op, childSpaceId); err != nil {
+		return nil, err
+	}
+	acl, err := s.app.AclSnapshot(ctx, childSpaceId)
+	if err != nil {
+		return nil, networkErr(op, err)
+	}
+	return acl, nil
+}
+
+// ChildRotationPending reads the pending rotation of a child space from
+// the ACL the nodes serve — see space.Service.ChildRotationPending.
+func (s *Service) ChildRotationPending(ctx context.Context, childSpaceId string) (bool, error) {
+	acl, err := s.childAcl(ctx, "ChildRotationPending", childSpaceId)
+	if err != nil {
+		return false, err
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().RotationPending(), nil
+}
+
+// ChildMembers lists the accounts of a child space from the ACL the
+// nodes serve — see space.Service.ChildMembers.
+func (s *Service) ChildMembers(ctx context.Context, childSpaceId string) ([]space.ChildMember, error) {
+	acl, err := s.childAcl(ctx, "ChildMembers", childSpaceId)
+	if err != nil {
+		return nil, err
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	accounts := acl.AclState().CurrentAccounts()
+	out := make([]space.ChildMember, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, space.ChildMember{
+			Identity:   acc.PubKey.Account(),
+			Permission: fromAclPermissions(acc.Permissions),
+			Status:     fromAclStatus(acc.Status),
+		})
+	}
+	return out, nil
+}
+
+// RemoveChildMembers removes members of a child space on the account's
+// role in the parent — see space.Service.RemoveChildMembers. Rides the
+// joining client, like CancelJoin: the record is built over the ACL the
+// nodes serve, so the child needs no row and no storage here.
+func (s *Service) RemoveChildMembers(ctx context.Context, childSpaceId string, identities []string) error {
+	if len(identities) == 0 {
+		return errors.New("spaceimpl: RemoveChildMembers: empty identities")
+	}
+	pks := make([]crypto.PubKey, 0, len(identities))
+	for i, id := range identities {
+		pk, err := decodeIdentity(id)
+		if err != nil {
+			return fmt.Errorf("spaceimpl: RemoveChildMembers: identity %d: %w", i, err)
+		}
+		pks = append(pks, pk)
+	}
+	if _, _, err := s.childTarget(ctx, "RemoveChildMembers", childSpaceId); err != nil {
+		return err
+	}
+	jc := s.app.JoiningClient()
+	if jc == nil {
+		return errors.New("spaceimpl: RemoveChildMembers: joining client unavailable")
+	}
+	_, err := jc.RemoveChildMembers(ctx, childSpaceId, pks)
+	return networkErr("RemoveChildMembers", err)
+}
+
+// ChangeChildOwner hands a child space to one of its members on the
+// account's role in the parent — see space.Service.ChangeChildOwner.
+// Rides the joining client, like RemoveChildMembers.
+func (s *Service) ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm space.Permission) error {
+	pk, err := decodeIdentity(newOwner)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: ChangeChildOwner: %w", err)
+	}
+	if _, _, err := s.childTarget(ctx, "ChangeChildOwner", childSpaceId); err != nil {
+		return err
+	}
+	jc := s.app.JoiningClient()
+	if jc == nil {
+		return errors.New("spaceimpl: ChangeChildOwner: joining client unavailable")
+	}
+	_, err = jc.ChangeChildOwner(ctx, childSpaceId, pk, toAclPermissions(oldOwnerPerm))
+	return networkErr("ChangeChildOwner", err)
+}
+
+// DeleteChild deletes a child space on the network on the account's
+// role in the parent — see space.Service.DeleteChild. The signed delete
+// goes to the coordinator on the call path: only its answer tells
+// whether the account may delete the child, so nothing local is
+// touched before it. A deletion already under way is the answer asked
+// for.
+func (s *Service) DeleteChild(ctx context.Context, childSpaceId string) error {
+	rec, held, err := s.childTarget(ctx, "DeleteChild", childSpaceId)
+	if err != nil {
+		return err
+	}
+	err = s.app.SpaceDelete(ctx, childSpaceId)
+	if err != nil && !errors.Is(err, coordinatorproto.ErrSpaceDeletionPending) && !errors.Is(err, coordinatorproto.ErrSpaceIsDeleted) {
+		return networkErr("DeleteChild", err)
+	}
+	if !held || rec.IsDeleted() {
+		return nil
+	}
+	// The account's own copy goes with the child. Cut short here, the
+	// deletion reconciler does the same from the coordinator's status.
+	ctx = context.WithoutCancel(ctx)
+	if _, err := s.tsp.SetRemoteStatus(ctx, childSpaceId, techspace.StatusDeleted); err != nil {
+		s.kickDeletionReconciler()
+		return fmt.Errorf("spaceimpl: DeleteChild: mark deleted: %w", err)
+	}
+	s.OffloadSpace(ctx, childSpaceId)
+	return nil
+}
+
 // networkErr wraps the error of a call that needs an answer from the
-// network; one that reached no coordinator or node reads
-// space.ErrOffline.
+// network. One that reached no coordinator or node reads
+// space.ErrOffline. The coordinator's answers for a space it does not
+// know and for one in deletion or deleted read as the same sentinels a
+// space of the index has: space.ErrSpaceUnknown and
+// space.ErrSpaceDeleted.
 func networkErr(op string, err error) error {
 	switch {
 	case err == nil:
 		return nil
 	case errors.Is(err, anynet.ErrUnableToConnect):
 		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrOffline, err)
+	case errors.Is(err, coordinatorproto.ErrSpaceNotExists):
+		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrSpaceUnknown, err)
+	case errors.Is(err, coordinatorproto.ErrSpaceIsDeleted), errors.Is(err, coordinatorproto.ErrSpaceDeletionPending):
+		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrSpaceDeleted, err)
 	}
 	return fmt.Errorf("spaceimpl: %s: %w", op, err)
 }

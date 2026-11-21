@@ -99,6 +99,22 @@ func (s *Service) setRefusal(ctx context.Context, spaceId string, refusal space.
 	}
 }
 
+// refusalErr returns the coordinator's error behind a recorded refusal
+// to sign a child space; nil for any other value.
+func refusalErr(refusal space.Refusal) error {
+	switch refusal {
+	case space.RefusalParentNotAvailable:
+		return space.ErrParentSpaceNotAvailable
+	case space.RefusalParentInvalid:
+		return space.ErrParentSpaceInvalid
+	case space.RefusalParentPermissionDenied:
+		return space.ErrParentPermissionDenied
+	case space.RefusalChildLimitReached:
+		return space.ErrChildSpacesLimitReached
+	}
+	return nil
+}
+
 // ownsStored reports a space this device stores and the account owns,
 // as far as the index tells: a role the ACL mirror has not written yet
 // counts as the owner's.

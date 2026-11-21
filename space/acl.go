@@ -74,6 +74,14 @@ var (
 //
 // Scope: only RequestToJoin invites are supported. AnyoneCanJoin is
 // deferred until any-sync ships v2 of that invite type.
+//
+// The Owner's CreateInvite, AddAccounts and CreateGuestKey need the
+// space on the network. For a space the coordinator does not know yet
+// they wait for its first push, and return ErrSpaceUnknown when it has
+// not landed in time. A child space the coordinator refused to sign
+// (SpaceInfo.Refusal) is not waited for: they return the error of that
+// refusal, one of ErrParentSpaceNotAvailable, ErrParentSpaceInvalid,
+// ErrParentPermissionDenied and ErrChildSpacesLimitReached.
 type ACL interface {
 	// CreateInvite mints a RequestToJoin invite. A space holds one at a
 	// time: ErrDuplicateInvite while one is active, until it is revoked

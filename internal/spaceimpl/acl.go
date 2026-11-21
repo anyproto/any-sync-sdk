@@ -143,11 +143,13 @@ func isLogNotReady(err error) bool {
 //
 // Total retry window ≈ 35s — long enough to clear the worst case of
 // peer-connect-then-syncperiod-tick.
+//
+// A child the coordinator refused to sign is on no node: once the
+// coordinator answers that it does not know the space, a refusal its
+// row holds is returned with no further wait. A wait that runs out
+// returns space.ErrSpaceUnknown.
 func ensureShareable(ctx context.Context, s *spaceImpl) error {
-	const (
-		maxAttempts = 35
-		backoff     = time.Second
-	)
+	const maxAttempts = 35
 	if !s.localIdentityIsOwner(ctx) {
 		return nil
 	}
@@ -159,16 +161,47 @@ func ensureShareable(ctx context.Context, s *spaceImpl) error {
 			if !isSpaceNotPushedYet(err) {
 				return fmt.Errorf("acl: make shareable: %w", err)
 			}
+			// Read after the coordinator's answer: the row can still hold
+			// a refusal for a child another device got signed.
+			if refused := s.signRefusal(ctx); refused != nil {
+				return refused
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(backoff):
+			case <-time.After(time.Duration(makeShareableBackoff.Load())):
 			}
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("acl: make shareable (after %d attempts): %w", maxAttempts, lastErr)
+	return fmt.Errorf("acl: make shareable (after %d attempts): %w: %w", maxAttempts, space.ErrSpaceUnknown, lastErr)
+}
+
+// makeShareableBackoff is the pause between two make-shareable requests
+// for a space the coordinator does not know yet.
+var makeShareableBackoff = newAtomicInterval(time.Second)
+
+// SetMakeShareableBackoffForTest overrides that pause and returns a
+// func that restores it. Test seam.
+func SetMakeShareableBackoffForTest(d time.Duration) (restore func()) {
+	prev := makeShareableBackoff.Swap(int64(d))
+	return func() { makeShareableBackoff.Store(prev) }
+}
+
+// signRefusal returns the error of the check this space failed when
+// the coordinator refused to sign it, nil when its row holds no such
+// refusal.
+func (s *spaceImpl) signRefusal(ctx context.Context) error {
+	rec, ok := s.tsp.Get(ctx, s.id)
+	if !ok {
+		return nil
+	}
+	cause := refusalErr(rec.Refusal)
+	if cause == nil {
+		return nil
+	}
+	return fmt.Errorf("acl: space %q is on no node, the coordinator refused it (%s): %w", s.id, rec.Refusal, cause)
 }
 
 // isSpaceNotPushedYet matches the coordinator's "space not exists"

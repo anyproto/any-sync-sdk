@@ -1799,6 +1799,143 @@ func TestSDK_ChildRotationPending(t *testing.T) {
 	requireNothingHeld(t, ctx, sdk, child.id)
 }
 
+// A refused child is on no node, so it is shared with nobody. The
+// sharing calls ask the coordinator once and, when it does not know the
+// child, answer with the error of the recorded refusal: they do not
+// wait for a push. The row alone is not trusted: for a child the
+// coordinator knows the call goes on, whatever the row still holds.
+func TestSDK_ChildSpace_SharingARefusedChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	var (
+		makeShareable atomic.Int32
+		known         atomic.Bool
+	)
+	answer := func(string) error {
+		makeShareable.Add(1)
+		if known.Load() {
+			return nil
+		}
+		return coordinatorproto.ErrSpaceNotExists
+	}
+	net.coord.shareable = answer
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	require.NoError(t, spaces.Track(ctx, foreignSpaceA))
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: foreignSpaceA})
+	require.NoError(t, err)
+	share := map[string]func(context.Context) error{
+		"CreateInvite": func(ctx context.Context) error {
+			_, err := child.ACL().CreateInvite(ctx)
+			return err
+		},
+		"AddAccounts": func(ctx context.Context) error {
+			return child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: randomIdentity(t), Permission: space.PermissionWriter}})
+		},
+		"CreateGuestKey": func(ctx context.Context) error {
+			_, err := child.ACL().CreateGuestKey(ctx)
+			return err
+		},
+	}
+
+	for _, tc := range []struct {
+		answer error
+		want   error
+	}{
+		{coordinatorproto.ErrParentSpaceNotAvailable, space.ErrParentSpaceNotAvailable},
+		{coordinatorproto.ErrParentSpaceInvalid, space.ErrParentSpaceInvalid},
+		{coordinatorproto.ErrParentPermissionDenied, space.ErrParentPermissionDenied},
+		{coordinatorproto.ErrChildSpacesLimitReached, space.ErrChildSpacesLimitReached},
+	} {
+		net.coord.set(func() { net.coord.sign = func() error { return tc.answer } })
+		require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), tc.want)
+		for name, call := range share {
+			asked := makeShareable.Load()
+			// Well inside the wait for a first push.
+			noWait, stop := context.WithTimeout(ctx, 5*time.Second)
+			require.ErrorIs(t, call(noWait), tc.want, "%s on a child refused for %v", name, tc.want)
+			stop()
+			assert.Equal(t, asked+1, makeShareable.Load(), "%s asks the coordinator once", name)
+		}
+	}
+
+	// Offline the row is not read: the call fails as on any space.
+	net.coord.set(func() { net.coord.shareable = nil })
+	err = share["CreateInvite"](ctx)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, space.ErrChildSpacesLimitReached)
+	net.coord.set(func() { net.coord.shareable = answer })
+
+	// Another device got the child signed, and the refusal of this one
+	// reached the row after that: the coordinator knows the child, and
+	// the call goes on.
+	known.Store(true)
+	net.nodes.set(func() {
+		net.nodes.add = func(_ string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+			return network.accept(rec), nil
+		}
+	})
+	invite, err := child.ACL().CreateInvite(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, child.Id(), invite.SpaceId)
+	assert.Equal(t, space.RefusalChildLimitReached, child.Info().Refusal, "the row still holds the refusal")
+}
+
+// A space the coordinator does not know yet and that holds no refusal
+// is waited for: its first push is on the way. A wait that runs out
+// reads ErrSpaceUnknown, for a top-level space and for a child, and a
+// refusal that lands during the wait ends it with its error.
+func TestSDK_Sharing_WaitsForTheFirstPush(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	coord := &installFakeNetwork(t).coord
+	var makeShareable atomic.Int32
+	coord.shareable = func(string) error {
+		makeShareable.Add(1)
+		return coordinatorproto.ErrSpaceNotExists
+	}
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	top, err := spaces.Create(ctx, space.CreateRequest{Name: "Top-level"})
+	require.NoError(t, err)
+	require.NoError(t, spaces.Track(ctx, foreignSpaceA))
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: foreignSpaceA})
+	require.NoError(t, err)
+
+	restore := spaceimpl.SetMakeShareableBackoffForTest(time.Millisecond)
+	t.Cleanup(restore)
+	for _, sp := range []space.Space{top, child} {
+		asked := makeShareable.Load()
+		_, err := sp.ACL().CreateInvite(ctx)
+		require.ErrorIs(t, err, space.ErrSpaceUnknown, sp.Info().Name)
+		assert.Greater(t, makeShareable.Load(), asked+1, "the request is repeated while the call waits")
+	}
+	restore()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := child.ACL().CreateInvite(ctx)
+		done <- err
+	}()
+	coord.set(func() { coord.sign = func() error { return coordinatorproto.ErrChildSpacesLimitReached } })
+	require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), space.ErrChildSpacesLimitReached)
+	select {
+	case err := <-done:
+		require.ErrorIs(t, err, space.ErrChildSpacesLimitReached)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the call still waits for a push of a refused child")
+	}
+}
+
 // Only the Owner of a space makes it shareable, and the coordinator
 // refuses that call from anyone else. An Admin acts in a space that is
 // shared already: it adds a member and creates an invite with no such

@@ -105,6 +105,20 @@ err := sdk.Spaces().RetryPush(ctx, childId)
 | `ErrNotChildSpace` | The space has no parent. |
 | `ErrSpaceNotStored` | This device has no copy of the space. A device that holds it retries the push. |
 
+A refused child is shared with nobody: no node holds it. On it
+`ACL().CreateInvite`, `ACL().AddAccounts` and `ACL().CreateGuestKey` ask
+the coordinator once and, when it does not know the child, return the
+error of the recorded refusal with no wait, the one `RetryPush` returns
+for it: `ErrParentSpaceNotAvailable`, `ErrParentSpaceInvalid`,
+`ErrParentPermissionDenied` or `ErrChildSpacesLimitReached`. When the
+coordinator knows the child the calls go on, whatever the row still
+reads; offline they fail as on any space.
+
+A child with no refusal that the coordinator does not know yet is waited
+for like any new space, up to 35 s: one whose own parent is not pushed
+yet, for example. `ErrSpaceUnknown` when the push has not landed by
+then.
+
 A refused child that is no longer wanted is removed with `Delete`, on
 any device of the account. A device asks for the child no more once its
 own row reads deleted, also when it still holds a copy, whatever becomes

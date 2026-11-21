@@ -99,6 +99,8 @@ var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pen
 // child-space calls made from the parent side) when the coordinator
 // does not know the space. That includes a space this account created
 // and has not pushed yet: the error passes once the space is pushed.
+// ACL.CreateInvite, AddAccounts and CreateGuestKey return it for such a
+// space when the push has not landed after their wait.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was

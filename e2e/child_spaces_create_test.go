@@ -17,10 +17,10 @@ import (
 // second device of its creator and to a member added to it, and names
 // its parent on both. The children of one owner fill its limit across
 // two parents; the next child is refused with the limit reason, stays
-// usable, shows the reason on the creator's second device, and is
-// accepted by RetryPush once a place frees up. A Reader's child is
-// refused for the role. A creator is not charged: the Writer's own
-// limit stays whole.
+// usable, is shared with nobody, shows the reason on the creator's
+// second device, and is accepted by RetryPush once a place frees up. A
+// Reader's child is refused for the role. A creator is not charged: the
+// Writer's own limit stays whole.
 func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -116,6 +116,17 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 	// Usable locally while refused.
 	overNote := writeNote(t, ctx, over, "written while refused")
 	assert.True(t, readsNote(ctx, over, overNote, "written while refused"))
+
+	// Shared with nobody while refused: the sharing calls do not wait
+	// for a push and answer with the refusal.
+	asked := time.Now()
+	_, err = over.ACL().CreateInvite(ctx)
+	assert.ErrorIs(t, err, space.ErrChildSpacesLimitReached, "CreateInvite on a refused child")
+	assert.ErrorIs(t, over.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: admin.id(), Permission: space.PermissionWriter}}),
+		space.ErrChildSpacesLimitReached, "AddAccounts on a refused child")
+	_, err = over.ACL().CreateGuestKey(ctx)
+	assert.ErrorIs(t, err, space.ErrChildSpacesLimitReached, "CreateGuestKey on a refused child")
+	assert.Less(t, time.Since(asked), 10*time.Second, "they do not wait for a push that is not coming")
 
 	// The reason reaches the creator's second device, which holds no copy.
 	onB := ownerB.waitRow(t, ctx, over.Id(), "the refusal reaches the second device", func(si space.SpaceInfo) bool {

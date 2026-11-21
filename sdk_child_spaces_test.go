@@ -1761,6 +1761,55 @@ func TestSDK_ChildRotationPending(t *testing.T) {
 	requireNothingHeld(t, ctx, sdk, child.id)
 }
 
+// Only the Owner of a space makes it shareable, and the coordinator
+// refuses that call from anyone else. An Admin acts in a space that is
+// shared already: it adds a member and creates an invite with no such
+// call.
+func TestSDK_ChildSpace_AdminAddsMembersWithoutMakeShareable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	var makeShareable atomic.Int32
+	net.coord.shareable = func(string) error {
+		makeShareable.Add(1)
+		return coordinatorproto.ErrForbidden
+	}
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	// A child another account owns, in which this account is an Admin.
+	parent := foreignSpaceA
+	require.NoError(t, spaces.Track(ctx, parent))
+	child := newForeignChild(t, network, parent)
+	acl := child.heldBy(t, ctx, sdk, parent, list.AclPermissionsAdmin)
+	child.serve(t, &net.nodes, func(*consensusproto.RawRecord) error { return nil })
+	sp, err := spaces.Get(ctx, child.id)
+	require.NoError(t, err)
+	me, err := sp.Members().Me(ctx)
+	require.NoError(t, err)
+	require.Equal(t, space.PermissionAdmin, me.Permission)
+
+	added := randomIdentity(t)
+	require.NoError(t, sp.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: added, Permission: space.PermissionWriter}}))
+	invite, err := sp.ACL().CreateInvite(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, child.id, invite.SpaceId)
+	assert.Zero(t, makeShareable.Load(), "the coordinator is not asked to make the space shareable")
+
+	acl.RLock()
+	state := acl.AclState()
+	addedKey, err := crypto.DecodeAccountAddress(added)
+	require.NoError(t, err)
+	assert.True(t, state.Permissions(addedKey).CanWrite(), "the member is added")
+	assert.Len(t, state.InviteIds(), 1, "and the invite is on the ACL")
+	acl.RUnlock()
+}
+
 // A device of an Admin of a child that starts with a rotation pending
 // ends it by itself: the boot pass loads the child and starts the
 // watcher that rotates, with no Get of the space.

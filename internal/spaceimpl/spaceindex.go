@@ -330,6 +330,23 @@ func (s *spaceImpl) WaitIndexSynced(ctx context.Context) error {
 	}
 }
 
+// IndexSeeded reports whether the spaceIndex metadata is projected on
+// this device: seeded here when the space was created, or arrived by
+// sync. A local read: it runs no sync round and loads no tree that is
+// not stored here. A handle kept past Evict or Delete answers false.
+func (s *spaceImpl) IndexSeeded(ctx context.Context) bool {
+	objectId, err := spaceIndexTreeId(s.id)
+	if err != nil || !s.store.HoldsTree(ctx, objectId) {
+		return false
+	}
+	// Get runs ColdRestore, so state head-synced before this boot
+	// projects too.
+	if _, err := s.store.Get(ctx, objectId); err != nil {
+		return false
+	}
+	return spaceIndexHasNamespace(ctx, s.store, objectId)
+}
+
 // spaceIndexHasNamespace returns true when the per-space `objects`
 // collection holds a row at spaceIndexObjectId carrying a
 // `record.spaceIndex` namespace (i.e. at least one prior LocalWrite

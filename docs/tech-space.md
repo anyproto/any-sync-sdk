@@ -62,7 +62,8 @@ Supported:
   leaves its losers claimed (`bundles.md` § Known edges).
 - `Info()` (synthetic: owner-only, derived, `any.techspace`),
   `SyncStatus`, `Debug`, `SyncHeads`, `TreeHeads`, `WaitIndexSynced`
-  (same as `WaitListSynced`).
+  (same as `WaitListSynced`), `IndexSeeded` (always true: `Open` derives
+  the tech index object).
 
 Everything else returns `space.ErrUnsupported`: `Objects().Create` /
 `Derive`, `Types().Create` / `Delete`, `Collections().Create` /

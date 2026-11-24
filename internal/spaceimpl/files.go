@@ -166,7 +166,54 @@ func (f *filesAPI) openRow(ctx context.Context, row payloads.Row) (space.FileRea
 	if err != nil {
 		return nil, fmt.Errorf("files: row %s rootCid: %w", row.Id, err)
 	}
-	return f.s.parent.fetch.Open(ctx, fetchObject(f.s.id, root, row), row.Enc.Key, row.Id)
+	r, err := f.s.parent.fetch.Open(ctx, fetchObject(f.s.id, root, row), row.Enc.Key, row.Id)
+	if err != nil || row.NetworkSign != "" {
+		return r, err
+	}
+	// The read may complete the local copy of a file nobody backed up.
+	return &takeoverReader{FileReader: r, done: func() {
+		f.s.scheduleTakeover(context.WithoutCancel(ctx), row)
+	}}, nil
+}
+
+// takeoverReader runs done once the reader of an unsigned file closes.
+type takeoverReader struct {
+	space.FileReader
+	done func()
+}
+
+func (r *takeoverReader) Close() error {
+	err := r.FileReader.Close()
+	r.done()
+	return err
+}
+
+// scheduleTakeover queues the delayed backup of a file this device
+// holds in full while its row is unsigned: whoever registered it has
+// not made it durable, and this device can. Staggered by takeoverDelay,
+// so an online creator or another downloader usually gets there first
+// and the job then no-ops on the row's networkSign. Nothing is queued
+// while a durable job is pending, the local copy is partial, or this
+// device cannot write the receipt.
+func (s *spaceImpl) scheduleTakeover(ctx context.Context, row payloads.Row) {
+	q := s.parent.fqueue
+	if q == nil || row.Inline() || row.NetworkSign != "" {
+		return
+	}
+	if _, pending, err := q.Get(ctx, status.KindDurable, s.id, row.Id); err != nil || pending {
+		return
+	}
+	root, err := cid.Decode(row.RootCid)
+	if err != nil {
+		return
+	}
+	info, err := s.parent.filesStore().Info(ctx, s.id, root)
+	if err != nil || info.State != filestore.StateComplete || !s.canWrite(ctx) {
+		return
+	}
+	if err = q.EnqueueDelayed(ctx, status.KindDurable, s.id, row.Id, takeoverDelay()); err != nil {
+		filesLog.Warn("schedule durability takeover", zap.String("fileId", row.Id), zap.Error(err))
+	}
 }
 
 // fetchObject names a row's content for the fetch service.

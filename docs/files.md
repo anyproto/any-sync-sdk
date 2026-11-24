@@ -186,6 +186,12 @@ are only waiting out that backoff.
 | `inflight` | registered; backup queued, running, or driven by another device |
 | `limited` | the network refused backup for storage limit |
 
+A device that completes its local copy of a file that is not durable, by
+reading it to the end or by a pin, and that may write to the space queues
+the backup itself 45–90 s later. The file then survives a creator that
+never uploads it; the job does nothing if the row gained `networkSign`
+in the meantime.
+
 `FileStatus` also reports `Cached` (complete local copy), `Attempts` and
 `LastErr`. `SubscribeStatus` delivers local transitions only (attach,
 backup progress and failure, pin completion, retries); a backup finished

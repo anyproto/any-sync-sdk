@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"errors"
 	"io"
 	mrand "math/rand"
 	"testing"
@@ -90,6 +91,67 @@ func TestReaderSeek(t *testing.T) {
 
 	_, err = r.Seek(-1, io.SeekStart)
 	require.Error(t, err)
+}
+
+// holedCiphertext counts reads and fails the ones that touch [from, to):
+// a partly fetched file with no source for the rest.
+type holedCiphertext struct {
+	*bytes.Reader
+	from, to int64
+	reads    int
+}
+
+var errHole = errors.New("block not available")
+
+func (h *holedCiphertext) Read(p []byte) (int, error) {
+	h.reads++
+	pos, _ := h.Reader.Seek(0, io.SeekCurrent)
+	if pos < h.to && pos+int64(len(p)) > h.from {
+		return 0, errHole
+	}
+	return h.Reader.Read(p)
+}
+
+// A Seek reads no ciphertext, so it cannot fail on bytes that are not
+// there: sizing a file by seeking to its end works on a partial copy,
+// and the missing bytes fail the Read that needs them.
+func TestReaderSeekReadsNothing(t *testing.T) {
+	plain, key := testData(t, 4096)
+	ct := &holedCiphertext{Reader: bytes.NewReader(encrypt(t, key, plain)), from: 1024, to: 4096}
+
+	r, err := NewReader(key, ct)
+	require.NoError(t, err)
+	size, err := r.Seek(0, io.SeekEnd)
+	require.NoError(t, err, "the end of the file is not local")
+	require.Equal(t, int64(len(plain)), size)
+	_, err = r.Seek(2000, io.SeekStart)
+	require.NoError(t, err)
+	require.Zero(t, ct.reads, "a seek reads no ciphertext")
+
+	_, err = r.Read(make([]byte, 10))
+	require.ErrorIs(t, err, errHole, "the read of missing bytes is what fails")
+
+	// The reader stays usable for what is there.
+	_, err = r.Seek(100, io.SeekStart)
+	require.NoError(t, err)
+	buf := make([]byte, 200)
+	_, err = io.ReadFull(r, buf)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(plain[100:300], buf))
+}
+
+// Reading from a position past the end is the end of the stream.
+func TestReaderSeekPastEnd(t *testing.T) {
+	plain, key := testData(t, 100)
+	r, err := NewReader(key, bytes.NewReader(encrypt(t, key, plain)))
+	require.NoError(t, err)
+	for _, off := range []int64{100, 105, 200, 5000} {
+		_, err = r.Seek(off, io.SeekStart)
+		require.NoError(t, err)
+		n, err := r.Read(make([]byte, 10))
+		require.Zero(t, n, "off=%d", off)
+		require.ErrorIs(t, err, io.EOF, "off=%d", off)
+	}
 }
 
 func TestBadKey(t *testing.T) {

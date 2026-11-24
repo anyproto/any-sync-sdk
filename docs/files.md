@@ -150,7 +150,8 @@ doubling to 10 min.
 ## Open
 
 `Open(ctx, fileId, variant)` returns a seekable reader over verified
-plaintext. Content resolves through a source ladder:
+plaintext. `Seek` reads nothing: a position whose bytes cannot be had
+fails the `Read` there. Content resolves through a source ladder:
 
 1. Local store.
 2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`):

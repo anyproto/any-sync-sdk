@@ -90,7 +90,7 @@ shape (tombstone, offload markers, ended join) surfaces as `Removed`.
 | Field | Scope | Meaning |
 | --- | --- | --- |
 | `id` | synced | Space id |
-| `type` | synced | On-wire header type. Set once; empty until the header is readable (join/track rows), then filled from the loaded header |
+| `type` | synced | On-wire header type: `any.space`, `any.organization`, `any.organization.space`, `any.onetoone`, or an `anytype.*` type on a joined or tracked row. Set once; empty until the header is readable (join/track rows), then filled from the loaded header |
 | `name`, `description`, `icon` | synced | Display metadata, mirrored from the space's `spaceIndex` object |
 | `spaceType` | synced | App-level tag mirrored from `spaceIndex.spaceType`; not pinned |
 | `localStatus` | local | Per-device lifecycle, below |
@@ -102,7 +102,7 @@ shape (tombstone, offload markers, ended join) surfaces as `Removed`.
 | `guestKey` | synced | Guest identity private key on a guest-mode row; presence marks guest mode |
 | `issuedInviteKeys` | synced | Invite private keys this account issued, below |
 | `derived` | synced | Row written by this account's `Derive`, below |
-| `parentSpaceId` | synced | Parent of a child space, from the space header. Set once: written with the row by the creating device, filled with `type` on a joined row's first load (docs/child-spaces.md) |
+| `parentSpaceId` | synced | Parent of a child space, from the space header. Set once: written with the row by the creating device, filled with `type` on a joined row's first load. A row whose `type` is `any.organization.space` and that names no parent, as a device whose SDK reads no parent from a header leaves it, takes the parent at the first `Get` of the space; until then `List` and `Subscribe` show the child with no parent (docs/child-spaces.md) |
 | `refusal` | synced | What the coordinator last refused for the space: the check a child space failed when it was not signed, or `has_children` on a deleted space whose deletion waits for its children; `none` or absent otherwise (docs/child-spaces.md) |
 | `oneToOnePeer` | synced | The other identity on a 1-1 row (needed to materialize storage; a spaceId doesn't encode it invertibly) |
 | `oneToOneInviteState` | local | `toSend` while this device owes the peer a 1-1 inbox notification |

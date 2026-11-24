@@ -1,12 +1,41 @@
 # Child Spaces
 
-A space can be created under a **parent** space. The child is a full
-space with its own ACL, read key and members: membership in the parent
-gives no access to it. The parent's Owner and Admins govern a child
-without reading it. The model and its rules are `docs/nested-spaces.md`;
-this page is the SDK API.
+An **organization** is a space under which spaces are created: it is
+their **parent**, and they are its **children**. A child is a full space
+with its own ACL, read key and members: membership in the parent gives
+no access to it. The parent's Owner and Admins govern a child without
+reading it. The model and its rules are `docs/nested-spaces.md`; this
+page is the SDK API.
 
 Every method below is on `sdk.Spaces()` unless it names `ACL()`.
+
+## The two types
+
+| | Header type | Constant | Made by |
+|---|---|---|---|
+| Organization | `any.organization` | `space.SpaceTypeOrganization` | `Create` with that `CreateRequest.SpaceType` |
+| Child | `any.organization.space` | `space.SpaceTypeOrganizationSpace` | `CreateChild` |
+
+```go
+org, err := sdk.Spaces().Create(ctx, space.CreateRequest{
+	Name:      "Acme",
+	SpaceType: space.SpaceTypeOrganization,
+})
+```
+
+The type is in the immutable space header: a space is created as an
+organization, and a space of another type never becomes one. Only an
+organization has children, and only a child names a parent. Read the
+type from `SpaceInfo.Type`, not from `SpaceInfo.SpaceType`: a derived
+space carries there a free-text tag its application chooses.
+
+An organization is otherwise a space like `any.space`: objects, files,
+members and invites work the same. Two things differ: it has children,
+and neither it nor a child has a guest role (*Members of a child*).
+
+A device whose SDK does not know the two types lists, joins and loads an
+organization and its children as ordinary spaces, under these type
+strings. It creates no organization and no child.
 
 ## The parent link
 
@@ -15,7 +44,11 @@ top-level space. It is the `parentSpaceId` of the signed space header,
 kept on the index row (`docs/tech-space.md § Space Index`):
 
 - the creating device writes it with the row;
-- a joined space carries it from its first load on, like `Type`.
+- a joined space carries it from its first load on, like `Type`;
+- a device whose SDK does not know the two types fills `Type` alone:
+  `List` and `Subscribe` show the child as `any.organization.space`
+  with an empty `ParentSpaceId` until the first `Get` of the space on a
+  device on this SDK fills it.
 
 A member finds the children it belongs to in `List`, by
 `ParentSpaceId`. The list of all children of a parent comes from the
@@ -31,17 +64,18 @@ child, err := sdk.Spaces().CreateChild(ctx, space.CreateChildRequest{
 ```
 
 `CreateChild` works like `Create`: it is local and needs no network. The
-child's v1 header names the parent, the child takes the parent's
-replication key, and nothing is written to the parent. The caller owns
-the child.
+child's v1 header carries the type `any.organization.space` and names
+the parent, the child takes the parent's replication key, and nothing is
+written to the parent. The caller owns the child.
 
-A child is always a regular space: header type `any.space`, and
-`SpaceInfo.SpaceType` `any.space` too. The app-level space type is a tag
-of derived spaces (`DeriveRequest.SpaceType`); a derived space is neither
-a child nor a parent.
+Only `CreateChild` makes a space of that type: `Create` refuses it with
+`ErrBadSpaceType`. `SpaceInfo.SpaceType` of a child is
+`any.organization.space` too. The app-level space type is a tag of
+derived spaces (`DeriveRequest.SpaceType`); a derived space is neither a
+child nor a parent.
 
-The parent is a space of the account's index. `CreateChild` refuses what
-the index already shows:
+The parent is an organization of the account's index. `CreateChild`
+refuses what the index already shows:
 
 | Parent | Error |
 |---|---|
@@ -49,7 +83,12 @@ the index already shows:
 | no row | `ErrSpaceUnknown` |
 | deleted | `ErrSpaceDeleted` |
 | join or invite not accepted yet | `ErrSpaceNotAccepted` |
-| the tech space, a 1-1 space, a derived space, a child, a space of another header type | `ErrParentSpaceInvalid` |
+| not an organization: a space of type `any.space` or of any other header type, a child, a derived space, a 1-1 space, the tech space | `ErrParentSpaceInvalid` |
+
+A parent whose row has no type yet, a joined space the account has
+loaded on no device, is not judged here. The coordinator refuses a child
+of a space that is not an organization at its first push
+(`RefusalParentInvalid`).
 
 The caller's role in the parent is not checked locally. The coordinator
 checks it when the child is first pushed: the account must then be a
@@ -73,7 +112,7 @@ A child the coordinator refuses to sign stays a local space: `Status` is
 | `Refusal` | Label | Cause | What ends it |
 |---|---|---|---|
 | `RefusalParentNotAvailable` | `parent_not_available` | The parent does not exist on the network or is deleted. | Nothing, for a deleted parent |
-| `RefusalParentInvalid` | `parent_invalid` | The parent is not a regular top-level space. | Nothing |
+| `RefusalParentInvalid` | `parent_invalid` | The parent is not an organization. | Nothing |
 | `RefusalParentPermissionDenied` | `parent_permission_denied` | The account is below Writer in the parent. | A role of Writer or above in the parent |
 | `RefusalChildLimitReached` | `child_limit_reached` | The parent's Owner is at its child spaces limit. | A higher limit of that account, or fewer children |
 
@@ -102,14 +141,14 @@ err := sdk.Spaces().RetryPush(ctx, childId)
 | `ErrParentSpaceNotAvailable`, `ErrParentSpaceInvalid`, `ErrParentPermissionDenied`, `ErrChildSpacesLimitReached` | Refused again. `Refusal` names that check. |
 | `ErrParentSpaceNotAvailable` with `Refusal` unchanged | The parent is the account's own and no tree node holds it yet. The coordinator was not asked; the SDK asks when one does. |
 | `ErrOffline` | The coordinator could not be reached. Nothing changed. |
-| `ErrNotChildSpace` | The space has no parent. |
+| `ErrNotChildSpace` | The space is not a child. |
 | `ErrSpaceNotStored` | This device has no copy of the space. A device that holds it retries the push. |
 
 A refused child is shared with nobody: no node holds it. On it
-`ACL().CreateInvite`, `ACL().AddAccounts` and `ACL().CreateGuestKey` ask
-the coordinator once and, when it does not know the child, return the
-error of the recorded refusal with no wait, the one `RetryPush` returns
-for it: `ErrParentSpaceNotAvailable`, `ErrParentSpaceInvalid`,
+`ACL().CreateInvite` and `ACL().AddAccounts` ask the coordinator once
+and, when it does not know the child, return the error of the recorded
+refusal with no wait, the one `RetryPush` returns for it:
+`ErrParentSpaceNotAvailable`, `ErrParentSpaceInvalid`,
 `ErrParentPermissionDenied` or `ErrChildSpacesLimitReached`. When the
 coordinator knows the child the calls go on, whatever the row still
 reads; offline they fail as on any space.
@@ -152,6 +191,10 @@ and the account needs no row for the parent.
 parent the coordinator does not know and `ErrSpaceDeleted` for one it
 holds as deleted or in deletion.
 
+The type of the space is not checked. An Admin or the Owner of a space
+that is not an organization gets an empty list, so an empty list does
+not say that the space can have children: `SpaceInfo.Type` does.
+
 A parent the account has just created is not on the network at once.
 Until it is pushed `Children` answers `ErrSpaceUnknown`, and then
 `ErrParentSpaceNotAvailable` until the ACL of the parent has reached the
@@ -186,7 +229,17 @@ for _, m := range members {
 ```
 
 It reads the child's ACL off the nodes. An ACL names accounts by
-identity; names are not readable without the child's keys.
+identity; names are not readable without the child's keys. The read is
+not limited to children: for any space the account does not hold, a
+top-level one included, `ChildMembers` and `ChildRotationPending`
+answer, so whoever knows the id of a space reads its accounts and their
+roles.
+
+An account added with `ACL().AddAccounts` is an active member in the ACL
+at once, whether it accepts the invite or declines it
+(docs/direct-add-invites.md): `ChildMembers` does not tell the two
+apart, and `ChangeChildOwner` hands the child to either. An owner who
+has not accepted holds the child on no device until `AcceptInvite`.
 
 `RemoveChildMembers` is for the parent's Admins and Owner only. An Admin
 or the Owner of the child removes members with `ACL().RemoveAccounts`,
@@ -208,12 +261,12 @@ Errors of these calls:
 | `ErrParentPermissionDenied` | The network does not accept the call from this account (the table above), or an Admin of the parent removes an account that is an Admin or the Owner of the parent. |
 | `ErrNotParentMember` | The new owner is no member of the parent. |
 | `ErrAccountNotFound` | An identity is no member of the child: one of the removed, or the new owner. |
-| `ErrInsufficientPermissions` | The ACL forbids the record: the child's Owner or the caller among the removed identities; a new owner who is the Owner already or a guest identity; an `oldOwnerPerm` of `none`, `guest` or `owner`. |
+| `ErrInsufficientPermissions` | The ACL forbids the record: the child's Owner or the caller among the removed identities; a new owner who is the Owner already; an `oldOwnerPerm` of `none`, `guest` or `owner`. |
 | any other error from `RemoveChildMembers` or `ChangeChildOwner` | The record names the ACL head it was built on, and another record reached the child's ACL first (`records conflict`, `incorrect prev id of a record`). Nothing was written: call again. |
 | `ErrSpaceUnknown` | The coordinator does not know the space. That includes a space this account created and has not pushed yet, a parent given to `Children` for example: the error passes once the space is pushed. |
 | `ErrParentSpaceNotAvailable` | The coordinator cannot read the ACL of the parent. From `Children`: it knows the parent and the ACL is not on the network yet, which passes once the parent is pushed. From `RemoveChildMembers`, `ChangeChildOwner` and `DeleteChild`: the ACL of the child's parent. |
 | `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. The error is no proof that the space is gone for good: the coordinator lets the space's own owner take back a deletion that owner started. |
-| `ErrNotChildSpace` | The space has no parent. The index shows it for a space the account holds, the tech space and a 1-1 space included, and nothing is sent. `DeleteChild` also returns it for an active regular top-level space of another account, which the coordinator shows; `RemoveChildMembers` and `ChangeChildOwner` see only the ACL of such a space. The device refuses with `ErrInsufficientPermissions` when the record names the space's Owner or the caller, and with `ErrAccountNotFound` for an identity that is no account of it. For another member of the space the coordinator refuses the record, and that error carries no sentinel. Not covered: for the tech space of another account, or a 1-1 space the account does not hold, `DeleteChild` returns the coordinator's untyped error, and for a space of another account that is deleted or in deletion it returns `nil`, as for any space the coordinator holds so. |
+| `ErrNotChildSpace` | The space is not a child. The index shows it for a space the account holds whose row has a type and is not the row of a child, an organization, the tech space and a 1-1 space included, and nothing is sent. `DeleteChild` also returns it for an active top-level space of another account, an organization included, which the coordinator shows; `RemoveChildMembers` and `ChangeChildOwner` see only the ACL of such a space. The device refuses with `ErrInsufficientPermissions` when the record names the space's Owner or the caller, and with `ErrAccountNotFound` for an identity that is no account of it. For another member of the space the coordinator refuses the record, and that error carries no sentinel. Not covered: for the tech space of another account, or a 1-1 space the account does not hold, `DeleteChild` returns the coordinator's untyped error, and for a space of another account that is deleted or in deletion it returns `nil`, as for any space the coordinator holds so. |
 | `ErrBadSpaceId`, `ErrBadIdentity` | Malformed input. |
 
 ## Rotation pending
@@ -231,8 +284,9 @@ account is an Admin or the Owner of the child and the device holds the
 child with its read key:
 
 - when the SDK starts, with no `Get`: for a child the device holds whose
-  row names the parent and whose load at start succeeds. A headless SDK
-  loads no space at start, and rotates from the first `Get` of the child;
+  row names the parent or has the type `any.organization.space`, and
+  whose load at start succeeds. A headless SDK loads no space at start,
+  and rotates from the first `Get` of the child;
 - while it runs, when the removal reaches a child that is loaded: one
   the SDK loaded at start or the application opened since;
 - with the network reachable; a change that could not be published is
@@ -263,26 +317,56 @@ the key.
 there. A child with no device of an Admin or the Owner left that holds
 it stays pending; `DeleteChild` is what remains.
 
+What the network enforces after a removal: any-sync checks a change
+against the ACL record the change names. A change of the removed member
+that names a record from before the removal is valid, and the other
+members read it, as in any space. A device on the SDK names the head of
+its own ACL, and stops writing once its own ACL shows the removal.
+
 ## Members of a child
 
-Only a member of the parent becomes a member of a child. The coordinator
-checks every way in, and its refusal is `ErrNotParentMember`:
+Only a member of the parent becomes a member of a child, or its owner.
+The coordinator checks every way in, and its refusal is
+`ErrNotParentMember`:
 
 | Call | Refused when |
 |---|---|
 | `ACL().AddAccounts` | one of the added accounts is not a member of the parent; nobody of the batch is added |
 | `ACL().AcceptRequest` | the joiner is not a member of the parent any more: it left the parent after it asked |
 | `Join` | this account is not a member of the parent: its join request is refused when it is posted, and no row is written |
+| `ACL().OwnershipChange`, `ChangeChildOwner` | the new owner is not a member of the parent |
 
-`ACL().CreateGuestKey` works on a child as on any space: the guest
-identity is no member, and gives read-only access to holders outside the
-parent.
+The same calls return `ErrParentSpaceNotAvailable` when the coordinator
+cannot read the ACL of the parent.
+
+### No guest role
+
+An organization and its children have no guest role: no account is a
+guest in one, and none has a guest key. A read-only member is a Reader.
+In both types these calls return `ErrNoGuestRole`:
+
+| Call | Refused |
+|---|---|
+| `ACL().CreateGuestKey`, `ACL().RevokeGuestKey` | always |
+| `ACL().AddAccounts` | when an account is added with `PermissionGuest`; nobody of the batch is added |
+| `ACL().ChangePermissions` | when a change is to `PermissionGuest`; no change of the batch is made |
+| `ACL().AcceptRequest` | with `PermissionGuest` |
+
+The type of the space decides (`SpaceInfo.Type`), for any caller and
+before its role is checked, and nothing is sent. A space of type
+`any.space` keeps its guest key and its guests.
+
+`ErrNoGuestRole` is the coordinator's own refusal of a record that makes
+an account a guest in an organization or a child. A device whose SDK
+does not know the two types sends such a record and gets that refusal
+from the network, as an error its SDK has no sentinel for.
 
 ## Deleting a parent
 
-The coordinator does not delete a space that still has children, and a
-deleted child is one until the coordinator has finished deleting it. So
-delete the children, and delete the parent once `Children` lists none:
+The coordinator does not delete an organization that still has children,
+and a deleted child is one until the coordinator has finished deleting
+it. So delete the children, and delete the parent once `Children` lists
+none:
 
 ```go
 children, err := sdk.Spaces().Children(ctx, parentId)
@@ -296,11 +380,11 @@ for _, c := range children {
 err = sdk.Spaces().Delete(ctx, parentId)
 ```
 
-`Delete` of a space the account owns settles this before it writes
-anything:
+`Delete` of an organization the account owns settles this before it
+writes anything:
 
-- a child in the account's index: `ErrSpaceHasChildren`, with no
-  network;
+- a child in the account's index whose row names the parent:
+  `ErrSpaceHasChildren`, with no network;
 - the coordinator in reach: the signed delete is sent on the call path.
   `ErrSpaceHasChildren` while `Children` still lists a child, the ones
   the account is not a member of and the ones in deletion included.
@@ -323,6 +407,17 @@ waiting delete again by itself, on every pass of the deletion reconciler
 and after each accepted `DeleteChild`. It goes through once the last
 child is finally deleted, and `Refusal` returns to `RefusalNone`.
 
+A deletion the coordinator refused changes nothing on the network: the
+parent stays an active space there. Only an account that is a Writer or
+above in the parent and holds it as an active space creates children
+under it, and each new child is one more the deletion waits for.
+
+Only an organization has children, so `Delete` of a space whose row
+carries another type asks nothing first (docs/space.md § Space
+Lifecycle). A device whose SDK does not know the two types deletes an
+organization the same way: the row reads deleted at once, and the
+network delete is refused until the children are gone.
+
 ## Without the network, and when the process is killed
 
 | Flow | Offline | Killed |
@@ -335,4 +430,4 @@ child is finally deleted, and `Refusal` returns to `RefusalNone`.
 | `RemoveChildMembers`, `ChangeChildOwner` | `ErrOffline`. | One ACL record: accepted by the network or not written. |
 | `DeleteChild` | `ErrOffline`, nothing changes. | After the coordinator accepted: the deletion reconciler marks the account's row deleted and removes the local copy on its next pass. |
 | Rotation | Retried until published. | The pending state is ACL state: the next start of the SDK sees it. |
-| `Delete` of a parent | `ErrSpaceHasChildren` from the index alone; otherwise deferred, and a later refusal is `RefusalHasChildren` on the deleted row. | After the coordinator accepted: the deletion reconciler marks the row deleted and removes the local copy on its next pass. After the row was marked: the reconciler sends the delete. |
+| `Delete` of a parent | `ErrSpaceHasChildren` from the index alone for a child whose row names the parent; otherwise deferred, and a later refusal is `RefusalHasChildren` on the deleted row. | After the coordinator accepted: the deletion reconciler marks the row deleted and removes the local copy on its next pass. After the row was marked: the reconciler sends the delete. |

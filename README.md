@@ -123,7 +123,7 @@ Implemented:
 - Sync status: `Space.SyncStatus()` (`Space`, `Object`, `SubscribeObject`); `Service.Status` / `SubscribeStatus`
 - Tech space (per-account derived index of all spaces); spaces stay resident and are eager-loaded on boot; `Service.Subscribe` for space-list events
 - Space lifecycle: `Create` / `Join` / `JoinGuest` / `Derive` / `OneToOne` / `Get` / `List` / `Track` / `Evict` / `Delete`; direct-add and 1-1 accept/decline
-- Child spaces: `CreateChild` under a parent space, `Children`, `RetryPush` for a child the coordinator refused (`SpaceInfo.Refusal`), and `ChildMembers` / `ChildRotationPending` / `RemoveChildMembers` / `ChangeChildOwner` / `DeleteChild` for the parent's Admins and Owner
+- Organizations and child spaces: `Create` with `SpaceTypeOrganization` for a space that has children, `CreateChild` under it, `Children`, `RetryPush` for a child the coordinator refused (`SpaceInfo.Refusal`), and `ChildMembers` / `ChildRotationPending` / `RemoveChildMembers` / `ChangeChildOwner` / `DeleteChild` for the parent's Admins and Owner
 - Collaboration: `ACL` (`CreateInvite` / `RevokeInvite` / `RevokeAllInvites` / `AcceptRequest` / `DeclineRequest` / `ChangePermissions` / `AddAccounts` / `RemoveAccounts` / `OwnershipChange` / `RequestSelfRemove` / `CancelJoinRequest` / `StopSharing` / `CreateGuestKey` / `RotationPending`); `Members` (`List` / `Get` / `Me` / `JoinRequests` / `Invites` / `Subscribe` / `Query`)
 - Account: `Account.Metadata` / `UpdateMetadata`, persisted in the tech space and republished to identityRepo on boot; `Account.Limits` — the network's file-storage pool, shared-spaces limit and child-spaces limit, served from the device's last answer while offline; `SDK.Identities()` directory; devices
 - Push notifications (`SDK.Push()`) and pub/sub (`SDK.PubSub()`, `Space.PubSub()`)
@@ -148,7 +148,7 @@ See [`docs/`](docs/):
 - `one-to-one-spaces.md`: derived 1-1 spaces and inbox discovery
 - `identities.md`: account-global identity directory
 - `direct-add-invites.md`: adding accounts to a space by identity
-- `child-spaces.md`: spaces under a parent space: creation, refusal, governance
+- `child-spaces.md`: organizations and their child spaces: the two types, creation, refusal, governance
 - `user-datasets.md`: parts, modules, runtime dataset schemas, batch upsert
 - `global-p2p.md`: internet-wide device-to-device sync
 - `account-discovery.md`: finding the account's own devices
@@ -161,7 +161,7 @@ See [`docs/`](docs/):
 
 ## Compatibility note
 
-The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. The SDK mints only the `any.*` family; it can join `anytype.*` spaces but never creates them. See `docs/space.md § Space type strings`.
+The on-the-wire `header.SpaceType` is constrained to the any-sync-coordinator's allow-list: the `any` product's `any.space` / `any.organization` / `any.organization.space` / `any.techspace` / `any.onetoone` (fileproto v2 required) plus anytype's `anytype.space`, `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. The SDK mints only the `any.*` family; it can join `anytype.*` spaces but never creates them. See `docs/space.md § Space type strings`.
 
 
 ## License

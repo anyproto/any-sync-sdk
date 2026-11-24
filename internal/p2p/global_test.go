@@ -968,12 +968,17 @@ func newDemandFixture(t *testing.T, cfg config.GlobalP2P, peers ...testPeer) *de
 	return fx
 }
 
-// start loads the space once the test has written its rows.
+// start loads the space once the test has written its rows. The
+// connector is parked until every row is folded in: a plan made on half
+// of them finds the space uncovered and dials for it.
 func (fx *demandFixture) start(t *testing.T) {
 	t.Helper()
+	sdkp2p.SetPowerHint(sdkp2p.PowerLow)
+	t.Cleanup(func() { sdkp2p.SetPowerHint(sdkp2p.PowerNormal) })
 	fx.run(t)
 	fx.g.SpaceLoaded("s1", fx.sp)
 	fx.drain(t)
+	sdkp2p.SetPowerHint(sdkp2p.PowerNormal)
 }
 
 func (fx *demandFixture) setFail(id string, fail bool) {
@@ -1007,8 +1012,8 @@ func TestConnectorDialsOnDemandBeyondTheCover(t *testing.T) {
 	require.Empty(t, fx.dials(), "the cover is satisfied: nothing is dialed unasked")
 
 	start := time.Now()
-	id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "", []string{fx.cover.peerId})
-	require.True(t, ok)
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", []string{fx.cover.peerId})
+	require.True(t, connected)
 	require.Equal(t, b.peerId, id)
 	require.Less(t, time.Since(start), refusedWindow, "the answer does not wait out the refusal window")
 	require.Equal(t, []string{b.peerId}, fx.dials())
@@ -1025,8 +1030,8 @@ func TestConnectorDemandAnswersWithAConnectedPeer(t *testing.T) {
 	fx.sp.kv.put(b, b.ticket, fx.now.Add(-time.Minute))
 	fx.start(t)
 
-	id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
-	require.True(t, ok)
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
+	require.True(t, connected)
 	require.Equal(t, fx.cover.peerId, id)
 	require.Empty(t, fx.dials())
 }
@@ -1036,7 +1041,7 @@ func TestConnectorDemandAnswersWithAConnectedPeer(t *testing.T) {
 func TestConnectorDemandPrefersTheAuthorsDevices(t *testing.T) {
 	other := newTestPeer(t, "other")
 	author := newTestPeer(t, "author")
-	fx := newDemandFixture(t, config.GlobalP2P{}, other, author)
+	fx := newDemandFixture(t, config.GlobalP2P{MaxDialsPerMinute: 60}, other, author)
 	own := newTestPeer(t, fx.self.identity)
 	fx.sp.kv.put(other, other.ticket, fx.now)
 	fx.sp.kv.put(own, own.ticket, fx.now.Add(-time.Hour))
@@ -1045,91 +1050,160 @@ func TestConnectorDemandPrefersTheAuthorsDevices(t *testing.T) {
 
 	skip := []string{fx.cover.peerId}
 	for _, want := range []testPeer{author, own, other} {
-		id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "author", skip)
-		require.True(t, ok)
+		id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "author", skip)
+		require.True(t, connected)
 		require.Equal(t, want.peerId, id)
 		skip = append(skip, id)
 	}
-	_, ok := fx.g.ConnectOne(demandCtx(t), "s1", "author", skip)
-	require.False(t, ok, "no candidate is left")
+	id, _ := fx.g.ConnectOne(demandCtx(t), "s1", "author", skip)
+	require.Empty(t, id, "no candidate is left")
 	require.Equal(t, []string{author.peerId, own.peerId, other.peerId}, fx.dials())
 }
 
-// A failed dial moves the demand on to the next candidate, and the peer
-// is left alone by later demands until demandRetry has passed.
+// A demand costs one dial: a dial in vain is the answer, and the peer
+// is then left alone by demands until demandRetry has passed.
 func TestConnectorDemandSkipsARecentlyFailedPeer(t *testing.T) {
 	b := newTestPeer(t, "b")
 	c := newTestPeer(t, "c")
-	fx := newDemandFixture(t, config.GlobalP2P{}, b, c)
+	fx := newDemandFixture(t, config.GlobalP2P{MaxDialsPerMinute: 60}, b, c)
 	fx.sp.kv.put(b, b.ticket, fx.now)
 	fx.sp.kv.put(c, c.ticket, fx.now.Add(-time.Minute))
 	fx.setFail(b.peerId, true)
 	fx.start(t)
 
-	id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "", []string{fx.cover.peerId})
-	require.True(t, ok)
-	require.Equal(t, c.peerId, id, "b did not answer, c is next")
-	require.Equal(t, []string{b.peerId, c.peerId}, fx.dials())
+	skip := []string{fx.cover.peerId}
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.Equal(t, b.peerId, id)
+	require.False(t, connected, "b did not answer")
+	require.Equal(t, []string{b.peerId}, fx.dials())
 
-	skip := []string{fx.cover.peerId, c.peerId}
-	_, ok = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
-	require.False(t, ok, "b failed a moment ago")
-	require.Len(t, fx.dials(), 2)
+	// Not in skip, yet not dialed again: it failed a moment ago.
+	id, connected = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.Equal(t, c.peerId, id)
+	require.True(t, connected)
+	skip = append(skip, c.peerId)
+	id, _ = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.Empty(t, id)
+	require.Equal(t, []string{b.peerId, c.peerId}, fx.dials())
 
 	fx.setFail(b.peerId, false)
 	fx.advance(demandRetry + time.Second)
-	id, ok = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
-	require.True(t, ok)
+	id, connected = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.True(t, connected)
 	require.Equal(t, b.peerId, id)
 }
 
-// Demands share the dial budget and stop at twice MaxConnections, so
-// they never take the headroom kept for inbound connections.
-func TestConnectorDemandHoldsTheBudget(t *testing.T) {
+// Demand connections take at most half of the room kept for inbound
+// ones.
+func TestConnectorDemandLeavesInboundHeadroom(t *testing.T) {
+	require.Equal(t, 8, demandCeiling(config.GlobalP2P{}.WithDefaults()))
+	require.Equal(t, 4, demandCeiling(config.GlobalP2P{MaxConnections: 4, MaxInbound: 1}), "no room to spare: none taken")
+
 	b := newTestPeer(t, "b")
 	c := newTestPeer(t, "c")
-	d := newTestPeer(t, "d")
-	fx := newDemandFixture(t, config.GlobalP2P{MaxConnections: 1, MaxDialsPerMinute: 1}, b, c, d)
-	for _, p := range []testPeer{b, c, d} {
-		fx.sp.kv.put(p, p.ticket, fx.now)
-	}
+	fx := newDemandFixture(t, config.GlobalP2P{MaxConnections: 1, MaxInbound: 2, MaxDialsPerMinute: 60}, b, c)
+	fx.sp.kv.put(b, b.ticket, fx.now)
+	fx.sp.kv.put(c, c.ticket, fx.now)
 	fx.start(t)
 
 	skip := []string{fx.cover.peerId}
-	id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
-	require.True(t, ok)
-	skip = append(skip, id)
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.True(t, connected)
 	require.Equal(t, 2, fx.g.liveCount())
 
-	// At the ceiling: refused, nothing dialed.
-	_, ok = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
-	require.False(t, ok)
+	id, _ = fx.g.ConnectOne(demandCtx(t), "s1", "", append(skip, id))
+	require.Empty(t, id, "at the ceiling nothing is dialed")
 	require.Len(t, fx.dials(), 1)
-
-	// Below the ceiling again, but the minute's one dial is spent: the
-	// demand waits and its caller gives up.
-	p, err := fx.pool.Pick(context.Background(), id)
-	require.NoError(t, err)
-	require.NoError(t, p.Close())
-	require.Eventually(t, func() bool { return fx.g.liveCount() == 1 }, time.Second, 5*time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
-	defer cancel()
-	_, ok = fx.g.ConnectOne(ctx, "s1", "", skip)
-	require.False(t, ok)
-	require.Len(t, fx.dials(), 1, "rate limit: one dial per minute")
+	require.True(t, fx.ep.filter(c.peerId), "and an inbound connection is still let in")
 }
 
-// A demand is a caller waiting now: it is served while the power hint
-// holds the cover back.
-func TestConnectorDemandIgnoresThePowerHint(t *testing.T) {
-	sdkp2p.SetPowerHint(sdkp2p.PowerLow)
-	t.Cleanup(func() { sdkp2p.SetPowerHint(sdkp2p.PowerNormal) })
+// Demands may spend half of the per-minute dials. One that waits for
+// the budget does not hold up a demand that needs no dial, and a caller
+// whose deadline comes first is told at once.
+func TestConnectorDemandSharesTheDialBudget(t *testing.T) {
+	b := newTestPeer(t, "b")
+	c := newTestPeer(t, "c")
+	fx := newDemandFixture(t, config.GlobalP2P{MaxDialsPerMinute: 2}, b, c)
+	fx.sp.kv.put(b, b.ticket, fx.now)
+	fx.sp.kv.put(c, c.ticket, fx.now)
+	fx.start(t)
+
+	skip := []string{fx.cover.peerId}
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.True(t, connected)
+	skip = append(skip, id)
+	// the connector records the attempt when it leaves that dial's
+	// refusal window; until then it serves nothing
+	require.Eventually(t, func() bool {
+		rec, _ := fx.status.Get(id)
+		return !rec.LastAttempt.IsZero()
+	}, 2*refusedWindow, 10*time.Millisecond)
+
+	// The demands' one dial of the minute is spent: a caller with a
+	// deadline is refused at once, with a dial still left for the cover.
+	start := time.Now()
+	id, _ = fx.g.ConnectOne(demandCtx(t), "s1", "", skip)
+	require.Empty(t, id)
+	require.Less(t, time.Since(start), time.Second)
+	require.Len(t, fx.dials(), 1)
+
+	// A caller without a deadline waits for the budget...
+	waiting, stop := context.WithCancel(context.Background())
+	defer stop()
+	go fx.g.ConnectOne(waiting, "s1", "", skip)
+	require.Eventually(t, func() bool {
+		fx.g.conn.mu.Lock()
+		defer fx.g.conn.mu.Unlock()
+		return len(fx.g.conn.demands) == 1
+	}, time.Second, 5*time.Millisecond)
+	// ...and does not block the one behind it, which a connected peer
+	// answers.
+	start = time.Now()
+	_, connected = fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
+	require.True(t, connected)
+	require.Less(t, time.Since(start), time.Second)
+	require.Len(t, fx.dials(), 1)
+
+	fx.advance(rateWindow + time.Second)
+	fx.g.conn.wakeUp()
+	require.Eventually(t, func() bool { return len(fx.dials()) == 2 }, 5*time.Second, 5*time.Millisecond,
+		"the waiting demand dials once the budget is back")
+}
+
+// The power hint means no global dials, a demand's included; a peer
+// that is connected already still answers.
+func TestConnectorDemandHonoursThePowerHint(t *testing.T) {
 	b := newTestPeer(t, "b")
 	fx := newDemandFixture(t, config.GlobalP2P{}, b)
 	fx.sp.kv.put(b, b.ticket, fx.now)
 	fx.start(t)
+	sdkp2p.SetPowerHint(sdkp2p.PowerLow)
+	require.Eventually(t, func() bool { return sdkp2p.PowerHint(fx.g.conn.power.Load()) == sdkp2p.PowerLow }, time.Second, 5*time.Millisecond)
 
-	id, ok := fx.g.ConnectOne(demandCtx(t), "s1", "", []string{fx.cover.peerId})
-	require.True(t, ok)
-	require.Equal(t, b.peerId, id)
+	id, _ := fx.g.ConnectOne(demandCtx(t), "s1", "", []string{fx.cover.peerId})
+	require.Empty(t, id)
+	require.Empty(t, fx.dials())
+
+	id, connected := fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
+	require.True(t, connected)
+	require.Equal(t, fx.cover.peerId, id)
+}
+
+// A layer that is not running answers at once and queues nothing.
+func TestConnectorDemandOnAStoppedLayer(t *testing.T) {
+	b := newTestPeer(t, "b")
+	fx := newDemandFixture(t, config.GlobalP2P{}, b)
+
+	start := time.Now()
+	id, _ := fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
+	require.Empty(t, id)
+	require.Less(t, time.Since(start), time.Second, "not started")
+
+	fx.start(t)
+	require.NoError(t, fx.g.Close(context.Background()))
+	start = time.Now()
+	id, _ = fx.g.ConnectOne(demandCtx(t), "s1", "", nil)
+	require.Empty(t, id)
+	require.Less(t, time.Since(start), time.Second, "closed")
+	require.Empty(t, fx.g.conn.demands)
 }

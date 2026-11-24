@@ -303,10 +303,11 @@ func (g *Global) Close(_ context.Context) error {
 
 // ConnectOne asks the connector for one more live peer of a space and
 // waits for it: a peer outside skip, devices of the prefer identity
-// first. ok=false when no candidate is left, the connection ceiling is
-// reached or ctx ends. For a caller with no other way to its data — a
+// first. It costs at most one dial. connected reports a live peer; a
+// peer id with connected false was dialed in vain, and no peer id means
+// nothing was dialed. For a caller with no other way to its data — a
 // file only a peer holds; the cover alone decides what stays connected.
-func (g *Global) ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, ok bool) {
+func (g *Global) ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, connected bool) {
 	return g.conn.connectOne(ctx, spaceId, prefer, skip)
 }
 

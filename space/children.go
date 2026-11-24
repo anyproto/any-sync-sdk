@@ -53,9 +53,10 @@ var (
 )
 
 // ErrNotChildSpace is returned by the calls that act on a child space
-// when the index shows the space is not one, and by DeleteChild for an
-// active top-level space of another account, which the coordinator
-// shows.
+// when the index shows the space is not one, by ChangeChildOwner and
+// DeleteChild for a space the account owns whose header names no
+// parent, and by DeleteChild for an active top-level space of another
+// account, which the coordinator shows.
 var ErrNotChildSpace = errors.New("space: not a child space")
 
 // ErrSpaceNotStored is returned by RetryPush on a device that holds no

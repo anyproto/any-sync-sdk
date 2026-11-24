@@ -24,7 +24,6 @@ import (
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	anynet "github.com/anyproto/any-sync/net"
-	"github.com/anyproto/any-sync/node/nodeclient"
 	"github.com/anyproto/any-sync/util/crypto"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -59,7 +58,7 @@ func installFakeNetwork(t *testing.T) *fakeNetwork {
 		case aclclient.AclJoiningClient:
 			n.joining.AclJoiningClient = real
 			return &n.joining
-		case nodeclient.NodeClient:
+		case anysyncx.NodeClient:
 			n.nodes.NodeClient = real
 			return &n.nodes
 		}
@@ -91,6 +90,18 @@ func (f *fakeCoordinator) set(fn func()) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	fn()
+}
+
+// deletesOf counts the signed deletes of spaceId it was sent.
+func (f *fakeCoordinator) deletesOf(spaceId string) (n int) {
+	f.set(func() {
+		for _, id := range f.deleted {
+			if id == spaceId {
+				n++
+			}
+		}
+	})
+	return n
 }
 
 func (f *fakeCoordinator) SpaceSign(ctx context.Context, payload coordinatorclient.SpaceSignPayload) (*coordinatorproto.SpaceReceiptWithSignature, error) {
@@ -154,13 +165,115 @@ func (f *fakeCoordinator) SpaceMakeShareable(ctx context.Context, spaceId string
 	return shareable(spaceId)
 }
 
+// activeSpace is the coordinator's status of an active space of another
+// account.
+func activeSpace(string) *coordinatorproto.SpaceStatusPayload {
+	return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusCreated}
+}
+
+// coordSpace is what a coordinatorModel holds of one space.
+type coordSpace struct {
+	status coordinatorproto.SpaceStatus
+	// owned: the coordinator's record names the account the owner. It
+	// is a copy of the ACL's owner, and can be a stale one. parent: the
+	// space names one; parentOwned: the account owns that parent.
+	owned, parent, parentOwned bool
+	oneToOne                   bool
+	// byParentOwner: the deletion is the one of the Owner of the parent.
+	byParentOwner bool
+}
+
+// coordinatorModel answers the account's status checks, signed deletes
+// and ACL calls as the coordinator does, for the spaces put in it.
+type coordinatorModel struct {
+	mu     sync.Mutex
+	spaces map[string]coordSpace
+}
+
+func (m *coordinatorModel) put(spaceId string, sp coordSpace) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.spaces[spaceId] = sp
+}
+
+func (m *coordinatorModel) get(spaceId string) coordSpace {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.spaces[spaceId]
+}
+
+// status reports the owner as the coordinator does: never for a 1-1
+// space.
+func (m *coordinatorModel) status(spaceId string) *coordinatorproto.SpaceStatusPayload {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sp, known := m.spaces[spaceId]
+	if !known {
+		return &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusNotExists}
+	}
+	status := &coordinatorproto.SpaceStatusPayload{Status: sp.status}
+	if sp.owned && !sp.oneToOne {
+		status.Permissions = coordinatorproto.SpacePermissions_SpacePermissionsOwner
+	}
+	return status
+}
+
+// delete takes the delete of an active space from its owner, and of a
+// child from the Owner of its parent: an active one, and one in
+// deletion by its own owner, whose deletion becomes the parent Owner's.
+func (m *coordinatorModel) delete(spaceId string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sp, known := m.spaces[spaceId]
+	switch {
+	case !known:
+		return coordinatorproto.ErrSpaceNotExists
+	case sp.oneToOne:
+		return coordinatorproto.ErrUnexpected
+	case !sp.owned && sp.parent && !sp.parentOwned:
+		return coordinatorproto.ErrParentPermissionDenied
+	}
+	byParentOwner := !sp.owned && sp.parentOwned
+	from := coordinatorproto.SpaceStatus_SpaceStatusCreated
+	if byParentOwner && sp.status == coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion && !sp.byParentOwner {
+		from = sp.status
+	}
+	if (sp.owned || byParentOwner) && sp.status == from {
+		sp.status = coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+		sp.byParentOwner = sp.byParentOwner || byParentOwner
+		m.spaces[spaceId] = sp
+		return nil
+	}
+	switch sp.status {
+	case coordinatorproto.SpaceStatus_SpaceStatusCreated:
+		return coordinatorproto.ErrSpaceIsCreated
+	case coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion:
+		return coordinatorproto.ErrSpaceDeletionPending
+	}
+	return coordinatorproto.ErrSpaceIsDeleted
+}
+
+// acl is the coordinator's answer to a read or a write of the ACL of a
+// space it does not hold as an active one.
+func (m *coordinatorModel) acl(spaceId string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sp, known := m.spaces[spaceId]
+	switch {
+	case !known:
+		return coordinatorproto.ErrSpaceNotExists
+	case sp.status != coordinatorproto.SpaceStatus_SpaceStatusCreated:
+		return coordinatorproto.ErrSpaceIsDeleted
+	}
+	return nil
+}
+
 type fakeJoiningClient struct {
 	aclclient.AclJoiningClient
 
 	mu sync.Mutex
-	// remove answers RemoveChildMembers, owner ChangeChildOwner.
+	// remove answers RemoveChildMembers.
 	remove func(spaceId string, identities []string) error
-	owner  func(spaceId, newOwner string, oldOwnerPerm list.AclPermissions) error
 }
 
 func (f *fakeJoiningClient) set(fn func()) {
@@ -183,33 +296,70 @@ func (f *fakeJoiningClient) RemoveChildMembers(ctx context.Context, spaceId stri
 	return "", remove(spaceId, accounts)
 }
 
-func (f *fakeJoiningClient) ChangeChildOwner(ctx context.Context, spaceId string, newOwner crypto.PubKey, oldOwnerPermissions list.AclPermissions) (string, error) {
-	f.mu.Lock()
-	owner := f.owner
-	f.mu.Unlock()
-	if owner == nil {
-		return f.AclJoiningClient.ChangeChildOwner(ctx, spaceId, newOwner, oldOwnerPermissions)
-	}
-	return "", owner(spaceId, newOwner.Account(), oldOwnerPermissions)
-}
-
 type fakeNodeClient struct {
-	nodeclient.NodeClient
+	anysyncx.NodeClient
 
 	mu sync.Mutex
-	// add answers AclAddRecord, get AclGetRecords.
-	add func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error)
-	get func(spaceId string) ([]*consensusproto.RawRecordWithId, error)
+	// add answers AclAddRecord, get AclGetRecords, header SpaceHeader.
+	add    func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error)
+	get    func(spaceId string) ([]*consensusproto.RawRecordWithId, error)
+	header func(spaceId string) (*spacesyncproto.RawSpaceHeaderWithId, error)
+	// held lists the spaces the nodes hold, when serveHeaders says
+	// which: the ACL of any other space is not on the network.
+	held map[string]bool
 }
 
+func (f *fakeNodeClient) SpaceHeader(ctx context.Context, spaceId string) (*spacesyncproto.RawSpaceHeaderWithId, error) {
+	f.mu.Lock()
+	header := f.header
+	f.mu.Unlock()
+	if header == nil {
+		return f.NodeClient.SpaceHeader(ctx, spaceId)
+	}
+	return header(spaceId)
+}
+
+// serveHeaders makes the fake nodes hold the spaces of these headers
+// and no other.
+func (f *fakeNodeClient) serveHeaders(headers ...*spacesyncproto.RawSpaceHeaderWithId) {
+	held := make(map[string]bool, len(headers))
+	for _, hdr := range headers {
+		held[hdr.Id] = true
+	}
+	f.set(func() {
+		f.held = held
+		f.header = func(spaceId string) (*spacesyncproto.RawSpaceHeaderWithId, error) {
+			for _, hdr := range headers {
+				if hdr.Id == spaceId {
+					return hdr, nil
+				}
+			}
+			return nil, spacesyncproto.ErrSpaceMissing
+		}
+	})
+}
+
+// answerHeaders makes header answer SpaceHeader, the real client when
+// it is nil, and leaves open which spaces the fake nodes hold.
+func (f *fakeNodeClient) answerHeaders(header func(spaceId string) (*spacesyncproto.RawSpaceHeaderWithId, error)) {
+	f.set(func() { f.header, f.held = header, nil })
+}
+
+// AclGetRecords answers as the coordinator behind the nodes does: the
+// node that stores a space creates the log of its ACL, so a space the
+// coordinator knows and no node holds has none.
 func (f *fakeNodeClient) AclGetRecords(ctx context.Context, spaceId, aclHead string) ([]*consensusproto.RawRecordWithId, error) {
 	f.mu.Lock()
-	get := f.get
+	get, onNoNode := f.get, f.held != nil && !f.held[spaceId]
 	f.mu.Unlock()
 	if get == nil {
 		return f.NodeClient.AclGetRecords(ctx, spaceId, aclHead)
 	}
-	return get(spaceId)
+	recs, err := get(spaceId)
+	if err == nil && onNoNode {
+		return nil, consensuserr.ErrLogNotFound
+	}
+	return recs, err
 }
 
 func (f *fakeNodeClient) set(fn func()) {
@@ -747,9 +897,9 @@ func foreignChildId(t *testing.T, parentSpaceId string) string {
 	return payload.SpaceHeaderWithId.Id
 }
 
-// foreignChild is a child space another account owns, as the network
-// holds its ACL: this device holds nothing of it.
-type foreignChild struct {
+// networkSpace is a space as the network holds it, its header and its
+// ACL: this device holds nothing of it.
+type networkSpace struct {
 	id      string
 	owner   *accountdata.AccountKeys
 	records []*consensusproto.RawRecordWithId
@@ -758,10 +908,19 @@ type foreignChild struct {
 	storage spacestorage.SpaceStorageCreatePayload
 }
 
-func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string) *foreignChild {
+// newForeignChild is a child space of parentSpaceId another account
+// owns.
+func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string) *networkSpace {
 	t.Helper()
 	owner, err := accountdata.NewRandom()
 	require.NoError(t, err)
+	return newNetworkSpace(t, network, owner, space.SpaceTypeOrganizationSpace, parentSpaceId)
+}
+
+// newNetworkSpace is a space of type spaceType that owner created, a
+// top-level one when parentSpaceId is empty.
+func newNetworkSpace(t *testing.T, network testNetworkKey, owner *accountdata.AccountKeys, spaceType, parentSpaceId string) *networkSpace {
+	t.Helper()
 	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
 	require.NoError(t, err)
 	payload, err := spacepayloads.StoragePayloadForSpaceCreateV1(spacepayloads.SpaceCreatePayload{
@@ -769,13 +928,19 @@ func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string)
 		MasterKey:     owner.SignKey,
 		ReadKey:       crypto.NewAES(),
 		MetadataKey:   metadataKey,
-		SpaceType:     space.SpaceTypeOrganizationSpace,
+		SpaceType:     spaceType,
 		ParentSpaceId: parentSpaceId,
 	})
 	require.NoError(t, err)
-	return &foreignChild{
+	return networkSpaceOf(network, owner, payload)
+}
+
+// networkSpaceOf is the space of payload. keys are the account the
+// space's ACL is read as: the one that created it, or a member.
+func networkSpaceOf(network testNetworkKey, keys *accountdata.AccountKeys, payload spacestorage.SpaceStorageCreatePayload) *networkSpace {
+	return &networkSpace{
 		id:      payload.SpaceHeaderWithId.Id,
-		owner:   owner,
+		owner:   keys,
 		records: []*consensusproto.RawRecordWithId{payload.AclWithId},
 		network: network,
 		storage: payload,
@@ -786,7 +951,7 @@ func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string)
 // member of role perm: the storage a pull leaves, the ACL record that
 // adds the account, and the row an accepted invite leaves, which names
 // rowParent as the parent. It returns the child's ACL on that device.
-func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, rowParent string, perm list.AclPermissions) list.AclList {
+func (c *networkSpace) heldBy(t *testing.T, ctx context.Context, sdk *SDK, rowParent string, perm list.AclPermissions) list.AclList {
 	t.Helper()
 	rec, err := c.ownerAcl(t).RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
 		{Identity: sdk.app.AccountKeys().SignKey.GetPublic(), Permissions: perm},
@@ -820,8 +985,9 @@ func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, rowPa
 	return acl
 }
 
-// ownerAcl is the child's ACL on a device of its owner.
-func (c *foreignChild) ownerAcl(t *testing.T) list.AclList {
+// ownerAcl is the space's ACL on a device of the account that created
+// it.
+func (c *networkSpace) ownerAcl(t *testing.T) list.AclList {
 	t.Helper()
 	st, err := list.NewInMemoryStorage(c.records[0].Id, c.records)
 	require.NoError(t, err)
@@ -830,15 +996,15 @@ func (c *foreignChild) ownerAcl(t *testing.T) list.AclList {
 	return acl
 }
 
-// accept takes a record into the child's ACL as the network does.
-func (c *foreignChild) accept(rec *consensusproto.RawRecord) *consensusproto.RawRecordWithId {
+// accept takes a record into the space's ACL as the network does.
+func (c *networkSpace) accept(rec *consensusproto.RawRecord) *consensusproto.RawRecordWithId {
 	accepted := c.network.accept(rec)
 	c.records = append(c.records, accepted)
 	return accepted
 }
 
 // invite adds a request-to-join invite and returns its key.
-func (c *foreignChild) invite(t *testing.T) crypto.PrivKey {
+func (c *networkSpace) invite(t *testing.T) crypto.PrivKey {
 	t.Helper()
 	invite, err := c.ownerAcl(t).RecordBuilder().BuildInvite()
 	require.NoError(t, err)
@@ -847,7 +1013,7 @@ func (c *foreignChild) invite(t *testing.T) crypto.PrivKey {
 }
 
 // addMember makes a new account a member and returns its identity.
-func (c *foreignChild) addMember(t *testing.T, perm list.AclPermissions) crypto.PubKey {
+func (c *networkSpace) addMember(t *testing.T, perm list.AclPermissions) crypto.PubKey {
 	t.Helper()
 	member, err := accountdata.NewRandom()
 	require.NoError(t, err)
@@ -859,9 +1025,25 @@ func (c *foreignChild) addMember(t *testing.T, perm list.AclPermissions) crypto.
 	return member.SignKey.GetPublic()
 }
 
-// serve makes the fake nodes serve the child's ACL and take the
+// handTo makes account a member of the space and then its owner.
+func (c *networkSpace) handTo(t *testing.T, account crypto.PubKey) {
+	t.Helper()
+	add, err := c.ownerAcl(t).RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
+		{Identity: account, Permissions: list.AclPermissionsWriter},
+	}})
+	require.NoError(t, err)
+	c.accept(add)
+	change, err := c.ownerAcl(t).RecordBuilder().BuildOwnershipChange(list.OwnershipChangePayload{
+		NewOwner:            account,
+		OldOwnerPermissions: list.AclPermissionsAdmin,
+	})
+	require.NoError(t, err)
+	c.accept(change)
+}
+
+// serve makes the fake nodes serve the space's ACL and take the
 // records posted to it. posted receives each of them.
-func (c *foreignChild) serve(t *testing.T, nodes *fakeNodeClient, posted func(*consensusproto.RawRecord) error) {
+func (c *networkSpace) serve(t *testing.T, nodes *fakeNodeClient, posted func(*consensusproto.RawRecord) error) {
 	t.Helper()
 	nodes.set(func() {
 		nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
@@ -901,14 +1083,20 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	net := installFakeNetwork(t)
-	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
 	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
-	childId := foreignChildId(t, parent.Id())
-	member, newOwner := randomIdentity(t), randomIdentity(t)
+	child := newForeignChild(t, network, parent.Id())
+	childId := child.id
+	member, newOwnerKey := randomIdentity(t), child.addMember(t, list.AclPermissionsWriter)
+	newOwner := newOwnerKey.Account()
 	before, err := spaces.List(ctx)
 	require.NoError(t, err)
 
@@ -925,6 +1113,13 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 		require.ErrorIs(t, call(), space.ErrOffline, name)
 	}
 
+	// The coordinator holds the child as a space of another account,
+	// and the nodes serve its ACL: ChangeChildOwner posts its record
+	// there.
+	net.coord.set(func() { net.coord.status = activeSpace })
+	var ownerAnswer error
+	child.serve(t, &net.nodes, func(*consensusproto.RawRecord) error { return ownerAnswer })
+
 	// The network's refusals, and the checks the record builder makes
 	// on this device before anything is sent.
 	answers := []struct {
@@ -938,8 +1133,8 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	for _, tc := range answers {
 		net.joining.set(func() {
 			net.joining.remove = func(string, []string) error { return tc.answer }
-			net.joining.owner = func(string, string, list.AclPermissions) error { return tc.answer }
 		})
+		ownerAnswer = tc.answer
 		net.coord.set(func() { net.coord.del = func(string) error { return tc.answer } })
 		for name, call := range calls {
 			err := call()
@@ -949,18 +1144,14 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	}
 
 	// Accepted: what was asked reaches the network as given.
-	var removedIn, ownerIn, removed, owner string
-	var ownerPerm list.AclPermissions
+	var removedIn, removed string
 	net.joining.set(func() {
 		net.joining.remove = func(spaceId string, identities []string) error {
 			removedIn, removed = spaceId, strings.Join(identities, ",")
 			return nil
 		}
-		net.joining.owner = func(spaceId, newOwner string, perm list.AclPermissions) error {
-			ownerIn, owner, ownerPerm = spaceId, newOwner, perm
-			return nil
-		}
 	})
+	ownerAnswer = nil
 	net.coord.set(func() {
 		net.coord.deleted = nil
 		net.coord.del = func(string) error { return nil }
@@ -970,9 +1161,9 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	}
 	assert.Equal(t, childId, removedIn)
 	assert.Equal(t, member, removed)
-	assert.Equal(t, childId, ownerIn)
-	assert.Equal(t, newOwner, owner)
-	assert.Equal(t, list.AclPermissionsAdmin, ownerPerm)
+	acl := child.ownerAcl(t).AclState()
+	assert.True(t, acl.Permissions(newOwnerKey).IsOwner())
+	assert.Equal(t, list.AclPermissionsAdmin, acl.Permissions(child.owner.SignKey.GetPublic()))
 	assert.Equal(t, []string{childId}, net.coord.deleted)
 
 	requireNothingHeld(t, ctx, sdk, childId)
@@ -984,7 +1175,16 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	// reach the network.
 	net.joining.set(func() {
 		net.joining.remove = func(string, []string) error { t.Error("RemoveChildMembers sent"); return nil }
-		net.joining.owner = func(string, string, list.AclPermissions) error { t.Error("ChangeChildOwner sent"); return nil }
+	})
+	net.nodes.set(func() {
+		net.nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
+			t.Errorf("the ACL of %s was read", spaceId)
+			return nil, anynet.ErrUnableToConnect
+		}
+		net.nodes.add = func(string, *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+			t.Error("ChangeChildOwner sent")
+			return nil, anynet.ErrUnableToConnect
+		}
 	})
 	net.coord.set(func() {
 		net.coord.del = func(string) error { t.Error("SpaceDelete sent"); return nil }
@@ -1745,11 +1945,12 @@ func newParentDelete(coord *fakeCoordinator, first error) *parentDelete {
 		return id != nil && *id == spaceId
 	}
 	coord.status = func(spaceId string) *coordinatorproto.SpaceStatusPayload {
-		st := &coordinatorproto.SpaceStatusPayload{
-			Status:      coordinatorproto.SpaceStatus_SpaceStatusCreated,
-			Permissions: coordinatorproto.SpacePermissions_SpacePermissionsOwner,
+		st := &coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus_SpaceStatusCreated}
+		if !isParent(spaceId) {
+			return st
 		}
-		if isParent(spaceId) && p.accepted.Load() {
+		st.Permissions = coordinatorproto.SpacePermissions_SpacePermissionsOwner
+		if p.accepted.Load() {
 			st.Status = coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
 		}
 		return st
@@ -1969,7 +2170,9 @@ func TestSDK_Delete_RowWithUnreadHeaderSendsNoSignedDelete(t *testing.T) {
 // A space the coordinator does not know, and one it holds as deleted or
 // in deletion, read as an unknown and as a deleted space on every call
 // made from the parent side. The nodes pass the coordinator's answer to
-// an ACL read or write on unchanged.
+// an ACL read or write on unchanged. The space is another account's.
+// DeleteChild alone reads its status first, and sends no delete of a
+// space the coordinator does not know.
 func TestSDK_ChildCalls_UnknownAndDeletedSpaces(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -2023,13 +2226,40 @@ func TestSDK_ChildCalls_UnknownAndDeletedSpaces(t *testing.T) {
 		})
 	}
 
+	statusIs := func(status coordinatorproto.SpaceStatus) {
+		net.coord.set(func() {
+			net.coord.status = func(string) *coordinatorproto.SpaceStatusPayload {
+				return &coordinatorproto.SpaceStatusPayload{Status: status}
+			}
+		})
+	}
+	// The coordinator's status says it does not know the space, or its
+	// answer to the delete does.
+	net.coord.set(func() { net.coord.del = func(string) error { t.Error("SpaceDelete sent"); return nil } })
+	statusIs(coordinatorproto.SpaceStatus_SpaceStatusNotExists)
+	require.ErrorIs(t, spaces.DeleteChild(ctx, child.id), space.ErrSpaceUnknown)
+	statusIs(coordinatorproto.SpaceStatus_SpaceStatusCreated)
 	net.coord.set(func() { net.coord.del = func(string) error { return coordinatorproto.ErrSpaceNotExists } })
 	require.ErrorIs(t, spaces.DeleteChild(ctx, child.id), space.ErrSpaceUnknown)
+
 	// A child already in deletion, or deleted, is what DeleteChild asks
-	// for.
-	for _, underWay := range []error{coordinatorproto.ErrSpaceDeletionPending, coordinatorproto.ErrSpaceIsDeleted} {
-		net.coord.set(func() { net.coord.del = func(string) error { return underWay } })
+	// for. The delete is sent in every status: the coordinator answers.
+	for _, underWay := range []struct {
+		status coordinatorproto.SpaceStatus
+		answer error
+	}{
+		{coordinatorproto.SpaceStatus_SpaceStatusCreated, coordinatorproto.ErrSpaceDeletionPending},
+		{coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion, coordinatorproto.ErrSpaceDeletionPending},
+		{coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted, coordinatorproto.ErrSpaceIsDeleted},
+		{coordinatorproto.SpaceStatus_SpaceStatusDeleted, coordinatorproto.ErrSpaceIsDeleted},
+	} {
+		statusIs(underWay.status)
+		net.coord.set(func() {
+			net.coord.deleted = nil
+			net.coord.del = func(string) error { return underWay.answer }
+		})
 		require.NoError(t, spaces.DeleteChild(ctx, child.id))
+		net.coord.set(func() { require.Equal(t, []string{child.id}, net.coord.deleted, "status %s", underWay.status) })
 	}
 	requireNothingHeld(t, ctx, sdk, child.id)
 }
@@ -2041,6 +2271,7 @@ func TestSDK_DeleteChild_TopLevelSpaceOfAnotherAccount(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	net := installFakeNetwork(t)
+	net.coord.status = activeSpace
 	net.coord.del = func(string) error { return coordinatorproto.ErrSpaceIsCreated }
 	sdk := openChildTestSDK(t, ctx, t.TempDir())
 	defer func() { _ = sdk.Close() }()
@@ -2059,6 +2290,500 @@ func TestSDK_DeleteChild_TopLevelSpaceOfAnotherAccount(t *testing.T) {
 	require.True(t, ok)
 	assert.False(t, rec.IsDeleted())
 	net.coord.set(func() { assert.Equal(t, []string{foreignSpaceB, foreignSpaceC}, net.coord.deleted) })
+}
+
+// openOnCoordinatorModel opens an SDK on a fake network whose
+// coordinator is a coordinatorModel.
+func openOnCoordinatorModel(t *testing.T, ctx context.Context) (*fakeNetwork, *coordinatorModel, testNetworkKey, *SDK) {
+	t.Helper()
+	net := installFakeNetwork(t)
+	coord := &coordinatorModel{spaces: map[string]coordSpace{}}
+	net.coord.status, net.coord.del = coord.status, coord.delete
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sdk.Close() })
+	return net, coord, network, sdk
+}
+
+// serveAcl makes the fake nodes serve the ACL of sp and take a record
+// as the coordinator does: for an active space, on the authority of the
+// parent when the account owns the parent, and on none otherwise. The
+// coordinator's own record of the owner is left as it is. It returns
+// the count of the records taken.
+func serveAcl(t *testing.T, net *fakeNetwork, coord *coordinatorModel, sp *networkSpace, parentOwned bool) (taken *int) {
+	t.Helper()
+	taken = new(int)
+	var authority list.ParentAuthorizer
+	if parentOwned {
+		authority = func(crypto.PubKey) (list.ParentAuthority, error) {
+			return list.ParentAuthority{RemoveMembers: true, ChangeOwner: true}, nil
+		}
+	}
+	net.nodes.set(func() {
+		net.nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
+			assert.Equal(t, sp.id, spaceId)
+			if err := coord.acl(spaceId); err != nil {
+				return nil, err
+			}
+			return sp.records, nil
+		}
+		net.nodes.add = func(spaceId string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+			assert.Equal(t, sp.id, spaceId)
+			if err := coord.acl(spaceId); err != nil {
+				return nil, err
+			}
+			if err := sp.ownerAcl(t).ValidateRawRecordWithAuthorizer(rec, authority, nil); err != nil {
+				return nil, err
+			}
+			*taken++
+			return sp.accept(rec), nil
+		}
+	})
+	return taken
+}
+
+// The coordinator takes the signed delete of a space from its owner,
+// and an ACL its owner's change of the owner, in a top-level space too.
+// For a space the index does not show as a child, DeleteChild and
+// ChangeChildOwner act on a space the account itself owns only when its
+// header, read from the nodes, names a parent. The account's own
+// top-level space, on a device that holds no row of it or a row with no
+// type, is not deleted and not handed over.
+func TestSDK_DeleteChild_AndChangeChildOwner_OwnSpaceWithNoTypedRow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net, coord, network, sdk := openOnCoordinatorModel(t, ctx)
+	spaces := sdk.Spaces()
+	account := sdk.app.AccountKeys()
+
+	const noRow, untypedRow = "no row", "a row with no type"
+	rows := []string{noRow, untypedRow}
+	track := func(t *testing.T, row string, sp *networkSpace) {
+		t.Helper()
+		if row == untypedRow {
+			require.NoError(t, spaces.Track(ctx, sp.id))
+		}
+	}
+	requireNothingSent := func(t *testing.T, sp *networkSpace, taken *int) {
+		t.Helper()
+		require.Zero(t, net.coord.deletesOf(sp.id), "no signed delete")
+		require.Zero(t, *taken, "no ACL record")
+	}
+	ownChild := func(t *testing.T) *networkSpace {
+		parent := newNetworkSpace(t, network, account, space.SpaceTypeOrganization, "")
+		return newNetworkSpace(t, network, account, space.SpaceTypeOrganizationSpace, parent.id)
+	}
+	child := coordSpace{owned: true, parent: true, parentOwned: true}
+	inDeletion := []coordinatorproto.SpaceStatus{
+		coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
+		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
+		coordinatorproto.SpaceStatus_SpaceStatusDeleted,
+	}
+
+	topLevel := []struct {
+		name  string
+		build func(t *testing.T, row string) *networkSpace
+	}{
+		{space.SpaceTypeAny, func(t *testing.T, _ string) *networkSpace {
+			return newNetworkSpace(t, network, account, space.SpaceTypeAny, "")
+		}},
+		{space.SpaceTypeOrganization, func(t *testing.T, _ string) *networkSpace {
+			return newNetworkSpace(t, network, account, space.SpaceTypeOrganization, "")
+		}},
+		{"derived", func(t *testing.T, row string) *networkSpace {
+			payload, err := spacepayloads.StoragePayloadForSpaceDeriveV1(spacepayloads.SpaceDerivePayload{
+				SigningKey:   account.SignKey,
+				MasterKey:    account.SignKey,
+				SpaceType:    space.SpaceTypeAny,
+				SpacePayload: []byte(row),
+			})
+			require.NoError(t, err)
+			return networkSpaceOf(network, account, payload)
+		}},
+	}
+	for _, kind := range topLevel {
+		for _, row := range rows {
+			t.Run(kind.name+", "+row, func(t *testing.T) {
+				own := kind.build(t, row)
+				// A derived space takes no member.
+				member := randomIdentity(t)
+				if kind.name != "derived" {
+					member = own.addMember(t, list.AclPermissionsWriter).Account()
+				}
+				track(t, row, own)
+				coord.put(own.id, coordSpace{owned: true})
+				taken := serveAcl(t, net, coord, own, false)
+				net.nodes.serveHeaders(own.storage.SpaceHeaderWithId)
+
+				require.ErrorIs(t, spaces.DeleteChild(ctx, own.id), space.ErrNotChildSpace)
+				require.ErrorIs(t, spaces.ChangeChildOwner(ctx, own.id, member, space.PermissionAdmin), space.ErrNotChildSpace)
+				// A removal on the authority of a parent is the network's
+				// to refuse.
+				require.Error(t, spaces.RemoveChildMembers(ctx, own.id, []string{member}))
+				requireNothingSent(t, own, taken)
+
+				rec, held := sdk.tsp.Get(ctx, own.id)
+				assert.Equal(t, row == untypedRow, held)
+				assert.False(t, rec.IsDeleted(), "the row stays as it was")
+				assert.False(t, sdk.app.SpaceExists(own.id), "nothing is stored")
+			})
+		}
+	}
+
+	// A top-level space of another account that was handed to this one.
+	// The ACL names the account the owner; the coordinator's record of
+	// the owner, a copy it writes after the ACL took the record, names
+	// the previous one. ChangeChildOwner reads the owner off the ACL it
+	// builds its record on, and the coordinator refuses the delete by
+	// its own record.
+	for _, row := range rows {
+		t.Run("handed to the account, the coordinator's record stale, "+row, func(t *testing.T) {
+			previous, err := accountdata.NewRandom()
+			require.NoError(t, err)
+			handed := newNetworkSpace(t, network, previous, space.SpaceTypeOrganization, "")
+			member := handed.addMember(t, list.AclPermissionsWriter).Account()
+			handed.handTo(t, account.SignKey.GetPublic())
+			track(t, row, handed)
+			coord.put(handed.id, coordSpace{})
+			taken := serveAcl(t, net, coord, handed, false)
+			net.nodes.serveHeaders(handed.storage.SpaceHeaderWithId)
+
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, handed.id, member, space.PermissionAdmin), space.ErrNotChildSpace)
+			require.Zero(t, *taken, "no ACL record")
+			assert.True(t, handed.ownerAcl(t).AclState().Permissions(account.SignKey.GetPublic()).IsOwner())
+			require.ErrorIs(t, spaces.DeleteChild(ctx, handed.id), space.ErrNotChildSpace)
+			assert.Equal(t, coordSpace{}, coord.get(handed.id), "the space is as it was")
+		})
+	}
+
+	// The hand-over lands between the read of the ACL and the post. The
+	// ACL read names another account the owner, so no header is asked
+	// for. The record names the head it is built on: the network
+	// refuses it, and the space stays the account's.
+	t.Run("handed to the account after the ACL is read", func(t *testing.T) {
+		previous, err := accountdata.NewRandom()
+		require.NoError(t, err)
+		handed := newNetworkSpace(t, network, previous, space.SpaceTypeOrganization, "")
+		member := handed.addMember(t, list.AclPermissionsWriter).Account()
+		coord.put(handed.id, coordSpace{})
+		taken := serveAcl(t, net, coord, handed, false)
+		net.nodes.serveHeaders(handed.storage.SpaceHeaderWithId)
+		net.nodes.set(func() {
+			read := net.nodes.get
+			net.nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
+				recs, err := read(spaceId)
+				handed.handTo(t, account.SignKey.GetPublic())
+				return recs, err
+			}
+		})
+
+		err = spaces.ChangeChildOwner(ctx, handed.id, member, space.PermissionAdmin)
+		require.ErrorIs(t, err, list.ErrIncorrectRecordSequence)
+		require.Zero(t, *taken, "no ACL record")
+		assert.True(t, handed.ownerAcl(t).AclState().Permissions(account.SignKey.GetPublic()).IsOwner())
+	})
+
+	// The account's own child: its header names the parent.
+	for _, row := range rows {
+		t.Run("own child, "+row, func(t *testing.T) {
+			handed, deleted := ownChild(t), ownChild(t)
+			member := handed.addMember(t, list.AclPermissionsWriter).Account()
+			track(t, row, handed)
+			track(t, row, deleted)
+			coord.put(handed.id, child)
+			coord.put(deleted.id, child)
+			net.nodes.serveHeaders(handed.storage.SpaceHeaderWithId, deleted.storage.SpaceHeaderWithId)
+
+			taken := serveAcl(t, net, coord, handed, true)
+			require.NoError(t, spaces.ChangeChildOwner(ctx, handed.id, member, space.PermissionAdmin))
+			assert.Equal(t, 1, *taken)
+			require.NoError(t, spaces.DeleteChild(ctx, deleted.id))
+			assert.Equal(t, 1, net.coord.deletesOf(deleted.id))
+			if row == untypedRow {
+				assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, deleted.id).Status)
+			}
+		})
+	}
+
+	// No header tells that the account's own child is one: the nodes are
+	// out of reach, none of them holds the space, or one serves the
+	// header of another space.
+	t.Run("own child, no header", func(t *testing.T) {
+		own := ownChild(t)
+		member := own.addMember(t, list.AclPermissionsWriter).Account()
+		coord.put(own.id, child)
+		taken := serveAcl(t, net, coord, own, true)
+		both := func(want error) {
+			t.Helper()
+			require.ErrorIs(t, spaces.DeleteChild(ctx, own.id), want)
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, own.id, member, space.PermissionAdmin), want)
+		}
+		net.nodes.answerHeaders(nil)
+		both(space.ErrOffline)
+		// On no node the space has no ACL either: ChangeChildOwner has
+		// no owner to read, and DeleteChild no header.
+		net.nodes.serveHeaders()
+		both(space.ErrSpaceUnknown)
+
+		other := ownChild(t).storage.SpaceHeaderWithId
+		net.nodes.answerHeaders(func(string) (*spacesyncproto.RawSpaceHeaderWithId, error) { return other, nil })
+		require.Error(t, spaces.DeleteChild(ctx, own.id))
+		require.Error(t, spaces.ChangeChildOwner(ctx, own.id, member, space.PermissionAdmin))
+		requireNothingSent(t, own, taken)
+	})
+
+	// The account's own space in deletion or deleted, a child or a
+	// top-level one: no header is read and nothing is sent. The row the
+	// account holds of it becomes a deleted one.
+	noHeader := func(string) (*spacesyncproto.RawSpaceHeaderWithId, error) {
+		t.Error("a header was read")
+		return nil, spacesyncproto.ErrSpaceMissing
+	}
+	for _, status := range inDeletion {
+		for _, own := range []struct {
+			name  string
+			build func(t *testing.T) *networkSpace
+			coord coordSpace
+		}{
+			{"own child", ownChild, child},
+			{"own top-level space", func(t *testing.T) *networkSpace {
+				return newNetworkSpace(t, network, account, space.SpaceTypeAny, "")
+			}, coordSpace{owned: true}},
+		} {
+			for _, row := range rows {
+				t.Run(own.name+", "+status.String()+", "+row, func(t *testing.T) {
+					sp := own.build(t)
+					member := sp.addMember(t, list.AclPermissionsWriter).Account()
+					track(t, row, sp)
+					held := own.coord
+					held.status = status
+					coord.put(sp.id, held)
+					taken := serveAcl(t, net, coord, sp, own.coord.parentOwned)
+					net.nodes.answerHeaders(noHeader)
+
+					require.ErrorIs(t, spaces.ChangeChildOwner(ctx, sp.id, member, space.PermissionAdmin), space.ErrSpaceDeleted)
+					require.NoError(t, spaces.DeleteChild(ctx, sp.id))
+					requireNothingSent(t, sp, taken)
+					if row == untypedRow {
+						assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, sp.id).Status)
+					} else {
+						requireNothingHeld(t, ctx, sdk, sp.id)
+					}
+				})
+			}
+		}
+	}
+
+	// A status this SDK does not know is no deletion: DeleteChild sends
+	// nothing, and the row stays.
+	t.Run("own child, unknown status", func(t *testing.T) {
+		own := ownChild(t)
+		require.NoError(t, spaces.Track(ctx, own.id))
+		unknown := child
+		unknown.status = 99
+		coord.put(own.id, unknown)
+		net.nodes.serveHeaders(own.storage.SpaceHeaderWithId)
+
+		require.Error(t, spaces.DeleteChild(ctx, own.id))
+		require.Zero(t, net.coord.deletesOf(own.id), "no signed delete")
+		rec, held := sdk.tsp.Get(ctx, own.id)
+		require.True(t, held)
+		assert.False(t, rec.IsDeleted())
+	})
+}
+
+// A space the coordinator holds as another account's is the
+// coordinator's to guard against a delete, and an ACL that names
+// another account the owner guards itself, with a typed row or without.
+// DeleteChild sends the delete in every status of the space, so the
+// Owner of the parent takes over a deletion the child's owner made, and
+// ChangeChildOwner posts its record. No header is read.
+func TestSDK_DeleteChild_AndChangeChildOwner_SpaceOfAnotherAccountWithNoTypedRow(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net, coord, network, sdk := openOnCoordinatorModel(t, ctx)
+	net.nodes.answerHeaders(func(string) (*spacesyncproto.RawSpaceHeaderWithId, error) {
+		t.Error("a header was read")
+		return nil, spacesyncproto.ErrSpaceMissing
+	})
+	spaces := sdk.Spaces()
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
+	require.NoError(t, err)
+
+	const (
+		pending = coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion
+		deleted = coordinatorproto.SpaceStatus_SpaceStatusDeleted
+	)
+	childOfOwn := coordSpace{parent: true, parentOwned: true}
+
+	t.Run("child of the account's organization", func(t *testing.T) {
+		child := newForeignChild(t, network, parent.Id())
+		member := child.addMember(t, list.AclPermissionsWriter).Account()
+		coord.put(child.id, childOfOwn)
+		taken := serveAcl(t, net, coord, child, true)
+
+		require.NoError(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin))
+		assert.Equal(t, 1, *taken)
+		require.NoError(t, spaces.DeleteChild(ctx, child.id))
+		assert.Equal(t, coordSpace{status: pending, parent: true, parentOwned: true, byParentOwner: true}, coord.get(child.id))
+		requireNothingHeld(t, ctx, sdk, child.id)
+	})
+
+	// The Owner of the parent takes over a deletion the child's owner
+	// made: the delete reaches the coordinator, and the deletion becomes
+	// the Owner's.
+	for _, row := range []string{"no row", "a row with no type"} {
+		t.Run("child in deletion by its owner, "+row, func(t *testing.T) {
+			child := newForeignChild(t, network, parent.Id())
+			member := child.addMember(t, list.AclPermissionsWriter).Account()
+			if row != "no row" {
+				require.NoError(t, spaces.Track(ctx, child.id))
+			}
+			inDeletion := childOfOwn
+			inDeletion.status = pending
+			coord.put(child.id, inDeletion)
+			taken := serveAcl(t, net, coord, child, true)
+
+			require.NoError(t, spaces.DeleteChild(ctx, child.id))
+			assert.True(t, coord.get(child.id).byParentOwner, "the deletion is the one of the Owner of the parent")
+			require.NoError(t, spaces.DeleteChild(ctx, child.id), "the deletion is its own already")
+			inDeletion.status = deleted
+			coord.put(child.id, inDeletion)
+			require.NoError(t, spaces.DeleteChild(ctx, child.id), "deleted")
+			assert.Equal(t, 3, net.coord.deletesOf(child.id), "each was sent")
+
+			// ChangeChildOwner reads the coordinator's answer off the
+			// ACL.
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin), space.ErrSpaceDeleted)
+			assert.Zero(t, *taken)
+		})
+	}
+
+	t.Run("child of another account's organization", func(t *testing.T) {
+		child := newForeignChild(t, network, foreignSpaceA)
+		coord.put(child.id, coordSpace{parent: true})
+		require.ErrorIs(t, spaces.DeleteChild(ctx, child.id), space.ErrParentPermissionDenied)
+		assert.Equal(t, coordSpace{parent: true}, coord.get(child.id))
+	})
+
+	// A top-level space: the coordinator refuses the delete in the
+	// status the space has, and the ACL the change of the owner.
+	t.Run("top-level space", func(t *testing.T) {
+		owner, err := accountdata.NewRandom()
+		require.NoError(t, err)
+		foreign := newNetworkSpace(t, network, owner, space.SpaceTypeOrganization, "")
+		member := foreign.addMember(t, list.AclPermissionsWriter).Account()
+		coord.put(foreign.id, coordSpace{})
+		taken := serveAcl(t, net, coord, foreign, false)
+
+		err = spaces.DeleteChild(ctx, foreign.id)
+		require.ErrorIs(t, err, space.ErrNotChildSpace)
+		require.ErrorIs(t, err, coordinatorproto.ErrSpaceIsCreated, "the coordinator's answer stays in the chain")
+		require.Error(t, spaces.ChangeChildOwner(ctx, foreign.id, member, space.PermissionAdmin))
+		assert.Zero(t, *taken)
+		for _, status := range []coordinatorproto.SpaceStatus{pending, deleted} {
+			coord.put(foreign.id, coordSpace{status: status})
+			require.NoError(t, spaces.DeleteChild(ctx, foreign.id), status.String())
+			assert.Equal(t, coordSpace{status: status}, coord.get(foreign.id), "the space is as it was")
+		}
+		requireNothingHeld(t, ctx, sdk, foreign.id)
+	})
+
+	t.Run("space the coordinator does not know", func(t *testing.T) {
+		unknown := foreignChildId(t, parent.Id())
+		net.nodes.set(func() {
+			net.nodes.get = func(spaceId string) ([]*consensusproto.RawRecordWithId, error) {
+				return nil, coord.acl(spaceId)
+			}
+		})
+		require.ErrorIs(t, spaces.DeleteChild(ctx, unknown), space.ErrSpaceUnknown)
+		require.ErrorIs(t, spaces.ChangeChildOwner(ctx, unknown, randomIdentity(t), space.PermissionAdmin), space.ErrSpaceUnknown)
+		assert.Zero(t, net.coord.deletesOf(unknown))
+	})
+
+	// A status this SDK does not know is no deletion, and DeleteChild
+	// sends nothing.
+	t.Run("unknown status", func(t *testing.T) {
+		child := newForeignChild(t, network, parent.Id())
+		unknown := childOfOwn
+		unknown.status = 99
+		coord.put(child.id, unknown)
+
+		require.Error(t, spaces.DeleteChild(ctx, child.id))
+		assert.Zero(t, net.coord.deletesOf(child.id))
+	})
+
+	// The account's own 1-1 space: the coordinator reports no account as
+	// the owner of one and refuses its delete, and the ACL names neither
+	// account its owner.
+	t.Run("one-to-one space of the account", func(t *testing.T) {
+		account := sdk.app.AccountKeys()
+		peer, err := accountdata.NewRandom()
+		require.NoError(t, err)
+		payload, err := spacepayloads.StoragePayloadForOneToOneSpaceWithType(account.SignKey, peer.SignKey.GetPublic(), space.SpaceTypeOneToOne)
+		require.NoError(t, err)
+		oneToOne := networkSpaceOf(network, account, payload)
+		coord.put(oneToOne.id, coordSpace{owned: true, oneToOne: true})
+		taken := serveAcl(t, net, coord, oneToOne, false)
+
+		require.ErrorIs(t, spaces.DeleteChild(ctx, oneToOne.id), coordinatorproto.ErrUnexpected)
+		require.Error(t, spaces.ChangeChildOwner(ctx, oneToOne.id, peer.SignKey.GetPublic().Account(), space.PermissionAdmin))
+		assert.Zero(t, *taken)
+		assert.Equal(t, coordSpace{owned: true, oneToOne: true}, coord.get(oneToOne.id), "the space is as it was")
+		requireNothingHeld(t, ctx, sdk, oneToOne.id)
+	})
+}
+
+// A child the coordinator has signed and no node holds. The node that
+// stores a space creates the log of its ACL, so the coordinator finds
+// none: each call that reads the ACL answers ErrSpaceUnknown, for a
+// child of another account and for the account's own with no row here.
+// The calls go on once a node holds the child.
+func TestSDK_ChildCalls_ChildOnNoNode(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net, coord, network, sdk := openOnCoordinatorModel(t, ctx)
+	spaces := sdk.Spaces()
+	account := sdk.app.AccountKeys()
+	another, err := accountdata.NewRandom()
+	require.NoError(t, err)
+	parent := newNetworkSpace(t, network, account, space.SpaceTypeOrganization, "")
+
+	for _, tc := range []struct {
+		name  string
+		owner *accountdata.AccountKeys
+	}{
+		{"child of another account", another},
+		{"the account's own child", account},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			child := newNetworkSpace(t, network, tc.owner, space.SpaceTypeOrganizationSpace, parent.id)
+			member := child.addMember(t, list.AclPermissionsWriter).Account()
+			coord.put(child.id, coordSpace{owned: tc.owner == account, parent: true, parentOwned: true})
+			taken := serveAcl(t, net, coord, child, true)
+
+			net.nodes.serveHeaders()
+			_, err := spaces.ChildMembers(ctx, child.id)
+			require.ErrorIs(t, err, space.ErrSpaceUnknown)
+			require.ErrorIs(t, err, consensuserr.ErrLogNotFound, "the coordinator's answer stays in the chain")
+			_, err = spaces.ChildRotationPending(ctx, child.id)
+			require.ErrorIs(t, err, space.ErrSpaceUnknown)
+			require.ErrorIs(t, spaces.RemoveChildMembers(ctx, child.id, []string{member}), space.ErrSpaceUnknown)
+			require.ErrorIs(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin), space.ErrSpaceUnknown)
+			require.Zero(t, *taken, "no ACL record")
+
+			net.nodes.serveHeaders(child.storage.SpaceHeaderWithId)
+			members, err := spaces.ChildMembers(ctx, child.id)
+			require.NoError(t, err)
+			assert.Len(t, members, 2)
+			require.NoError(t, spaces.ChangeChildOwner(ctx, child.id, member, space.PermissionAdmin))
+			assert.Equal(t, 1, *taken)
+			requireNothingHeld(t, ctx, sdk, child.id)
+		})
+	}
 }
 
 // The parent side reads whether a child rotated its key after a

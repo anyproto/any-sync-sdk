@@ -5,6 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/anyproto/any-sync/consensus/consensusproto"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
+	"storj.io/drpc/drpcerr"
+
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
@@ -36,5 +40,16 @@ func TestDecodeIdentityBadIdentity(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "decode identity") {
 		t.Errorf("message lost %q phrase: %v", "decode identity", err)
+	}
+}
+
+// The coordinator finds no log of an ACL when no node holds the space,
+// and the nodes pass its answer on as an rpc code. What the node client
+// makes of that code reads as an unknown space.
+func TestNetworkErrAclNotOnTheNetwork(t *testing.T) {
+	code := uint64(consensusproto.ErrCodes_ErrorOffset) + uint64(consensusproto.ErrCodes_LogNotFound)
+	answer := rpcerr.Unwrap(drpcerr.WithCode(errors.New("log not found"), code))
+	if err := networkErr("ChildMembers", answer); !errors.Is(err, space.ErrSpaceUnknown) {
+		t.Errorf("want ErrSpaceUnknown, got %v", err)
 	}
 }

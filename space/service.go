@@ -100,7 +100,9 @@ var ErrGuestJoinPending = errors.New("space: guest join recorded; space load pen
 // does not know the space. That includes a space this account created
 // and has not pushed yet: the error passes once the space is pushed.
 // ACL.CreateInvite, AddAccounts and CreateGuestKey return it for such a
-// space when the push has not landed after their wait.
+// space when the push has not landed after their wait. The calls that
+// read the ACL or the header of a child return it also while no node
+// holds the space.
 var ErrSpaceUnknown = errors.New("unknown space")
 
 // ErrJoinPending is returned by Join after the RequestToJoin was
@@ -270,9 +272,10 @@ type Service interface {
 	// the call checks no role.
 	//
 	// The child is not added to the index, loaded or stored. ErrOffline
-	// when the nodes cannot be reached, ErrNotChildSpace for a space
-	// the index shows is not a child space, ErrBadSpaceId for a
-	// malformed id.
+	// when the nodes cannot be reached, ErrSpaceUnknown for a space the
+	// coordinator does not know or no node holds (its ACL is not on the
+	// network), ErrNotChildSpace for a space the index shows is not a
+	// child space, ErrBadSpaceId for a malformed id.
 	ChildMembers(ctx context.Context, childSpaceId string) ([]ChildMember, error)
 
 	// ChildRotationPending reports, from the ACL the nodes serve,
@@ -304,6 +307,7 @@ type Service interface {
 	// The record is built from the ACL the nodes serve and posted
 	// through them: the child is not added to the index, loaded or
 	// synced. ErrOffline when the network cannot be reached,
+	// ErrSpaceUnknown as from ChildMembers,
 	// ErrParentPermissionDenied for a caller who is not an Admin or the
 	// Owner of the parent, and for an Admin of the parent who removes
 	// one of its Admins or its Owner,
@@ -334,6 +338,14 @@ type Service interface {
 	// member of the parent, ErrAccountNotFound for one who is no member
 	// of the child, ErrInsufficientPermissions for one who is the Owner
 	// already, and for an oldOwnerPerm of none, guest or owner.
+	//
+	// A space whose ACL names the account the owner is handed over only
+	// as a child: by its row in the index, or, with no row or a row
+	// with no type, by its header, read from the nodes:
+	// ErrNotChildSpace when it names no parent, ErrSpaceUnknown when no
+	// node holds the space. The record is built on that ACL. With no
+	// row or a row with no type, a space in deletion or deleted, a
+	// top-level one included, is ErrSpaceDeleted.
 	ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm Permission) error
 
 	// DeleteChild deletes the child space childSpaceId on the network.
@@ -344,13 +356,25 @@ type Service interface {
 	// in its index, the row then becomes a deleted one and the local
 	// copy is removed, as after Delete.
 	//
+	// A space the coordinator holds as the account's own is deleted
+	// only as a child: by its row in the index, or, with no row or a
+	// row with no type, by its header, read from the nodes:
+	// ErrNotChildSpace when it names no parent, ErrSpaceUnknown when no
+	// node holds the space. With no row or a row with no type, such a
+	// space in deletion or deleted, a top-level one included, reads no
+	// header: nil, and the row, if there is one, becomes a deleted one.
+	// The coordinator names the owner in one call and takes the delete
+	// in the next: a top-level space handed to the account between the
+	// two is deleted.
+	//
 	// Delete stays the call for a space of the account's own list: it
 	// deletes on the network only a space the account owns, and for a
 	// member of a child, the parent's Owner included, it removes the
 	// child from the account alone.
 	//
-	// ErrOffline when the coordinator cannot be reached (nothing
-	// changes), ErrParentPermissionDenied for a caller who is neither
+	// ErrOffline when the coordinator cannot be reached, or that header
+	// cannot be read for a node out of reach (nothing changes),
+	// ErrParentPermissionDenied for a caller who is neither
 	// the parent's Owner nor the child's, ErrNotChildSpace for a space
 	// the index shows is not a child space and for an active top-level
 	// space of another account, an organization included, ErrBadSpaceId

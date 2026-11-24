@@ -18,6 +18,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"github.com/anyproto/any-sync/commonspace/pubsub"
+	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/coordinator/inboxclient"
@@ -54,6 +55,7 @@ type App struct {
 	coord        coordinatorclient.CoordinatorClient
 	streamPool   streampool.StreamPool
 	joining      aclclient.AclJoiningClient
+	nodes        NodeClient
 	inbox        inboxclient.InboxClient
 
 	// inboxReceiver holds the live push callback installed by the inbox
@@ -324,7 +326,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(p2pSrv).
 		Register(peerManagers).
 		Register(wrapComponent(coordinatorclient.New())).
-		Register(wrapComponent(nodeclient.New())).
+		Register(wrapComponent(newNodeClient())).
 		Register(storage).
 		Register(tree).
 		Register(syncqueues.New()).
@@ -434,6 +436,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 	out.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
 	out.joining = a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient)
+	out.nodes = a.MustComponent(nodeclient.CName).(NodeClient)
 	// Wire the responsible-node resolver so per-space trackers can
 	// filter inbound HeadsApply senders.
 	nc := out.nodeConf
@@ -587,6 +590,15 @@ func (a *App) AclSnapshot(ctx context.Context, spaceId string) (list.AclList, er
 		return nil, fmt.Errorf("anysyncx: acl snapshot %q: %w", spaceId, err)
 	}
 	return acl, nil
+}
+
+// AclAddRecord posts rec, built on an AclSnapshot of spaceId, to the
+// ACL of that space through the nodes.
+func (a *App) AclAddRecord(ctx context.Context, spaceId string, rec *consensusproto.RawRecord) error {
+	if _, err := a.nodes.AclAddRecord(ctx, spaceId, rec); err != nil {
+		return fmt.Errorf("anysyncx: acl add record %q: %w", spaceId, err)
+	}
+	return nil
 }
 
 // InboxMessageHandler is the push callback the inbox notifier installs.

@@ -216,6 +216,17 @@ synced. Each needs the network and returns `ErrOffline` without it.
 
 The child's own Owner is accepted on the last two whatever its role in
 the parent, as the owner of any space changes its owner and deletes it.
+So both calls check a space the account itself owns before they act on
+it. The index tells for a row that names a parent or has a type. For any
+other id `ChangeChildOwner` reads the owner from the ACL it builds its
+record on, and `DeleteChild` asks the coordinator. The account's own
+space then needs a header, read from the nodes, that names a parent:
+`ErrNotChildSpace` when it names none, `ErrSpaceUnknown` when no node
+holds the space. In deletion or deleted, a top-level one included, it
+reads no header: `DeleteChild` returns `nil`, `ChangeChildOwner`
+`ErrSpaceDeleted`. The coordinator names the owner in one call and takes
+the delete in the next: `DeleteChild` deletes a top-level space that is
+handed to the account between the two. Nothing of the space is stored.
 
 `ChildMembers` is how the parent side learns who is in a child: the
 identities to remove, and the active members one of whom can become the
@@ -257,16 +268,16 @@ Errors of these calls:
 
 | Error | Meaning |
 |---|---|
-| `ErrOffline` | No node or coordinator could be reached. Nothing changed. |
+| `ErrOffline` | The coordinator or a node could not be reached. Nothing changed. |
 | `ErrParentPermissionDenied` | The network does not accept the call from this account (the table above), or an Admin of the parent removes an account that is an Admin or the Owner of the parent. |
 | `ErrNotParentMember` | The new owner is no member of the parent. |
 | `ErrAccountNotFound` | An identity is no member of the child: one of the removed, or the new owner. |
 | `ErrInsufficientPermissions` | The ACL forbids the record: the child's Owner or the caller among the removed identities; a new owner who is the Owner already; an `oldOwnerPerm` of `none`, `guest` or `owner`. |
 | any other error from `RemoveChildMembers` or `ChangeChildOwner` | The record names the ACL head it was built on, and another record reached the child's ACL first (`records conflict`, `incorrect prev id of a record`). Nothing was written: call again. |
-| `ErrSpaceUnknown` | The coordinator does not know the space. That includes a space this account created and has not pushed yet, a parent given to `Children` for example: the error passes once the space is pushed. |
+| `ErrSpaceUnknown` | The coordinator does not know the space. That includes a space this account created and has not pushed yet, a parent given to `Children` for example: the error passes once the space is pushed. Also a space the coordinator knows that no node holds yet. From `ChildMembers`, `ChildRotationPending`, `RemoveChildMembers` and `ChangeChildOwner`: its ACL is not on the network. From `DeleteChild`, for a space the account owns: its header cannot be read. |
 | `ErrParentSpaceNotAvailable` | The coordinator cannot read the ACL of the parent. From `Children`: it knows the parent and the ACL is not on the network yet, which passes once the parent is pushed. From `RemoveChildMembers`, `ChangeChildOwner` and `DeleteChild`: the ACL of the child's parent. |
-| `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. The error is no proof that the space is gone for good: the coordinator lets the space's own owner take back a deletion that owner started. |
-| `ErrNotChildSpace` | The space is not a child. The index shows it for a space the account holds whose row has a type and is not the row of a child, an organization, the tech space and a 1-1 space included, and nothing is sent. `DeleteChild` also returns it for an active top-level space of another account, an organization included, which the coordinator shows; `RemoveChildMembers` and `ChangeChildOwner` see only the ACL of such a space. The device refuses with `ErrInsufficientPermissions` when the record names the space's Owner or the caller, and with `ErrAccountNotFound` for an identity that is no account of it. For another member of the space the coordinator refuses the record, and that error carries no sentinel. Not covered: for the tech space of another account, or a 1-1 space the account does not hold, `DeleteChild` returns the coordinator's untyped error, and for a space of another account that is deleted or in deletion it returns `nil`, as for any space the coordinator holds so. |
+| `ErrSpaceDeleted` | The coordinator holds the space as deleted or in deletion. `DeleteChild` of such a child returns `nil`: it is done. So it does for the account's own space the index does not tell about, a top-level one included, and a row with no type becomes a deleted one. The error is no proof that the space is gone for good: the coordinator lets the space's own owner take back a deletion that owner started. |
+| `ErrNotChildSpace` | The space is not a child. The index shows it for a space the account holds whose row has a type and is not the row of a child, an organization, the tech space and a 1-1 space included, and nothing is sent. The same when the header of a space the account owns names no parent (`ChangeChildOwner`, `DeleteChild`). `DeleteChild` also returns it for an active top-level space of another account, an organization included, which the coordinator shows; `RemoveChildMembers` and `ChangeChildOwner` see only the ACL of such a space. The device refuses with `ErrInsufficientPermissions` when the record names the space's Owner or the caller, and with `ErrAccountNotFound` for an identity that is no account of it. For another member of the space the coordinator refuses the record, and that error carries no sentinel. Not covered: for the tech space of another account, or a 1-1 space the account does not hold, `DeleteChild` returns the coordinator's untyped error, and for a space of another account that is deleted or in deletion it returns `nil`, as for any space the coordinator holds so. |
 | `ErrBadSpaceId`, `ErrBadIdentity` | Malformed input. |
 
 ## Rotation pending

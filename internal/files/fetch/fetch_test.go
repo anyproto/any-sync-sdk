@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"net/http"
@@ -97,7 +98,7 @@ func TestOpenRemoteReadAll(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(base))
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	require.EqualValues(t, len(plain), f.Size())
 	got, err := io.ReadAll(f)
@@ -107,7 +108,7 @@ func TestOpenRemoteReadAll(t *testing.T) {
 	t.Logf("full read: %d range requests", requests.Load())
 
 	// Everything persisted: byte-identical local CAR, readable offline.
-	require.NoError(t, svc.Fetch(ctx, spaceId, root, true, "file1"))
+	require.NoError(t, svc.Fetch(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, "file1"))
 	info, err := st.Info(ctx, spaceId, root)
 	require.NoError(t, err)
 	require.Equal(t, store.StateComplete, info.State)
@@ -119,7 +120,7 @@ func TestOpenRemoteReadAll(t *testing.T) {
 	require.True(t, bytes.Equal(car, local), "local CAR must equal the remote object byte-for-byte")
 
 	offline := New(st, staticBase("")) // no remote rung
-	f2, err := offline.Open(ctx, spaceId, root, key, true, "file1")
+	f2, err := offline.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	got2, err := io.ReadAll(f2)
 	require.NoError(t, err)
@@ -134,7 +135,7 @@ func TestOpenSeekTargeted(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(base))
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	defer f.Close()
 
@@ -166,7 +167,7 @@ func TestResumeAcrossReopen(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(base))
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	head := make([]byte, 1_000_000)
 	_, err = io.ReadFull(f, head)
@@ -181,7 +182,7 @@ func TestResumeAcrossReopen(t *testing.T) {
 	require.Equal(t, store.StatePartial, info.State)
 	require.Positive(t, info.Present)
 
-	require.NoError(t, svc.Fetch(ctx, spaceId, root, true, "file1"))
+	require.NoError(t, svc.Fetch(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, "file1"))
 	info, err = st.Info(ctx, spaceId, root)
 	require.NoError(t, err)
 	require.Equal(t, store.StateComplete, info.State)
@@ -197,7 +198,7 @@ func TestPartialReadableOffline(t *testing.T) {
 
 	st := newStore(t)
 	online := New(st, staticBase(base))
-	f, err := online.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := online.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	head := make([]byte, 1_500_000)
 	_, err = io.ReadFull(f, head)
@@ -205,7 +206,7 @@ func TestPartialReadableOffline(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	offline := New(st, staticBase("")) // network gone
-	f2, err := offline.Open(ctx, spaceId, root, key, true, "file1")
+	f2, err := offline.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err, "a partial file must open offline")
 	got := make([]byte, 1_000_000)
 	_, err = io.ReadFull(f2, got)
@@ -230,11 +231,11 @@ func TestOfflineOffloadedThenRefetch(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(base))
-	require.NoError(t, svc.Fetch(ctx, spaceId, root, true, "file1"))
+	require.NoError(t, svc.Fetch(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, "file1"))
 	require.NoError(t, st.Offload(ctx, spaceId, root))
 
 	// Reopen refetches transparently through the public URL.
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	got, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -247,7 +248,7 @@ func TestNotDurableNotLocal(t *testing.T) {
 	_, root, key, _ := buildSource(t, 100_000)
 	st := newStore(t)
 	svc := New(st, staticBase("http://unused.test"))
-	_, err := svc.Open(ctx, spaceId, root, key, false, "file1")
+	_, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: false}, key, "file1")
 	require.ErrorIs(t, err, ErrNotAvailable)
 	require.ErrorIs(t, err, space.ErrFileNotAvailable, "consumers match the public sentinel")
 }
@@ -257,7 +258,7 @@ func TestNoPublicBase(t *testing.T) {
 	_, root, key, _ := buildSource(t, 100_000)
 	st := newStore(t)
 	svc := New(st, staticBase(""))
-	_, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	_, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.ErrorIs(t, err, ErrNotAvailable)
 	require.ErrorIs(t, err, space.ErrFileNotAvailable)
 }
@@ -277,7 +278,7 @@ func TestWrongObjectAtURL(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(srv.URL))
-	_, err := svc.Open(ctx, spaceId, wantRoot, key, true, "file1")
+	_, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: wantRoot, Durable: true}, key, "file1")
 	require.ErrorContains(t, err, "wanted "+wantRoot.String())
 	// The rejected skeleton must not linger.
 	_, err = st.Info(ctx, spaceId, otherRoot)
@@ -296,14 +297,14 @@ func TestWrongObjectDoesNotTouchExistingFile(t *testing.T) {
 	st := newStore(t)
 	// File B is a legitimate complete local file.
 	baseB, _ := serveCar(t, otherRoot, otherCar)
-	require.NoError(t, New(st, staticBase(baseB)).Fetch(ctx, spaceId, otherRoot, true, "fileB"))
+	require.NoError(t, New(st, staticBase(baseB)).Fetch(ctx, Object{SpaceId: spaceId, Root: otherRoot, Durable: true}, "fileB"))
 
 	// A misconfigured CDN serves B's bytes at A's URL.
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.ServeContent(w, r, "", time.Unix(0, 0), bytes.NewReader(otherCar))
 	}))
 	t.Cleanup(srv.Close)
-	_, err := New(st, staticBase(srv.URL)).Open(ctx, spaceId, wantRoot, key, true, "fileA")
+	_, err := New(st, staticBase(srv.URL)).Open(ctx, Object{SpaceId: spaceId, Root: wantRoot, Durable: true}, key, "fileA")
 	require.ErrorContains(t, err, "wanted "+wantRoot.String())
 
 	// B is untouched: complete, refs intact.
@@ -337,7 +338,7 @@ func Test206WithoutContentRange(t *testing.T) {
 	t.Cleanup(srv.Close)
 
 	st := newStore(t)
-	_, err := New(st, staticBase(srv.URL)).Open(ctx, spaceId, root, key, true, "file1")
+	_, err := New(st, staticBase(srv.URL)).Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.ErrorContains(t, err, "Content-Range")
 }
 
@@ -360,7 +361,7 @@ func TestPromotionWindow404(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(srv.URL))
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err, "must retry through the 404 window")
 	got, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -414,20 +415,22 @@ func (f *fakeCar) ReadProbe(_ context.Context) ([]byte, int64, error) {
 }
 
 type fakePeerSource struct {
-	car    *fakeCar
-	banned *bool
-	absent bool
+	car     *fakeCar
+	banned  *bool
+	absent  bool
+	queries []PeerQuery
 }
 
-func (p *fakePeerSource) SourceFor(context.Context, string, cid.Cid) (CarSource, func(), bool) {
+func (p *fakePeerSource) SourceFor(_ context.Context, q PeerQuery) (CarSource, func(), error) {
+	p.queries = append(p.queries, q)
 	if p.absent {
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("%w: no peer in this test", ErrNotAvailable)
 	}
 	return p.car, func() {
 		if p.banned != nil {
 			*p.banned = true
 		}
-	}, true
+	}, nil
 }
 
 // A healthy peer serves the whole file; HTTP egress must be zero.
@@ -440,7 +443,7 @@ func TestPeerPreferredNoHTTPEgress(t *testing.T) {
 	svc := New(st, staticBase(base))
 	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car}})
 
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	got, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -468,7 +471,7 @@ func TestLyingPeerFallsBackToHTTPAndBans(t *testing.T) {
 	banned := false
 	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car, lieBelow: int64(hdr.IndexOffset)}, banned: &banned})
 
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err, "a lying peer must not fail the fetch — HTTP serves it")
 	got, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -479,7 +482,7 @@ func TestLyingPeerFallsBackToHTTPAndBans(t *testing.T) {
 
 	// The store is intact: a full fetch completes and the local CAR
 	// equals the real object byte-for-byte (no corruption landed).
-	require.NoError(t, svc.Fetch(ctx, spaceId, root, true, "file1"))
+	require.NoError(t, svc.Fetch(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, "file1"))
 	h, err := st.Open(ctx, spaceId, root)
 	require.NoError(t, err)
 	info, _ := st.Info(ctx, spaceId, root)
@@ -501,7 +504,7 @@ func TestLyingPeerProbeFallsBack(t *testing.T) {
 	banned := false
 	svc.SetPeer(&fakePeerSource{car: &fakeCar{car: car, lieProbe: true}, banned: &banned})
 
-	f, err := svc.Open(ctx, spaceId, root, key, true, "file1")
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "file1")
 	require.NoError(t, err)
 	got, err := io.ReadAll(f)
 	require.NoError(t, err)
@@ -522,7 +525,7 @@ func TestNonDurablePeerFailsGracefully(t *testing.T) {
 
 	// The regression: with a typed-nil HTTP source, the demote path
 	// dereferenced nil and panicked. It must return a clean error.
-	_, err := svc.Open(ctx, spaceId, root, key, false, "file1") // durable=false
+	_, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: false}, key, "file1") // durable=false
 	require.Error(t, err, "no usable source → error, not panic")
 }
 
@@ -533,7 +536,7 @@ func TestNonDurableNoPeerGraceful(t *testing.T) {
 	st := newStore(t)
 	svc := New(st, staticBase(""))
 	svc.SetPeer(&fakePeerSource{absent: true})
-	_, err := svc.Open(ctx, spaceId, root, key, false, "file1")
+	_, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: false}, key, "file1")
 	require.ErrorIs(t, err, space.ErrFileNotAvailable)
 }
 
@@ -546,14 +549,39 @@ func TestOpenLimitedRefusesOversized(t *testing.T) {
 
 	st := newStore(t)
 	svc := New(st, staticBase(base))
-	_, err := svc.OpenLimited(ctx, spaceId, root, key, true, "icon", 1<<20)
+	_, err := svc.OpenLimited(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "icon", 1<<20)
 	require.ErrorIs(t, err, ErrObjectTooLarge)
 	require.EqualValues(t, 1, requests.Load(), "only the probe is fetched")
 	_, err = st.Info(ctx, spaceId, root)
 	require.ErrorIs(t, err, store.ErrNotFound, "a refused object leaves no row")
 
 	// Under the cap the same object opens.
-	f, err := svc.OpenLimited(ctx, spaceId, root, key, true, "icon", int64(len(car))+1)
+	f, err := svc.OpenLimited(ctx, Object{SpaceId: spaceId, Root: root, Durable: true}, key, "icon", int64(len(car))+1)
 	require.NoError(t, err)
 	require.NoError(t, f.Close())
+}
+
+// The peer layer learns who registered the file, and that it is the
+// only source exactly when there is no public object to fall back on.
+func TestPeerQueryCarriesAuthorAndSole(t *testing.T) {
+	ctx := context.Background()
+	car, root, key, _ := buildSource(t, 800_000)
+	base, _ := serveCar(t, root, car)
+
+	durable := &fakePeerSource{car: &fakeCar{car: car}}
+	svc := New(newStore(t), staticBase(base))
+	svc.SetPeer(durable)
+	f, err := svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Durable: true, Author: "author"}, key, "file1")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.Equal(t, []PeerQuery{{SpaceId: spaceId, Root: root, Author: "author"}}, durable.queries,
+		"a durable file has the public object: the peer layer must not dial for it")
+
+	sole := &fakePeerSource{car: &fakeCar{car: car}}
+	svc = New(newStore(t), staticBase(base))
+	svc.SetPeer(sole)
+	f, err = svc.Open(ctx, Object{SpaceId: spaceId, Root: root, Author: "author"}, key, "file1")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+	require.Equal(t, []PeerQuery{{SpaceId: spaceId, Root: root, Author: "author", Sole: true}}, sole.queries)
 }

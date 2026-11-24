@@ -650,6 +650,9 @@ func (a *App) P2PEnabled() bool { return a.p2pEnabled }
 // (cfg.P2P.Global).
 func (a *App) GlobalP2PEnabled() bool { return a.globalEnabled }
 
+// Global is the internet-wide layer; nil when it is off.
+func (a *App) Global() *p2p.Global { return a.global }
+
 // SetFileStore injects the file store into the p2p file server, enabling
 // it to serve stored CAR objects to LAN peers. Called by sdk.Open once
 // the store is built. No-op when p2p is disabled.

@@ -36,18 +36,21 @@ func NewEncryptReader(key []byte, r io.Reader) (io.Reader, error) {
 }
 
 // Reader decrypts an AES-256-CFB ciphertext stream with random access.
-// Seek re-keys the stream from the ciphertext block boundary before the
-// target offset: the 16 ciphertext bytes preceding the aligned position
-// are the IV, so decryption never restarts from zero (ports
-// anytype-heart's cfb.CFBDecryptor).
+// Seek only records the target; the next Read re-keys the stream from
+// the ciphertext block boundary before it: the 16 ciphertext bytes
+// preceding the aligned position are the IV, so decryption never
+// restarts from zero (ports anytype-heart's cfb.CFBDecryptor). A seek
+// costs no read of the ciphertext, and a position whose ciphertext
+// cannot be had fails the Read, not the Seek.
 //
 // The underlying ciphertext reader must serve only cid-verified bytes;
 // Reader adds no integrity of its own.
 type Reader struct {
 	block cipher.Block
 	ct    io.ReadSeeker
-	sr    *cipher.StreamReader
-	pos   int64
+	// sr is the stream keyed at pos; nil from a Seek to the next Read.
+	sr  *cipher.StreamReader
+	pos int64
 }
 
 // NewReader positions a Reader at plaintext offset 0.
@@ -56,14 +59,20 @@ func NewReader(key []byte, ct io.ReadSeeker) (*Reader, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Reader{block: block, ct: ct}
-	if err = r.seekTo(0); err != nil {
-		return nil, err
-	}
-	return r, nil
+	return &Reader{block: block, ct: ct}, nil
 }
 
 func (r *Reader) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if r.sr == nil {
+		sr, err := r.keyAt(r.pos)
+		if err != nil {
+			return 0, err
+		}
+		r.sr = sr
+	}
 	n, err := r.sr.Read(p)
 	r.pos += int64(n)
 	return n, err
@@ -88,35 +97,42 @@ func (r *Reader) Seek(offset int64, whence int) (int64, error) {
 	if abs < 0 {
 		return 0, errors.New("crypt: negative seek offset")
 	}
-	if err := r.seekTo(abs); err != nil {
-		return 0, err
-	}
+	r.pos, r.sr = abs, nil
 	return abs, nil
 }
 
-func (r *Reader) seekTo(off int64) error {
+// keyAt returns the decrypting stream positioned at plaintext offset
+// off. An offset past the end reads as io.EOF.
+func (r *Reader) keyAt(off int64) (*cipher.StreamReader, error) {
 	aligned := (off / aes.BlockSize) * aes.BlockSize
 	iv := make([]byte, aes.BlockSize) // zero IV at stream start
 	if aligned == 0 {
 		if _, err := r.ct.Seek(0, io.SeekStart); err != nil {
-			return err
+			return nil, err
 		}
 	} else {
 		if _, err := r.ct.Seek(aligned-aes.BlockSize, io.SeekStart); err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := io.ReadFull(r.ct, iv); err != nil {
-			return err
+			return nil, pastEnd(err)
 		}
 	}
-	r.sr = &cipher.StreamReader{S: cipher.NewCFBDecrypter(r.block, iv), R: r.ct}
+	sr := &cipher.StreamReader{S: cipher.NewCFBDecrypter(r.block, iv), R: r.ct}
 	if rem := off - aligned; rem > 0 {
-		if _, err := io.CopyN(io.Discard, r.sr, rem); err != nil {
-			return err
+		if _, err := io.CopyN(io.Discard, sr, rem); err != nil {
+			return nil, pastEnd(err)
 		}
 	}
-	r.pos = off
-	return nil
+	return sr, nil
+}
+
+// pastEnd reads a short ciphertext as the end of the stream.
+func pastEnd(err error) error {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return io.EOF
+	}
+	return err
 }
 
 func newBlock(key []byte) (cipher.Block, error) {

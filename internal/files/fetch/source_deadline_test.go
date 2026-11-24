@@ -124,11 +124,25 @@ func TestExpiredPeerReadWithoutHttpKeepsThePeer(t *testing.T) {
 	car := &stallingCar{roundTrip: 10 * time.Millisecond}
 	fs := &fetchSources{peer: car, banPeer: func() { banned++ }}
 
-	if _, err := fs.readRange(context.Background(), 0, 1, nil); err == nil {
-		t.Fatal("an expired read with no fallback must surface")
+	_, err := fs.readRange(context.Background(), 0, 1, nil)
+	if !errors.Is(err, ErrNotAvailable) {
+		t.Fatalf("err = %v, want the read of the only source to fail as not available", err)
 	}
 	if banned != 0 || fs.peerOff {
 		t.Errorf("banned=%d peerOff=%v, want the only source kept", banned, fs.peerOff)
+	}
+}
+
+// The caller giving up is not a verdict on the file: its own context
+// error comes back as it is.
+func TestCancelledPeerReadWithoutHttpIsNotUnavailable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	car := &stallingCar{roundTrip: time.Minute, cancel: cancel}
+	fs := &fetchSources{peer: car}
+
+	_, err := fs.readRange(ctx, 0, 1, nil)
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrNotAvailable) {
+		t.Fatalf("err = %v, want the caller's cancel", err)
 	}
 }
 

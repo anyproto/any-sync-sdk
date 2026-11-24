@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/net/peerservice"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/config"
 	sdkp2p "github.com/anyproto/any-sync-sdk/p2p"
 )
 
@@ -40,21 +41,58 @@ const (
 	// comes early by, at random, so peers that failed together do not
 	// retry in lockstep.
 	retryJitter = 0.25
+	// demandPeerTTL is the pool TTL of a connection dialed on demand: it
+	// is outside the cover, so it closes soon after the fetch that
+	// wanted it goes idle.
+	demandPeerTTL = 5 * time.Minute
+	// demandRetry is how long a peer whose dial failed is left alone by
+	// demands, whatever its backoff: a demand is a caller waiting now,
+	// and the cover's backoff of a stale peer runs to hours.
+	demandRetry = activeBackoffMin
+	// demandShare is the part of MaxDialsPerMinute demands may spend, so
+	// a caller retrying a fetch nobody can serve leaves the cover its
+	// dials.
+	demandShare = 2
 )
 
 // connector is the only dialer of global peers. It keeps at most
 // MaxConnections peers connected, chosen to cover the loaded spaces
 // (own devices first, then most recently seen), one dial at a time,
-// rate-limited, with per-peer backoff by tier. Every other consumer of
-// global peers only picks live connections from the pool.
+// rate-limited, with per-peer backoff by tier. Beyond the cover it dials
+// only on demand (see demand). Every other consumer of global peers
+// only picks live connections from the pool.
 type connector struct {
 	g *Global
 
 	mu       sync.Mutex
 	next     map[string]time.Time
 	attempts []time.Time
-	wake     chan struct{}
-	power    atomic.Int32
+	// demandAttempts are the dials of attempts made for demands.
+	demandAttempts []time.Time
+	demands        []*demand
+	wake           chan struct{}
+	power          atomic.Int32
+}
+
+// demand is a caller waiting for one more live peer of a space: a file
+// fetch whose holder is not among the connected peers. It costs at most
+// one dial. The connector owns it once queued; the caller only reads
+// res.
+type demand struct {
+	ctx     context.Context
+	spaceId string
+	// prefer is the account identity whose devices are dialed first.
+	prefer string
+	// skip holds the peers the caller already asked.
+	skip map[string]struct{}
+	res  chan demandResult
+}
+
+// demandResult names the peer a demand ended on: connected, or dialed
+// in vain. The zero value means nothing was there to dial.
+type demandResult struct {
+	peerId    string
+	connected bool
 }
 
 func newConnector(g *Global) *connector {
@@ -107,9 +145,22 @@ type peerInfo struct {
 	backoff bool
 }
 
-// step plans once and dials at most one peer. Returns how long to
-// sleep without a wake-up.
+// step serves the demands, then plans the cover, and dials at most one
+// peer in all. Returns how long to sleep without a wake-up.
 func (c *connector) step(ctx context.Context) time.Duration {
+	demandWait, dialed := c.serveDemands(ctx)
+	if dialed {
+		return 0
+	}
+	wait := c.cover(ctx)
+	if wait > 0 && demandWait > 0 {
+		return min(wait, demandWait)
+	}
+	return wait
+}
+
+// cover plans the space cover once and dials at most one peer for it.
+func (c *connector) cover(ctx context.Context) time.Duration {
 	if sdkp2p.PowerHint(c.power.Load()) == sdkp2p.PowerLow {
 		return idleCheck
 	}
@@ -169,8 +220,167 @@ func (c *connector) step(ctx context.Context) time.Duration {
 	if wait := c.rateLimitWait(now); wait > 0 {
 		return wait
 	}
-	c.dial(ctx, dial)
+	c.dial(ctx, dial, globalPeerTTL, nil)
 	return 0
+}
+
+// connectOne queues a demand and waits for its answer. connected
+// reports a live peer of the space outside skip; a peer id with
+// connected false was dialed in vain; no peer id means nothing was
+// dialed: no candidate, no budget, the layer stopped, or ctx ended. A
+// dial in flight when ctx ends still completes.
+func (c *connector) connectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, connected bool) {
+	run := c.g.runCtx
+	if run == nil || run.Err() != nil {
+		return "", false
+	}
+	d := &demand{ctx: ctx, spaceId: spaceId, prefer: prefer, skip: make(map[string]struct{}, len(skip)), res: make(chan demandResult, 1)}
+	for _, id := range skip {
+		d.skip[id] = struct{}{}
+	}
+	c.mu.Lock()
+	c.demands = append(c.demands, d)
+	c.mu.Unlock()
+	c.wakeUp()
+	select {
+	case r := <-d.res:
+		return r.peerId, r.connected
+	case <-ctx.Done():
+	case <-run.Done():
+	}
+	return "", false
+}
+
+// waitingDemands drops the demands nobody waits for and returns the
+// rest, oldest first.
+func (c *connector) waitingDemands() []*demand {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.demands = slices.DeleteFunc(c.demands, func(d *demand) bool { return d.ctx.Err() != nil })
+	return slices.Clone(c.demands)
+}
+
+// answer takes a demand off the queue and hands its result over.
+func (c *connector) answer(d *demand, res demandResult) {
+	c.mu.Lock()
+	c.demands = slices.DeleteFunc(c.demands, func(q *demand) bool { return q == d })
+	c.mu.Unlock()
+	d.res <- res
+}
+
+// serveDemands answers every demand that needs no dial — a connected
+// peer its caller has not asked, or nothing left to dial — and dials
+// for at most one. A demand that waits for the dial budget stays
+// queued without holding up the ones behind it; wait is how long the
+// earliest of those waits. The power hint and the connection ceiling
+// refuse a dial outright.
+func (c *connector) serveDemands(ctx context.Context) (wait time.Duration, dialed bool) {
+	g := c.g
+	for _, d := range c.waitingDemands() {
+		now := g.now()
+		live, target := c.demandTarget(d, now)
+		switch {
+		case live != "":
+			c.answer(d, demandResult{peerId: live, connected: true})
+			continue
+		case target == "",
+			sdkp2p.PowerHint(c.power.Load()) == sdkp2p.PowerLow,
+			g.liveCount() >= demandCeiling(g.cfg):
+			c.answer(d, demandResult{})
+			continue
+		}
+		if w := c.demandRateWait(now); w > 0 {
+			// the budget frees after this caller has left
+			if deadline, ok := d.ctx.Deadline(); ok && time.Until(deadline) < w {
+				c.answer(d, demandResult{})
+			} else if wait == 0 || w < wait {
+				wait = w
+			}
+			continue
+		}
+		c.mu.Lock()
+		c.demandAttempts = append(c.demandAttempts, now)
+		c.mu.Unlock()
+		answered := false
+		connected := c.dial(ctx, target, demandPeerTTL, func() {
+			answered = true
+			c.answer(d, demandResult{peerId: target, connected: true})
+		})
+		if !answered {
+			c.answer(d, demandResult{peerId: target, connected: connected})
+		}
+		return wait, true
+	}
+	return wait, false
+}
+
+// demandTarget picks for one demand: live, a connected peer its caller
+// has not asked, or else target, the first peer worth a dial.
+func (c *connector) demandTarget(d *demand, now time.Time) (live, target string) {
+	g := c.g
+	for _, id := range c.demandOrder(d) {
+		if _, ok := d.skip[id]; ok {
+			continue
+		}
+		if g.connected(id) {
+			return id, ""
+		}
+		if rec, ok := g.status.Get(id); ok && rec.Failures > 0 && now.Sub(rec.LastAttempt) < demandRetry {
+			continue
+		}
+		if target == "" {
+			target = id
+		}
+	}
+	return "", target
+}
+
+// demandCeiling is the live-connection count past which no demand
+// dials: demand connections may take half of the room kept for inbound
+// ones, never all of it.
+func demandCeiling(cfg config.GlobalP2P) int {
+	return cfg.MaxConnections + cfg.MaxInbound/2
+}
+
+// demandRateWait is rateLimitWait for a demand dial, which also has to
+// fit the demands' share of the budget.
+func (c *connector) demandRateWait(now time.Time) time.Duration {
+	wait := c.rateLimitWait(now)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	cut := now.Add(-rateWindow)
+	c.demandAttempts = slices.DeleteFunc(c.demandAttempts, func(t time.Time) bool { return t.Before(cut) })
+	limit := c.g.cfg.MaxDialsPerMinute
+	if limit <= 0 {
+		return wait
+	}
+	if share := max(limit/demandShare, 1); len(c.demandAttempts) >= share {
+		wait = max(wait, c.demandAttempts[0].Add(rateWindow).Sub(now))
+	}
+	return wait
+}
+
+// demandOrder ranks the dialable peers of a demand's space: devices of
+// the preferred identity, then own devices, then the rest, each group
+// most recently seen first.
+func (c *connector) demandOrder(d *demand) []string {
+	g := c.g
+	ids := c.dialable(g.store.GlobalPeerIds(d.spaceId))
+	rank := func(id string) int {
+		switch identity := g.peerIdentity(id); {
+		case d.prefer != "" && identity == d.prefer:
+			return 0
+		case g.selfIdentity != "" && identity == g.selfIdentity:
+			return 1
+		}
+		return 2
+	}
+	ranks := make(map[string]int, len(ids))
+	for _, id := range ids {
+		ranks[id] = rank(id)
+	}
+	slices.SortStableFunc(ids, func(a, b string) int { return ranks[a] - ranks[b] })
+	return ids
 }
 
 // accountCover is the bucket the account's own devices are covered
@@ -312,17 +522,20 @@ func (c *connector) forget(peerId string) {
 // DialTimeout) and the connection is handed to the pool as an
 // incoming-style peer. Going around pool.Get means no in-flight pool
 // load ever exists for a global peer, so every Pick answers at once.
-func (c *connector) dial(ctx context.Context, peerId string) {
+// ttl is the connection's pool TTL. onLive, when set, runs as soon as a
+// dialed connection is usable, before the wait that tells a refusal
+// from a connection. Reports whether the peer is connected.
+func (c *connector) dial(ctx context.Context, peerId string, ttl time.Duration, onLive func()) bool {
 	g := c.g
 	now := g.now()
 	// the plan is stale by now if the peer connected to us in between:
 	// dialing back would replace the accepted connection and kill both
 	if g.connected(peerId) {
-		return
+		return true
 	}
 	if p := g.pickIroh(peerId); p != nil {
 		g.addLive(p)
-		return
+		return true
 	}
 	c.mu.Lock()
 	c.attempts = append(c.attempts, now)
@@ -338,14 +551,17 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 		c.mu.Lock()
 		c.next[peerId] = now.Add(addrsNotFoundRetry)
 		c.mu.Unlock()
-		return
+		return false
 	}
 	if err == nil {
-		p.SetTTL(globalPeerTTL)
+		p.SetTTL(ttl)
 		if err = g.pool.AddPeer(ctx, p); err != nil {
 			_ = p.Close()
 		} else {
 			g.addLive(p)
+			if onLive != nil {
+				onLive()
+			}
 			// a peer that refuses us after the handshake closes at once:
 			// that is a failed dial, not a connection
 			select {
@@ -371,6 +587,7 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 	} else {
 		log.Debug("global peer dial failed", zap.String("peerId", peerId), zap.Int("failures", rec.Failures), zap.Error(err))
 	}
+	return ok
 }
 
 // errRefusedAfterHandshake is a dial the peer closed within

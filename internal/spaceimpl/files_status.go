@@ -81,7 +81,7 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 		if err != nil {
 			return err
 		}
-		if err := s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId); err != nil {
+		if err := s.fetch.Fetch(ctx, fetchObject(job.SpaceId, root, row), job.FileId); err != nil {
 			return err
 		}
 		// Durability takeover (SYN-48): we now hold the complete file. If

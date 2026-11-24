@@ -78,7 +78,7 @@ func (s *Service) openIdentityIcon(ctx context.Context, identity string, p techs
 	// failure, a peer budget — is the same retry-later state to the
 	// caller, and the underlying error (which names the owner's space)
 	// stays in the debug log.
-	f, err := s.fetch.OpenLimited(ctx, p.IconSpaceId, root, key, true, identityIconRef(identity), identityIconObjectCap)
+	f, err := s.fetch.OpenLimited(ctx, fetch.Object{SpaceId: p.IconSpaceId, Root: root, Durable: true}, key, identityIconRef(identity), identityIconObjectCap)
 	if err != nil {
 		if ctx.Err() != nil {
 			return nil, ctx.Err()

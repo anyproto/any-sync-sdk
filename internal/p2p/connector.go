@@ -40,21 +40,46 @@ const (
 	// comes early by, at random, so peers that failed together do not
 	// retry in lockstep.
 	retryJitter = 0.25
+	// demandPeerTTL is the pool TTL of a connection dialed on demand: it
+	// is outside the cover, so it closes soon after the fetch that
+	// wanted it goes idle.
+	demandPeerTTL = 5 * time.Minute
+	// demandRetry is how long a peer whose dial failed is left alone by
+	// demands, whatever its backoff: a demand is a caller waiting now,
+	// and the cover's backoff of a stale peer runs to hours.
+	demandRetry = activeBackoffMin
 )
 
 // connector is the only dialer of global peers. It keeps at most
 // MaxConnections peers connected, chosen to cover the loaded spaces
 // (own devices first, then most recently seen), one dial at a time,
-// rate-limited, with per-peer backoff by tier. Every other consumer of
-// global peers only picks live connections from the pool.
+// rate-limited, with per-peer backoff by tier. Beyond the cover it dials
+// only on demand (see demand). Every other consumer of global peers
+// only picks live connections from the pool.
 type connector struct {
 	g *Global
 
 	mu       sync.Mutex
 	next     map[string]time.Time
 	attempts []time.Time
+	demands  []*demand
 	wake     chan struct{}
 	power    atomic.Int32
+}
+
+// demand is a caller waiting for one more live peer of a space: a file
+// fetch whose holder is not among the connected peers. The connector
+// owns it once queued; the caller only reads res.
+type demand struct {
+	ctx     context.Context
+	spaceId string
+	// prefer is the account identity whose devices are dialed first.
+	prefer string
+	// skip holds the peers the caller already asked, plus the ones this
+	// demand failed to dial.
+	skip map[string]struct{}
+	// res receives the peer id, empty when no candidate is left.
+	res chan string
 }
 
 func newConnector(g *Global) *connector {
@@ -108,8 +133,12 @@ type peerInfo struct {
 }
 
 // step plans once and dials at most one peer. Returns how long to
-// sleep without a wake-up.
+// sleep without a wake-up. A demand goes ahead of the cover and of the
+// power hint: it exists only while a caller waits.
 func (c *connector) step(ctx context.Context) time.Duration {
+	if d := c.nextDemand(); d != nil {
+		return c.serveDemand(ctx, d)
+	}
 	if sdkp2p.PowerHint(c.power.Load()) == sdkp2p.PowerLow {
 		return idleCheck
 	}
@@ -169,8 +198,116 @@ func (c *connector) step(ctx context.Context) time.Duration {
 	if wait := c.rateLimitWait(now); wait > 0 {
 		return wait
 	}
-	c.dial(ctx, dial)
+	c.dial(ctx, dial, globalPeerTTL, nil)
 	return 0
+}
+
+// connectOne queues a demand and waits for its answer: the id of a live
+// peer of the space outside skip, ok=false when no candidate is left or
+// ctx ends first. A dial in flight when ctx ends still completes.
+func (c *connector) connectOne(ctx context.Context, spaceId, prefer string, skip []string) (string, bool) {
+	d := &demand{ctx: ctx, spaceId: spaceId, prefer: prefer, skip: make(map[string]struct{}, len(skip)), res: make(chan string, 1)}
+	for _, id := range skip {
+		d.skip[id] = struct{}{}
+	}
+	c.mu.Lock()
+	c.demands = append(c.demands, d)
+	c.mu.Unlock()
+	c.wakeUp()
+	select {
+	case id := <-d.res:
+		return id, id != ""
+	case <-ctx.Done():
+		return "", false
+	}
+}
+
+// nextDemand returns the oldest demand somebody still waits for.
+func (c *connector) nextDemand() *demand {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.demands = slices.DeleteFunc(c.demands, func(d *demand) bool { return d.ctx.Err() != nil })
+	if len(c.demands) == 0 {
+		return nil
+	}
+	return c.demands[0]
+}
+
+// answer takes a demand off the queue and hands its result over.
+func (c *connector) answer(d *demand, peerId string) {
+	c.mu.Lock()
+	c.demands = slices.DeleteFunc(c.demands, func(q *demand) bool { return q == d })
+	c.mu.Unlock()
+	d.res <- peerId
+}
+
+// serveDemand advances one demand by at most one dial: it answers with
+// a connected peer the caller has not asked, dials the next candidate,
+// or answers empty when none is left. A failed dial keeps the demand
+// queued for the candidate after it.
+func (c *connector) serveDemand(ctx context.Context, d *demand) time.Duration {
+	g := c.g
+	now := g.now()
+	var target string
+	for _, id := range c.demandOrder(d) {
+		if _, ok := d.skip[id]; ok {
+			continue
+		}
+		if g.connected(id) {
+			c.answer(d, id)
+			return 0
+		}
+		if rec, ok := g.status.Get(id); ok && rec.Failures > 0 && now.Sub(rec.LastAttempt) < demandRetry {
+			continue
+		}
+		if target == "" {
+			target = id
+		}
+	}
+	// a demand never takes the headroom left for inbound connections
+	if target == "" || g.liveCount() >= 2*g.cfg.MaxConnections {
+		c.answer(d, "")
+		return 0
+	}
+	if wait := c.rateLimitWait(now); wait > 0 {
+		return wait
+	}
+	answered := false
+	live := c.dial(ctx, target, demandPeerTTL, func() {
+		answered = true
+		c.answer(d, target)
+	})
+	switch {
+	case answered:
+	case live:
+		c.answer(d, target)
+	default:
+		d.skip[target] = struct{}{}
+	}
+	return 0
+}
+
+// demandOrder ranks the dialable peers of a demand's space: devices of
+// the preferred identity, then own devices, then the rest, each group
+// most recently seen first.
+func (c *connector) demandOrder(d *demand) []string {
+	g := c.g
+	ids := c.dialable(g.store.GlobalPeerIds(d.spaceId))
+	rank := func(id string) int {
+		switch identity := g.peerIdentity(id); {
+		case d.prefer != "" && identity == d.prefer:
+			return 0
+		case g.selfIdentity != "" && identity == g.selfIdentity:
+			return 1
+		}
+		return 2
+	}
+	ranks := make(map[string]int, len(ids))
+	for _, id := range ids {
+		ranks[id] = rank(id)
+	}
+	slices.SortStableFunc(ids, func(a, b string) int { return ranks[a] - ranks[b] })
+	return ids
 }
 
 // accountCover is the bucket the account's own devices are covered
@@ -312,17 +449,20 @@ func (c *connector) forget(peerId string) {
 // DialTimeout) and the connection is handed to the pool as an
 // incoming-style peer. Going around pool.Get means no in-flight pool
 // load ever exists for a global peer, so every Pick answers at once.
-func (c *connector) dial(ctx context.Context, peerId string) {
+// ttl is the connection's pool TTL. onLive, when set, runs as soon as a
+// dialed connection is usable, before the wait that tells a refusal
+// from a connection. Reports whether the peer is connected.
+func (c *connector) dial(ctx context.Context, peerId string, ttl time.Duration, onLive func()) bool {
 	g := c.g
 	now := g.now()
 	// the plan is stale by now if the peer connected to us in between:
 	// dialing back would replace the accepted connection and kill both
 	if g.connected(peerId) {
-		return
+		return true
 	}
 	if p := g.pickIroh(peerId); p != nil {
 		g.addLive(p)
-		return
+		return true
 	}
 	c.mu.Lock()
 	c.attempts = append(c.attempts, now)
@@ -338,14 +478,17 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 		c.mu.Lock()
 		c.next[peerId] = now.Add(addrsNotFoundRetry)
 		c.mu.Unlock()
-		return
+		return false
 	}
 	if err == nil {
-		p.SetTTL(globalPeerTTL)
+		p.SetTTL(ttl)
 		if err = g.pool.AddPeer(ctx, p); err != nil {
 			_ = p.Close()
 		} else {
 			g.addLive(p)
+			if onLive != nil {
+				onLive()
+			}
 			// a peer that refuses us after the handshake closes at once:
 			// that is a failed dial, not a connection
 			select {
@@ -371,6 +514,7 @@ func (c *connector) dial(ctx context.Context, peerId string) {
 	} else {
 		log.Debug("global peer dial failed", zap.String("peerId", peerId), zap.Int("failures", rec.Failures), zap.Error(err))
 	}
+	return ok
 }
 
 // errRefusedAfterHandshake is a dial the peer closed within

@@ -33,9 +33,16 @@ var testBudgets = budgets{
 }
 
 func newTestSource(pool DialPool, peers LocalPeers) *Source {
-	s := NewSource(pool, peers)
+	s := NewSource(pool, peers, nil)
 	s.b = testBudgets
 	return s
+}
+
+// query asks for the test file in a space, as a fetch that has a public
+// object to fall back on.
+func query(t *testing.T, spaceId string) fetch.PeerQuery {
+	t.Helper()
+	return fetch.PeerQuery{SpaceId: spaceId, Root: testCid(t)}
 }
 
 // isBanned reports a peer that selection skips right now, banned or
@@ -117,7 +124,7 @@ func TestSourceGlobalPeersPickOnly(t *testing.T) {
 	src := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
 	start := time.Now()
-	_, _, err := src.SourceFor(context.Background(), "s", testCid(t))
+	_, _, err := src.SourceFor(context.Background(), query(t, "s"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Less(t, time.Since(start), testBudgets.globalPeer, "a disconnected global peer is skipped, never dialed")
 	require.Equal(t, 0, pool.gets, "pool.Get never reaches a global peer")
@@ -140,7 +147,7 @@ func TestSourceGlobalPeersBoundedPick(t *testing.T) {
 	src := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
 	start := time.Now()
-	_, _, err := src.SourceFor(context.Background(), "s", testCid(t))
+	_, _, err := src.SourceFor(context.Background(), query(t, "s"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Less(t, time.Since(start), testBudgets.globalPeer, "each global lookup is bounded well below the per-peer budget")
 	require.Equal(t, 0, pool.gets)
@@ -177,7 +184,7 @@ func TestSourceGlobalPeerGetsARelaySizedBudget(t *testing.T) {
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
 
 	start := time.Now()
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	elapsed := time.Since(start)
 
 	require.ErrorIs(t, err, fetch.ErrNotAvailable, "the stub holds nothing, so selection still fails")
@@ -202,7 +209,7 @@ func TestSourceLanPeerKeepsTheShortBudget(t *testing.T) {
 	}}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"l1", "l2"}})
 
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, []string{"l1", "l2"}, pool.asked,
@@ -255,7 +262,7 @@ func TestSourceBansArePerLayer(t *testing.T) {
 	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
 	s := newTestSource(pool, bothLayerPeers{lan: []string{"d1"}, global: []string{"d1"}})
 	// A LAN dial that never answers backs the LAN entry off.
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, 1, pool.gets)
 	require.Equal(t, 1, pool.picks, "the global layer still consults the device")
@@ -263,7 +270,7 @@ func TestSourceBansArePerLayer(t *testing.T) {
 	require.False(t, s.isBanned("d1", true), "the relayed path to the same device must survive")
 
 	// The next selection skips the LAN dial and still picks the device.
-	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err = s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, 1, pool.gets, "the LAN path is not dialed again inside its backoff")
 	require.Equal(t, 2, pool.picks, "the relayed path is still consulted")
@@ -278,7 +285,7 @@ func TestSourceDoesNotBanOnCallerCancel(t *testing.T) {
 	pool := &cancellingDialPool{cancel: cancel}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
 
-	_, _, err := s.SourceFor(ctx, "space1", testCid(t))
+	_, _, err := s.SourceFor(ctx, query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	s.banMu.Lock()
 	n := len(s.banned)
@@ -314,7 +321,7 @@ func TestSourceDoesNotBanOnLayerClock(t *testing.T) {
 	require.Greater(t, 2*testBudgets.globalPeer, testBudgets.globalSweep)
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.True(t, s.isBanned("g1", true), "exhausted its own budget")
 	require.False(t, s.isBanned("g2", true), "cut off by the layer clock, not by its own budget")
@@ -328,13 +335,13 @@ func TestSourceDoesNotBanOnLayerClock(t *testing.T) {
 func TestSourceDoesNotBanOnInheritedCancel(t *testing.T) {
 	pool := &dialErrPool{err: context.Canceled}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.False(t, s.isBanned("d1", false), "someone else's cancel says nothing about the peer")
 
 	pool = &dialErrPool{err: context.DeadlineExceeded}
 	s = newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
-	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err = s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.True(t, s.isBanned("d1", false), "the dial's own timeout means the peer is unreachable")
 }
@@ -360,7 +367,7 @@ func TestSourceLayersDoNotStarveEachOther(t *testing.T) {
 	}
 	s := newTestSource(pool, bothLayerPeers{lan: lan, global: []string{"g1"}})
 
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable, "the stub reports nothing held")
 	require.Less(t, pool.gets, len(lan), "the LAN clock bounds the stale dials")
 	require.Positive(t, pool.picks, "the global layer must still be reached")
@@ -384,7 +391,7 @@ func TestSourceGlobalLayerAsksAtMostMaxCandidates(t *testing.T) {
 	pool := &hangingDialPool{connected: connected}
 	s := newTestSource(pool, globalOnlyPeers{global: global})
 
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, maxCandidates, pool.picks, "twenty answering peers must not all be asked")
 }
@@ -397,7 +404,7 @@ func TestSourceGlobalOfflineIdsDoNotHideTheHolder(t *testing.T) {
 	pool := &hangingDialPool{connected: map[string]peer.Peer{"g4": holderPeer{id: "g4"}}}
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2", "g3", "g4"}})
 
-	src, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	src, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.NoError(t, err, "the connected holder ranked behind three offline ids must be asked")
 	require.Equal(t, "g4", src.(*peerCar).peerId)
 	for _, id := range []string{"g1", "g2", "g3"} {
@@ -420,20 +427,20 @@ func TestSourceAsksAFailedPeerAgainAfterItsBackoff(t *testing.T) {
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
 	s.b.backoffMin, s.b.backoffMax = 40*time.Millisecond, time.Second
 
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.ErrorContains(t, err, "1 peer(s) that may hold it did not answer",
 		"the failure names the holder that did not answer")
 	require.Equal(t, 1, pool.picks)
 
-	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err = s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorContains(t, err, "1 peer(s) that may hold it did not answer")
 	require.Equal(t, 1, pool.picks, "a burst of fetches probes the failed peer once")
 
 	// The peer is back.
 	pool.connected["g1"] = holderPeer{id: "g1"}
 	time.Sleep(2 * s.b.backoffMin)
-	src, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	src, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.NoError(t, err, "past the backoff the holder is asked again")
 	require.Equal(t, "g1", src.(*peerCar).peerId)
 	s.banMu.Lock()
@@ -479,7 +486,116 @@ func TestSourceBanSurvivesAnAnswer(t *testing.T) {
 // reachable holds the file.
 func TestSourceWithoutCandidatesSaysNobodyHoldsIt(t *testing.T) {
 	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{global: []string{"g1"}})
-	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
 	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.ErrorContains(t, err, "no reachable peer holds it")
+}
+
+// fakeDialer connects the next scripted peer on each call, as the
+// connector would, and records what it was asked.
+type fakeDialer struct {
+	pool    *hangingDialPool
+	connect []peer.Peer
+	calls   []dialCall
+}
+
+type dialCall struct {
+	spaceId, prefer string
+	skip            []string
+}
+
+func (d *fakeDialer) ConnectOne(_ context.Context, spaceId, prefer string, skip []string) (string, bool) {
+	d.calls = append(d.calls, dialCall{spaceId, prefer, append([]string(nil), skip...)})
+	if len(d.connect) == 0 {
+		return "", false
+	}
+	p := d.connect[0]
+	d.connect = d.connect[1:]
+	d.pool.mu.Lock()
+	d.pool.connected[p.Id()] = p
+	d.pool.mu.Unlock()
+	return p.Id(), true
+}
+
+func soleQuery(t *testing.T, author string) fetch.PeerQuery {
+	t.Helper()
+	return fetch.PeerQuery{SpaceId: "space1", Root: testCid(t), Author: author, Sole: true}
+}
+
+// A file nothing else can serve, held by a peer that is not connected:
+// the source has the connector dial for it — the peers it already asked
+// excluded, the author named — and selects the holder that comes up.
+// The source itself still never dials a global peer.
+func TestSourceDialsAnUnconnectedHolder(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"g1": stubPeer{id: "g1"}}}
+	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2", "g3"}})
+	dialer := &fakeDialer{pool: pool, connect: []peer.Peer{notFullPeer{id: "g2"}, holderPeer{id: "g3"}}}
+	s.dialer = dialer
+
+	src, ban, err := s.SourceFor(context.Background(), soleQuery(t, "author"))
+	require.NoError(t, err)
+	require.Equal(t, "g3", src.(*peerCar).peerId)
+	require.True(t, src.(*peerCar).global)
+	require.Equal(t, []dialCall{
+		{"space1", "author", []string{"g1"}},
+		{"space1", "author", []string{"g1", "g2"}},
+	}, dialer.calls)
+	require.Zero(t, pool.gets, "pool.Get never reaches a global peer")
+
+	ban()
+	require.True(t, s.isBanned("g3", true), "the ban hook covers a dialed holder")
+}
+
+// With a public object to fall back on, nothing is dialed: global peers
+// are used only while connected.
+func TestSourceDoesNotDialWhenAnotherSourceExists(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
+	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
+	dialer := &fakeDialer{pool: pool, connect: []peer.Peer{holderPeer{id: "g1"}}}
+	s.dialer = dialer
+
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.Empty(t, dialer.calls)
+}
+
+// One fetch has at most maxDemandDials peers dialed, and a peer sitting
+// out a backoff is not handed back by the dialer.
+func TestSourceBoundsItsDemandDials(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
+	global := []string{"down"}
+	var connect []peer.Peer
+	for i := 0; i < maxDemandDials+2; i++ {
+		id := "g" + string(rune('a'+i))
+		global = append(global, id)
+		connect = append(connect, notFullPeer{id: id})
+	}
+	s := newTestSource(pool, globalOnlyPeers{global: global})
+	s.unreachable("down", true)
+	dialer := &fakeDialer{pool: pool, connect: connect}
+	s.dialer = dialer
+
+	_, _, err := s.SourceFor(context.Background(), soleQuery(t, ""))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.Len(t, dialer.calls, maxDemandDials)
+	for _, call := range dialer.calls {
+		require.Contains(t, call.skip, "down")
+	}
+}
+
+// notFullPeer answers FileCheck with nothing held.
+type notFullPeer struct {
+	peer.Peer
+	id string
+}
+
+func (n notFullPeer) Id() string { return n.id }
+func (n notFullPeer) DoDrpc(_ context.Context, do func(conn drpc.Conn) error) error {
+	return do(emptyConn{})
+}
+
+type emptyConn struct{ drpc.Conn }
+
+func (emptyConn) Invoke(context.Context, string, drpc.Encoding, drpc.Message, drpc.Message) error {
+	return nil
 }

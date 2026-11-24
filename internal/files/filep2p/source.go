@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -64,6 +65,9 @@ const (
 	// banTTL keeps a peer that served invalid content, or stalled a read
 	// that has a fallback, out of selection.
 	banTTL = 5 * time.Minute
+	// maxDemandDials caps the peers one fetch has the connector dial for
+	// a file nothing else can serve.
+	maxDemandDials = 3
 	// backoffMin / backoffMax bound how long a peer that failed a dial or
 	// a FileCheck is skipped; the wait doubles per consecutive failure. A
 	// burst of fetches probes a dead peer once, and the only holder of a
@@ -93,7 +97,7 @@ var defaultBudgets = budgets{
 }
 
 // LocalPeers is the slice of the p2p peer store this source needs: LAN
-// peers are dialed (bounded), global peers only used while connected.
+// peers are dialed (bounded), global peers used while connected.
 type LocalPeers interface {
 	LocalPeerIds(spaceId string) []string
 	GlobalPeerIds(spaceId string) []string
@@ -106,23 +110,35 @@ type DialPool interface {
 	Pick(ctx context.Context, id string) (peer.Peer, error)
 }
 
+// Dialer brings up one more global peer of a space on request: a peer
+// outside skip, devices of the prefer identity first. The global
+// layer's connector implements it; it stays the only dialer.
+type Dialer interface {
+	ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, ok bool)
+}
+
 // Source is the fetch.PeerSource: it finds a peer that holds a file in
-// full — on the LAN first, then among the connected global peers — and
-// hands back a Car reader over the FileP2P ObjectRead RPC. Each layer
-// sweeps under its own clock and per-candidate budget, and a peer that
-// fails is skipped on that layer for a while, so selection never stalls
-// a fetch when no peer has the file.
+// full — on the LAN first, then among the connected global peers, then,
+// for a file nothing else can serve, among global peers it has the
+// connector dial — and hands back a Car reader over the FileP2P
+// ObjectRead RPC. Each layer sweeps under its own clock and
+// per-candidate budget, and a peer that fails is skipped on that layer
+// for a while, so selection never stalls a fetch when no peer has the
+// file.
 type Source struct {
-	pool  DialPool
-	peers LocalPeers
-	b     budgets
+	pool   DialPool
+	peers  LocalPeers
+	dialer Dialer
+	b      budgets
 
 	banMu  sync.Mutex
 	banned map[banKey]exclusion
 }
 
-func NewSource(pool DialPool, peers LocalPeers) *Source {
-	return &Source{pool: pool, peers: peers, b: defaultBudgets, banned: map[banKey]exclusion{}}
+// NewSource builds the source. dialer is nil when the global layer is
+// off: global peers are then used only while connected.
+func NewSource(pool DialPool, peers LocalPeers, dialer Dialer) *Source {
+	return &Source{pool: pool, peers: peers, dialer: dialer, b: defaultBudgets, banned: map[banKey]exclusion{}}
 }
 
 var (
@@ -130,26 +146,26 @@ var (
 	_ fetch.PeerReadBudgeter = (*peerCar)(nil)
 )
 
-// SourceFor returns a peer-backed Car reader for (spaceId, root) when a
-// selectable peer reports holding the file in full, plus a hook to ban
-// that peer (called by the fetcher if it serves invalid bytes). The
-// error wraps fetch.ErrNotAvailable and says whether peers that may
-// hold the file are only waiting out a backoff.
+// SourceFor returns a peer-backed Car reader for the queried file when
+// a selectable peer reports holding it in full, plus a hook to ban that
+// peer (called by the fetcher if it serves invalid bytes). The error
+// wraps fetch.ErrNotAvailable and says whether peers that may hold the
+// file are only waiting out a backoff.
 //
 // Each layer gets its own try count AND its own clock. Sharing either
 // starves the global layer: LAN ids come first and a handful of stale
 // ones exhaust a shared budget before any relayed peer is asked.
-func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (fetch.CarSource, func(), error) {
+func (s *Source) SourceFor(ctx context.Context, q fetch.PeerQuery) (fetch.CarSource, func(), error) {
 	layers := []struct {
 		ids    func() []string
 		global bool
 		sweep  time.Duration
 	}{
-		{ids: func() []string { return s.peers.LocalPeerIds(spaceId) }, sweep: s.b.lanSweep},
+		{ids: func() []string { return s.peers.LocalPeerIds(q.SpaceId) }, sweep: s.b.lanSweep},
 		// Built lazily: resolving the global set unions in every
 		// account peer and ranks them, all wasted when a LAN peer
 		// answers first.
-		{ids: func() []string { return s.peers.GlobalPeerIds(spaceId) }, global: true, sweep: s.b.globalSweep},
+		{ids: func() []string { return s.peers.GlobalPeerIds(q.SpaceId) }, global: true, sweep: s.b.globalSweep},
 	}
 	var candidates []banKey
 	for _, layer := range layers {
@@ -157,14 +173,56 @@ func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (f
 		for _, id := range ids {
 			candidates = append(candidates, banKey{id, layer.global})
 		}
+		selectable := s.filterBanned(ids, layer.global)
 		lctx, cancel := context.WithTimeout(ctx, layer.sweep)
-		src, ban, ok := s.sweepLayer(lctx, s.filterBanned(ids, layer.global), layer.global, spaceId, root)
+		car, asked := s.sweepLayer(lctx, selectable, layer.global, q)
+		if car == nil && layer.global {
+			// asked peers and the ones sitting out a backoff are not
+			// handed back by the dialer
+			car = s.dialHolder(lctx, q, append(asked, excluded(ids, selectable)...))
+		}
 		cancel()
-		if ok {
-			return src, ban, nil
+		if car != nil {
+			return car, func() { s.ban(car.peerId, car.global) }, nil
 		}
 	}
 	return nil, nil, s.unavailable(candidates)
+}
+
+// excluded returns the ids filterBanned dropped.
+func excluded(ids, selectable []string) []string {
+	var out []string
+	for _, id := range ids {
+		if !slices.Contains(selectable, id) {
+			out = append(out, id)
+		}
+	}
+	return out
+}
+
+// dialHolder has the connector bring up global peers that are not
+// connected, one at a time, and asks each for the file — only for a
+// file nothing else can serve, and inside the global layer's clock. A
+// dial still in flight when the clock ends completes on its own, so the
+// next fetch finds that peer connected.
+func (s *Source) dialHolder(lctx context.Context, q fetch.PeerQuery, skip []string) *peerCar {
+	if !q.Sole || s.dialer == nil {
+		return nil
+	}
+	for range maxDemandDials {
+		if lctx.Err() != nil {
+			return nil
+		}
+		id, ok := s.dialer.ConnectOne(lctx, q.SpaceId, q.Author, skip)
+		if !ok {
+			return nil
+		}
+		skip = append(skip, id)
+		if _, full := s.holdsFull(lctx, id, true, q.SpaceId, q.Root); full {
+			return &peerCar{pool: s.pool, peerId: id, global: true, spaceId: q.SpaceId, root: q.Root}
+		}
+	}
+	return nil
 }
 
 // unavailable is the selection's failure: a plain "nobody holds it", or
@@ -198,28 +256,26 @@ func (s *Source) unavailable(candidates []banKey) error {
 }
 
 // sweepLayer asks up to maxCandidates peers of one layer, under lctx,
-// this layer's clock. Candidates that are never reached — a dead LAN
-// dial, a global id with no live connection — are skipped without
+// this layer's clock, and returns the holder's reader (nil when none)
+// with the peers it asked. Candidates that are never reached — a dead
+// LAN dial, a global id with no live connection — are skipped without
 // counting: the clock bounds them, and the global ranking is by last
 // seen, not connectivity, so a connected holder may sit behind several
 // offline ids.
-func (s *Source) sweepLayer(lctx context.Context, ids []string, global bool, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
-	asked := 0
+func (s *Source) sweepLayer(lctx context.Context, ids []string, global bool, q fetch.PeerQuery) (car *peerCar, asked []string) {
 	for _, id := range ids {
-		if asked >= maxCandidates || lctx.Err() != nil {
+		if len(asked) >= maxCandidates || lctx.Err() != nil {
 			break
 		}
-		reached, full := s.holdsFull(lctx, id, global, spaceId, root)
+		reached, full := s.holdsFull(lctx, id, global, q.SpaceId, q.Root)
 		if reached {
-			asked++
+			asked = append(asked, id)
 		}
 		if full {
-			peerId := id
-			car := &peerCar{pool: s.pool, peerId: peerId, global: global, spaceId: spaceId, root: root}
-			return car, func() { s.ban(peerId, global) }, true
+			return &peerCar{pool: s.pool, peerId: id, global: global, spaceId: q.SpaceId, root: q.Root}, asked
 		}
 	}
-	return nil, nil, false
+	return nil, asked
 }
 
 // holdsFull reaches one peer (under its own budget) and asks whether it

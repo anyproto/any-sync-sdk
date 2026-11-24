@@ -301,6 +301,15 @@ func (g *Global) Close(_ context.Context) error {
 	return g.status.Close()
 }
 
+// ConnectOne asks the connector for one more live peer of a space and
+// waits for it: a peer outside skip, devices of the prefer identity
+// first. ok=false when no candidate is left, the connection ceiling is
+// reached or ctx ends. For a caller with no other way to its data — a
+// file only a peer holds; the cover alone decides what stays connected.
+func (g *Global) ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, ok bool) {
+	return g.conn.connectOne(ctx, spaceId, prefer, skip)
+}
+
 // SpaceLoaded registers a loaded space: its records are read, its
 // applied writes followed, and the own record published (or re-set
 // when stale). Local-only and guest spaces must not be registered.

@@ -153,9 +153,12 @@ doubling to 10 min.
 plaintext. Content resolves through a source ladder:
 
 1. Local store.
-2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`).
-   Peers serve ciphertext and every block is CID-verified, so a peer
-   can neither read nor corrupt content.
+2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`):
+   a LAN peer, then a connected global peer. For a file that is not
+   durable, global peers that are not connected are dialed too
+   ([global-p2p](global-p2p.md) § Budget). Peers serve ciphertext and
+   every block is CID-verified, so a peer can neither read nor corrupt
+   content.
 3. Public HTTP GET with Range on `{publicReadBaseUrl}/blob/{spaceId}/{rootCid}`,
    for durable files only. The base URL is resolved once from the
    network's fileV2 nodes and cached; `config.Files.PublicReadBaseUrl`

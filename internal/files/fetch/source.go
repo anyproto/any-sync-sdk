@@ -41,7 +41,19 @@ type CarSource interface {
 // LAN one, so an unbounded sweep would spike latency exactly when no
 // peer has the file.
 type PeerSource interface {
-	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), err error)
+	SourceFor(ctx context.Context, q PeerQuery) (src CarSource, ban func(), err error)
+}
+
+// PeerQuery names the file a peer is wanted for.
+type PeerQuery struct {
+	SpaceId string
+	Root    cid.Cid
+	// Author is the account that registered the file ("" when unknown):
+	// its devices are tried first when a peer has to be dialed.
+	Author string
+	// Sole reports that no other source can serve the file. Only then
+	// may the peer layer dial a peer it is not connected to.
+	Sole bool
 }
 
 // peerPreferDeadline bounds each read from a LAN peer. On a healthy

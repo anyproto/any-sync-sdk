@@ -12,6 +12,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"go.uber.org/zap"
 
+	"github.com/anyproto/any-sync-sdk/internal/files/fetch"
 	"github.com/anyproto/any-sync-sdk/internal/files/status"
 	filestore "github.com/anyproto/any-sync-sdk/internal/files/store"
 	"github.com/anyproto/any-sync-sdk/internal/files/upload"
@@ -165,7 +166,12 @@ func (f *filesAPI) openRow(ctx context.Context, row payloads.Row) (space.FileRea
 	if err != nil {
 		return nil, fmt.Errorf("files: row %s rootCid: %w", row.Id, err)
 	}
-	return f.s.parent.fetch.Open(ctx, f.s.id, root, row.Enc.Key, row.NetworkSign != "", row.Id)
+	return f.s.parent.fetch.Open(ctx, fetchObject(f.s.id, root, row), row.Enc.Key, row.Id)
+}
+
+// fetchObject names a row's content for the fetch service.
+func fetchObject(spaceId string, root cid.Cid, row payloads.Row) fetch.Object {
+	return fetch.Object{SpaceId: spaceId, Root: root, Durable: row.NetworkSign != "", Author: row.Author}
 }
 
 // resolveVariant finds the sibling row tagged {variantOf: orig,

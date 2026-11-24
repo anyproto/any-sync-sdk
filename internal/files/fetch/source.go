@@ -33,13 +33,15 @@ type CarSource interface {
 // network or, more slowly, across the internet. It returns a
 // CarSource that reads the file's CAR object from that peer, plus a ban
 // hook the fetcher calls when the peer serves INVALID bytes (so a bad
-// peer is not re-selected). ok=false — no peer holds the file / p2p
-// disabled — means the fetch uses the public GET only. Selection is
-// bounded as a whole, not only per candidate: a relayed FileCheck is
-// orders of magnitude slower than a LAN one, so an unbounded sweep
-// would spike latency exactly when no peer has the file.
+// peer is not re-selected). An error — no peer holds the file, or none
+// answers right now — means the fetch uses the public GET only; it
+// wraps ErrNotAvailable and is what the fetch reports when there is no
+// public object either. Selection is bounded as a whole, not only per
+// candidate: a relayed FileCheck is orders of magnitude slower than a
+// LAN one, so an unbounded sweep would spike latency exactly when no
+// peer has the file.
 type PeerSource interface {
-	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), ok bool)
+	SourceFor(ctx context.Context, spaceId string, root cid.Cid) (src CarSource, ban func(), err error)
 }
 
 // peerPreferDeadline bounds each read from a LAN peer. On a healthy
@@ -97,11 +99,15 @@ func (fs *fetchSources) peerDeadline(length int64) time.Duration {
 // than one per Open (a read error only demotes; selection already
 // admitted the peer, and the next Open would admit it again). A caller
 // giving up (ctx done) says nothing about the peer. With no fallback
-// the error surfaces and the peer stays: it is the only source, and
-// the next block retries it.
+// the peer stays — it is the only source, and the next block retries
+// it — and the failure is ErrNotAvailable: the bytes exist, this
+// device cannot get them now.
 func (fs *fetchSources) peerReadFailed(ctx context.Context, expired bool, err error) error {
 	if fs.http == nil {
-		return err
+		if ctx.Err() != nil {
+			return err
+		}
+		return fmt.Errorf("%w: peer read failed: %v", ErrNotAvailable, err)
 	}
 	fs.peerOff = true
 	if expired && ctx.Err() == nil && fs.banPeer != nil {
@@ -120,8 +126,9 @@ func (fs *fetchSources) peerReadFailed(ctx context.Context, expired bool, err er
 //     back to HTTP (a bad peer must never make a durable file unreadable);
 //   - peer read errors → demote for the rest of this fetch when HTTP
 //     exists; a read that exhausted the peer's own budget also bans it
-//     (see peerReadFailed). With no HTTP fallback, surface the error
-//     and keep the peer for the next block (it is the only source).
+//     (see peerReadFailed). With no HTTP fallback, fail the read as
+//     ErrNotAvailable and keep the peer for the next block (it is the
+//     only source).
 //
 // One fetchSources per fetch; not shared across goroutines.
 type fetchSources struct {

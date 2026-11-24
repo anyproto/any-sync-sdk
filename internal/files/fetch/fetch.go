@@ -227,12 +227,13 @@ func (s *Service) seed(ctx context.Context, spaceId string, root cid.Cid, durabl
 	return h, src, nil
 }
 
-// source builds the CAR object reader for a fetch: a LAN peer that holds
+// source builds the CAR object reader for a fetch: a peer that holds
 // the file (preferred — free, works offline) laddered over the public
 // HTTP object (durable files only). Returns ErrNotAvailable only when
 // NEITHER is available (not durable / no public base AND no peer holds
-// it). The peer is tried first per read with a bounded deadline and
-// demoted to HTTP on the first failure (see ladderedCar).
+// it); the peer selection's own reason is kept. The peer is tried first
+// per read with a bounded deadline and demoted to HTTP on the first
+// failure (see fetchSources).
 func (s *Service) source(ctx context.Context, spaceId string, root cid.Cid, durable bool) (*fetchSources, error) {
 	fs := &fetchSources{}
 	// A typed-nil *remoteCar must NOT be stored in the CarSource
@@ -243,15 +244,24 @@ func (s *Service) source(ctx context.Context, spaceId string, root cid.Cid, dura
 		// No peer to try and no HTTP: surface why HTTP is unavailable.
 		return nil, httpErr
 	}
+	var peerErr error
 	if s.peer != nil {
-		if src, ban, ok := s.peer.SourceFor(ctx, spaceId, root); ok {
+		src, ban, err := s.peer.SourceFor(ctx, spaceId, root)
+		if err == nil {
 			fs.peer, fs.banPeer = src, ban
 		}
+		peerErr = err
 	}
-	if !fs.available() {
+	if fs.available() {
+		return fs, nil
+	}
+	switch {
+	case peerErr == nil:
 		return nil, ErrNotAvailable
+	case errors.Is(peerErr, ErrNotAvailable):
+		return nil, peerErr
 	}
-	return fs, nil
+	return nil, fmt.Errorf("%w: %v", ErrNotAvailable, peerErr)
 }
 
 // httpSource builds the public-object range reader; ErrNotAvailable when

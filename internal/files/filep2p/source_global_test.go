@@ -27,6 +27,9 @@ var testBudgets = budgets{
 	globalPeer:  perGlobalPeerTimeout / testScale,
 	lanSweep:    maxLanSweep / testScale,
 	globalSweep: maxGlobalSweep / testScale,
+	ban:         banTTL,
+	backoffMin:  backoffMin,
+	backoffMax:  backoffMax,
 }
 
 func newTestSource(pool DialPool, peers LocalPeers) *Source {
@@ -35,11 +38,13 @@ func newTestSource(pool DialPool, peers LocalPeers) *Source {
 	return s
 }
 
+// isBanned reports a peer that selection skips right now, banned or
+// backing off.
 func (s *Source) isBanned(peerId string, global bool) bool {
 	s.banMu.Lock()
 	defer s.banMu.Unlock()
-	_, banned := s.banned[banKey{peerId, global}]
-	return banned
+	e, ok := s.banned[banKey{peerId, global}]
+	return ok && time.Now().Before(e.until)
 }
 
 type globalOnlyPeers struct{ global []string }
@@ -112,12 +117,12 @@ func TestSourceGlobalPeersPickOnly(t *testing.T) {
 	src := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
 	start := time.Now()
-	_, _, ok := src.SourceFor(context.Background(), "s", testCid(t))
-	require.False(t, ok)
+	_, _, err := src.SourceFor(context.Background(), "s", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Less(t, time.Since(start), testBudgets.globalPeer, "a disconnected global peer is skipped, never dialed")
 	require.Equal(t, 0, pool.gets, "pool.Get never reaches a global peer")
 
-	// A disconnected global peer is not banned: it is simply not
+	// A disconnected global peer is not sidelined: it is simply not
 	// connected right now.
 	require.False(t, src.isBanned("g2", true))
 }
@@ -135,8 +140,8 @@ func TestSourceGlobalPeersBoundedPick(t *testing.T) {
 	src := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
 	start := time.Now()
-	_, _, ok := src.SourceFor(context.Background(), "s", testCid(t))
-	require.False(t, ok)
+	_, _, err := src.SourceFor(context.Background(), "s", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Less(t, time.Since(start), testBudgets.globalPeer, "each global lookup is bounded well below the per-peer budget")
 	require.Equal(t, 0, pool.gets)
 }
@@ -172,10 +177,10 @@ func TestSourceGlobalPeerGetsARelaySizedBudget(t *testing.T) {
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
 
 	start := time.Now()
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
 	elapsed := time.Since(start)
 
-	require.False(t, ok, "the stub holds nothing, so selection still fails")
+	require.ErrorIs(t, err, fetch.ErrNotAvailable, "the stub holds nothing, so selection still fails")
 	require.GreaterOrEqual(t, elapsed, slow.delay,
 		"the check was cut off at the LAN budget instead of being awaited")
 	require.Less(t, elapsed, testBudgets.globalPeer, "and it must still be bounded")
@@ -197,9 +202,9 @@ func TestSourceLanPeerKeepsTheShortBudget(t *testing.T) {
 	}}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"l1", "l2"}})
 
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
 
-	require.False(t, ok)
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, []string{"l1", "l2"}, pool.asked,
 		"a LAN FileCheck must not get the relayed budget")
 }
@@ -249,32 +254,32 @@ func TestPeerCarReadBudgetIsPerLayer(t *testing.T) {
 func TestSourceBansArePerLayer(t *testing.T) {
 	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
 	s := newTestSource(pool, bothLayerPeers{lan: []string{"d1"}, global: []string{"d1"}})
-	// A LAN dial that never answers bans the LAN entry.
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
+	// A LAN dial that never answers backs the LAN entry off.
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, 1, pool.gets)
 	require.Equal(t, 1, pool.picks, "the global layer still consults the device")
-	require.True(t, s.isBanned("d1", false), "the failing LAN path is banned")
+	require.True(t, s.isBanned("d1", false), "the failing LAN path is backed off")
 	require.False(t, s.isBanned("d1", true), "the relayed path to the same device must survive")
 
 	// The next selection skips the LAN dial and still picks the device.
-	_, _, ok = s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
-	require.Equal(t, 1, pool.gets, "the banned LAN path is not dialed again")
+	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.Equal(t, 1, pool.gets, "the LAN path is not dialed again inside its backoff")
 	require.Equal(t, 2, pool.picks, "the relayed path is still consulted")
 }
 
-// The caller giving up must not be recorded against the peer: banning
-// on an aborted download would hide the one device holding the file
-// for banTTL. The cancel has to land MID-DIAL — a context already dead
-// when the sweep starts never reaches the ban path at all.
+// The caller giving up must not be recorded against the peer: an
+// aborted download would hide the one device holding the file. The
+// cancel has to land MID-DIAL — a context already dead when the sweep
+// starts never reaches the verdict at all.
 func TestSourceDoesNotBanOnCallerCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	pool := &cancellingDialPool{cancel: cancel}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
 
-	_, _, ok := s.SourceFor(ctx, "space1", testCid(t))
-	require.False(t, ok)
+	_, _, err := s.SourceFor(ctx, "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	s.banMu.Lock()
 	n := len(s.banned)
 	s.banMu.Unlock()
@@ -294,9 +299,9 @@ func (c *cancellingDialPool) Get(ctx context.Context, _ string) (peer.Peer, erro
 }
 
 // The layer clock ending mid-FileCheck says nothing about that peer:
-// only a candidate's OWN budget or a real RPC error bans it. Otherwise
-// one stalling candidate ahead of the holder gets it sidelined for
-// banTTL when the sweep runs out of time on it.
+// only a candidate's OWN budget or a real RPC error backs it off.
+// Otherwise one stalling candidate ahead of the holder gets it
+// sidelined when the sweep runs out of time on it.
 func TestSourceDoesNotBanOnLayerClock(t *testing.T) {
 	stall := time.Hour
 	pool := &hangingDialPool{connected: map[string]peer.Peer{
@@ -309,28 +314,28 @@ func TestSourceDoesNotBanOnLayerClock(t *testing.T) {
 	require.Greater(t, 2*testBudgets.globalPeer, testBudgets.globalSweep)
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2"}})
 
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.True(t, s.isBanned("g1", true), "exhausted its own budget")
 	require.False(t, s.isBanned("g2", true), "cut off by the layer clock, not by its own budget")
 }
 
 // A dial error that carries another caller's cancel is not this peer's
 // fault: the pool shares an in-flight dial's outcome with every waiter,
-// so a fetch aborted elsewhere must not ban a healthy holder. The
+// so a fetch aborted elsewhere must not sideline a healthy holder. The
 // dial's OWN timeout, surfacing as a deadline error while the
-// candidate's budget is still running, is the peer's fault and bans.
+// candidate's budget is still running, is the peer's fault.
 func TestSourceDoesNotBanOnInheritedCancel(t *testing.T) {
 	pool := &dialErrPool{err: context.Canceled}
 	s := newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.False(t, s.isBanned("d1", false), "someone else's cancel says nothing about the peer")
 
 	pool = &dialErrPool{err: context.DeadlineExceeded}
 	s = newTestSource(pool, lanOnlyPeers{lan: []string{"d1"}})
-	_, _, ok = s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
+	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.True(t, s.isBanned("d1", false), "the dial's own timeout means the peer is unreachable")
 }
 
@@ -355,8 +360,8 @@ func TestSourceLayersDoNotStarveEachOther(t *testing.T) {
 	}
 	s := newTestSource(pool, bothLayerPeers{lan: lan, global: []string{"g1"}})
 
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok, "the stub reports nothing held")
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable, "the stub reports nothing held")
 	require.Less(t, pool.gets, len(lan), "the LAN clock bounds the stale dials")
 	require.Positive(t, pool.picks, "the global layer must still be reached")
 }
@@ -379,8 +384,8 @@ func TestSourceGlobalLayerAsksAtMostMaxCandidates(t *testing.T) {
 	pool := &hangingDialPool{connected: connected}
 	s := newTestSource(pool, globalOnlyPeers{global: global})
 
-	_, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.False(t, ok)
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
 	require.Equal(t, maxCandidates, pool.picks, "twenty answering peers must not all be asked")
 }
 
@@ -392,11 +397,11 @@ func TestSourceGlobalOfflineIdsDoNotHideTheHolder(t *testing.T) {
 	pool := &hangingDialPool{connected: map[string]peer.Peer{"g4": holderPeer{id: "g4"}}}
 	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1", "g2", "g3", "g4"}})
 
-	src, _, ok := s.SourceFor(context.Background(), "space1", testCid(t))
-	require.True(t, ok, "the connected holder ranked behind three offline ids must be asked")
+	src, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.NoError(t, err, "the connected holder ranked behind three offline ids must be asked")
 	require.Equal(t, "g4", src.(*peerCar).peerId)
 	for _, id := range []string{"g1", "g2", "g3"} {
-		require.False(t, s.isBanned(id, true), "an offline id is skipped, not banned")
+		require.False(t, s.isBanned(id, true), "an offline id is skipped with no verdict")
 	}
 }
 
@@ -405,4 +410,76 @@ func testCid(t *testing.T) cid.Cid {
 	root, err := cid.Decode("bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy")
 	require.NoError(t, err)
 	return root
+}
+
+// One failed FileCheck must not hide the only holder for long: inside
+// the backoff the peer is skipped without a probe, and right after it
+// the peer is asked again and selected.
+func TestSourceAsksAFailedPeerAgainAfterItsBackoff(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"g1": stubPeer{id: "g1"}}}
+	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
+	s.b.backoffMin, s.b.backoffMax = 40*time.Millisecond, time.Second
+
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.ErrorContains(t, err, "1 peer(s) that may hold it did not answer",
+		"the failure names the holder that did not answer")
+	require.Equal(t, 1, pool.picks)
+
+	_, _, err = s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorContains(t, err, "1 peer(s) that may hold it did not answer")
+	require.Equal(t, 1, pool.picks, "a burst of fetches probes the failed peer once")
+
+	// The peer is back.
+	pool.connected["g1"] = holderPeer{id: "g1"}
+	time.Sleep(2 * s.b.backoffMin)
+	src, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.NoError(t, err, "past the backoff the holder is asked again")
+	require.Equal(t, "g1", src.(*peerCar).peerId)
+	s.banMu.Lock()
+	n := len(s.banned)
+	s.banMu.Unlock()
+	require.Zero(t, n, "an answer clears the backoff")
+}
+
+// The backoff doubles per consecutive failure up to its cap, and an
+// answer starts it over.
+func TestSourceBackoffGrowsAndResets(t *testing.T) {
+	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{})
+	wait := func() time.Duration {
+		s.banMu.Lock()
+		defer s.banMu.Unlock()
+		return time.Until(s.banned[banKey{"p", true}].until)
+	}
+	for i, want := range []time.Duration{backoffMin, 2 * backoffMin, 4 * backoffMin, 8 * backoffMin, backoffMax, backoffMax} {
+		s.unreachable("p", true)
+		require.InDelta(t, want, wait(), float64(time.Second), "failure %d", i+1)
+	}
+	require.LessOrEqual(t, 8*backoffMin, backoffMax, "the table above assumes four doublings fit under the cap")
+
+	s.answered("p", true)
+	s.unreachable("p", true)
+	require.InDelta(t, backoffMin, wait(), float64(time.Second), "an answer starts the backoff over")
+}
+
+// A peer that served invalid content stays out for banTTL: a FileCheck
+// it answers in the meantime does not let it back in.
+func TestSourceBanSurvivesAnAnswer(t *testing.T) {
+	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{})
+	s.ban("p", true)
+	s.answered("p", true)
+	require.True(t, s.isBanned("p", true))
+	s.banMu.Lock()
+	until := s.banned[banKey{"p", true}].until
+	s.banMu.Unlock()
+	require.InDelta(t, banTTL, time.Until(until), float64(time.Second))
+}
+
+// With no candidate waiting out a backoff, the failure says that nobody
+// reachable holds the file.
+func TestSourceWithoutCandidatesSaysNobodyHoldsIt(t *testing.T) {
+	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{global: []string{"g1"}})
+	_, _, err := s.SourceFor(context.Background(), "space1", testCid(t))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.ErrorContains(t, err, "no reachable peer holds it")
 }

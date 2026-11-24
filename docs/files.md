@@ -164,7 +164,14 @@ plaintext. Content resolves through a source ladder:
 Every fetched block is verified and persisted into a sparse local CAR,
 so streaming, seeking and interrupted reads accrete toward a complete
 copy. A file that is neither local, durable, nor held by a reachable
-peer fails with `ErrFileNotAvailable`.
+peer fails with `ErrFileNotAvailable`, as does a read whose only source
+is a peer that stops answering.
+
+A peer that fails a dial or an availability check is skipped for 5 s,
+doubling per consecutive failure up to a minute, and asked again after
+that; any answer clears it. A peer that serves invalid content is
+skipped for 5 minutes. The error says when peers that may hold the file
+are only waiting out that backoff.
 
 ## Status
 

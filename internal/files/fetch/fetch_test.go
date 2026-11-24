@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	mrand "math/rand"
 	"net/http"
@@ -419,15 +420,15 @@ type fakePeerSource struct {
 	absent bool
 }
 
-func (p *fakePeerSource) SourceFor(context.Context, string, cid.Cid) (CarSource, func(), bool) {
+func (p *fakePeerSource) SourceFor(context.Context, string, cid.Cid) (CarSource, func(), error) {
 	if p.absent {
-		return nil, nil, false
+		return nil, nil, fmt.Errorf("%w: no peer in this test", ErrNotAvailable)
 	}
 	return p.car, func() {
 		if p.banned != nil {
 			*p.banned = true
 		}
-	}, true
+	}, nil
 }
 
 // A healthy peer serves the whole file; HTTP egress must be zero.

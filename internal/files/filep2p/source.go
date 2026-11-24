@@ -61,8 +61,15 @@ const (
 	// counting them lets a few offline ids ranked ahead hide the one
 	// connected holder.
 	maxCandidates = 3
-	// banTTL keeps a peer that failed to dial/serve out of selection.
+	// banTTL keeps a peer that served invalid content, or stalled a read
+	// that has a fallback, out of selection.
 	banTTL = 5 * time.Minute
+	// backoffMin / backoffMax bound how long a peer that failed a dial or
+	// a FileCheck is skipped; the wait doubles per consecutive failure. A
+	// burst of fetches probes a dead peer once, and the only holder of a
+	// file is asked again seconds after one lost round trip.
+	backoffMin = 5 * time.Second
+	backoffMax = time.Minute
 )
 
 // budgets are the selection clocks; a field so tests run them in
@@ -70,6 +77,9 @@ const (
 type budgets struct {
 	lanPeer, globalPeer   time.Duration
 	lanSweep, globalSweep time.Duration
+	ban                   time.Duration
+	backoffMin            time.Duration
+	backoffMax            time.Duration
 }
 
 var defaultBudgets = budgets{
@@ -77,6 +87,9 @@ var defaultBudgets = budgets{
 	globalPeer:  perGlobalPeerTimeout,
 	lanSweep:    maxLanSweep,
 	globalSweep: maxGlobalSweep,
+	ban:         banTTL,
+	backoffMin:  backoffMin,
+	backoffMax:  backoffMax,
 }
 
 // LocalPeers is the slice of the p2p peer store this source needs: LAN
@@ -96,20 +109,20 @@ type DialPool interface {
 // Source is the fetch.PeerSource: it finds a peer that holds a file in
 // full — on the LAN first, then among the connected global peers — and
 // hands back a Car reader over the FileP2P ObjectRead RPC. Each layer
-// sweeps under its own clock and per-candidate budget, and failures ban
-// the peer on that layer, so selection never stalls a fetch when no
-// peer has the file.
+// sweeps under its own clock and per-candidate budget, and a peer that
+// fails is skipped on that layer for a while, so selection never stalls
+// a fetch when no peer has the file.
 type Source struct {
 	pool  DialPool
 	peers LocalPeers
 	b     budgets
 
 	banMu  sync.Mutex
-	banned map[banKey]time.Time
+	banned map[banKey]exclusion
 }
 
 func NewSource(pool DialPool, peers LocalPeers) *Source {
-	return &Source{pool: pool, peers: peers, b: defaultBudgets, banned: map[banKey]time.Time{}}
+	return &Source{pool: pool, peers: peers, b: defaultBudgets, banned: map[banKey]exclusion{}}
 }
 
 var (
@@ -118,33 +131,70 @@ var (
 )
 
 // SourceFor returns a peer-backed Car reader for (spaceId, root) when a
-// non-banned peer reports holding the file in full, plus a hook to ban
-// that peer (called by the fetcher if it serves invalid bytes).
-// ok=false when no peer holds the file.
+// selectable peer reports holding the file in full, plus a hook to ban
+// that peer (called by the fetcher if it serves invalid bytes). The
+// error wraps fetch.ErrNotAvailable and says whether peers that may
+// hold the file are only waiting out a backoff.
 //
 // Each layer gets its own try count AND its own clock. Sharing either
 // starves the global layer: LAN ids come first and a handful of stale
 // ones exhaust a shared budget before any relayed peer is asked.
-func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (fetch.CarSource, func(), bool) {
-	for _, layer := range []struct {
+func (s *Source) SourceFor(ctx context.Context, spaceId string, root cid.Cid) (fetch.CarSource, func(), error) {
+	layers := []struct {
 		ids    func() []string
 		global bool
 		sweep  time.Duration
 	}{
-		{ids: func() []string { return s.filterBanned(s.peers.LocalPeerIds(spaceId), false) }, sweep: s.b.lanSweep},
+		{ids: func() []string { return s.peers.LocalPeerIds(spaceId) }, sweep: s.b.lanSweep},
 		// Built lazily: resolving the global set unions in every
 		// account peer and ranks them, all wasted when a LAN peer
 		// answers first.
-		{ids: func() []string { return s.filterBanned(s.peers.GlobalPeerIds(spaceId), true) }, global: true, sweep: s.b.globalSweep},
-	} {
+		{ids: func() []string { return s.peers.GlobalPeerIds(spaceId) }, global: true, sweep: s.b.globalSweep},
+	}
+	var candidates []banKey
+	for _, layer := range layers {
+		ids := layer.ids()
+		for _, id := range ids {
+			candidates = append(candidates, banKey{id, layer.global})
+		}
 		lctx, cancel := context.WithTimeout(ctx, layer.sweep)
-		src, ban, ok := s.sweepLayer(lctx, layer.ids(), layer.global, spaceId, root)
+		src, ban, ok := s.sweepLayer(lctx, s.filterBanned(ids, layer.global), layer.global, spaceId, root)
 		cancel()
 		if ok {
-			return src, ban, true
+			return src, ban, nil
 		}
 	}
-	return nil, nil, false
+	return nil, nil, s.unavailable(candidates)
+}
+
+// unavailable is the selection's failure: a plain "nobody holds it", or
+// a count of the candidates that failed to answer and are skipped until
+// their backoff ends.
+func (s *Source) unavailable(candidates []banKey) error {
+	now := time.Now()
+	var (
+		waiting int
+		next    time.Time
+	)
+	s.banMu.Lock()
+	for _, k := range candidates {
+		e, ok := s.banned[k]
+		if !ok || e.failures == 0 || !now.Before(e.until) {
+			continue
+		}
+		waiting++
+		if next.IsZero() || e.until.Before(next) {
+			next = e.until
+		}
+	}
+	s.banMu.Unlock()
+	if waiting == 0 {
+		return fmt.Errorf("%w: no reachable peer holds it", fetch.ErrNotAvailable)
+	}
+	// rounded up: "0s" would read as "now"
+	wait := (next.Sub(now) + time.Second - 1).Truncate(time.Second)
+	return fmt.Errorf("%w: %d peer(s) that may hold it did not answer and are asked again in %s",
+		fetch.ErrNotAvailable, waiting, wait)
 }
 
 // sweepLayer asks up to maxCandidates peers of one layer, under lctx,
@@ -175,17 +225,16 @@ func (s *Source) sweepLayer(lctx context.Context, ids []string, global bool, spa
 // holdsFull reaches one peer (under its own budget) and asks whether it
 // holds the file in full. reached reports that the peer was resolved
 // and a FileCheck attempted on it. LAN peers are dialed; a global peer
-// is only picked from the pool and skipped, not banned, when it has no
-// live connection. A dial/RPC failure bans the peer — it is unreachable
-// — but a plain "not full" answer does not, and neither does the layer
-// clock (or the caller) ending first: that cut-off says nothing about
-// the peer, and banTTL is long enough to hide the only device holding
-// the file. Nor does a dial error carrying ANOTHER caller's cancel: the
+// is only picked from the pool and skipped, with no verdict, when it has
+// no live connection. A dial/RPC failure backs the peer off — it is
+// unreachable — and any answer clears that. The layer clock (or the
+// caller) ending first is no verdict: that cut-off says nothing about
+// the peer. Nor is a dial error carrying ANOTHER caller's cancel: the
 // pool shares an in-flight dial's outcome with every waiter (retrying a
 // few times, but the last verdict can still be that cancel), so a fetch
-// aborted elsewhere must not ban a healthy LAN holder. A deadline error
-// with pctx alive is NOT inherited: it is the dial's own timeout, and
-// the peer is unreachable.
+// aborted elsewhere must not sideline a healthy LAN holder. A deadline
+// error with pctx alive is NOT inherited: it is the dial's own timeout,
+// and the peer is unreachable.
 func (s *Source) holdsFull(lctx context.Context, peerId string, global bool, spaceId string, root cid.Cid) (reached, full bool) {
 	budget := s.b.lanPeer
 	if global {
@@ -197,7 +246,7 @@ func (s *Source) holdsFull(lctx context.Context, peerId string, global bool, spa
 	if err != nil {
 		inherited := pctx.Err() == nil && errors.Is(err, context.Canceled)
 		if !global && lctx.Err() == nil && !inherited {
-			s.ban(peerId, global)
+			s.unreachable(peerId, global)
 		}
 		return false, false
 	}
@@ -218,10 +267,11 @@ func (s *Source) holdsFull(lctx context.Context, peerId string, global bool, spa
 	})
 	if err != nil {
 		if lctx.Err() == nil {
-			s.ban(peerId, global)
+			s.unreachable(peerId, global)
 		}
 		return true, false
 	}
+	s.answered(peerId, global)
 	return true, full
 }
 
@@ -234,14 +284,46 @@ func (s *Source) peer(ctx context.Context, peerId string, global bool) (peer.Pee
 	return s.pool.Get(ctx, peerId)
 }
 
-// ban sidelines a peer ON ONE LAYER. A device reachable both on the
-// LAN and through a relay is one peer id with two very different
-// paths and two very different budgets, so a LAN failure — client
-// isolation on the Wi-Fi, say — must not also remove the relayed path
-// that works.
+// ban sidelines a peer ON ONE LAYER for banTTL: it served invalid
+// content, or stalled a read another source can serve. A device
+// reachable both on the LAN and through a relay is one peer id with two
+// very different paths and two very different budgets, so a LAN failure
+// — client isolation on the Wi-Fi, say — must not also remove the
+// relayed path that works.
 func (s *Source) ban(peerId string, global bool) {
 	s.banMu.Lock()
-	s.banned[banKey{peerId, global}] = time.Now().Add(banTTL)
+	s.banned[banKey{peerId, global}] = exclusion{until: time.Now().Add(s.b.ban)}
+	s.banMu.Unlock()
+}
+
+// unreachable backs a peer off on one layer after a failed dial or
+// FileCheck: backoffMin, doubled per consecutive failure, up to
+// backoffMax.
+func (s *Source) unreachable(peerId string, global bool) {
+	k := banKey{peerId, global}
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	e := s.banned[k]
+	e.failures++
+	wait := s.b.backoffMax
+	// the shift is bounded so a long outage cannot overflow it
+	if shift := e.failures - 1; shift < 16 {
+		wait = min(s.b.backoffMin<<shift, s.b.backoffMax)
+	}
+	if until := time.Now().Add(wait); until.After(e.until) {
+		e.until = until
+	}
+	s.banned[k] = e
+}
+
+// answered clears a peer's backoff: it replied to a FileCheck. A ban
+// for invalid content stays.
+func (s *Source) answered(peerId string, global bool) {
+	k := banKey{peerId, global}
+	s.banMu.Lock()
+	if e, ok := s.banned[k]; ok && e.failures > 0 {
+		delete(s.banned, k)
+	}
 	s.banMu.Unlock()
 }
 
@@ -251,21 +333,34 @@ type banKey struct {
 	global bool
 }
 
+// exclusion keeps a peer out of one layer's selection until `until`.
+// failures counts consecutive unreachable verdicts; zero marks a ban.
+type exclusion struct {
+	until    time.Time
+	failures int
+}
+
 func (s *Source) filterBanned(ids []string, global bool) []string {
 	s.banMu.Lock()
 	defer s.banMu.Unlock()
 	now := time.Now()
-	// Drop every expired ban, not only the ones whose id is in this
+	// Drop every stale entry, not only the ones whose id is in this
 	// list: a peer that left the network is never handed back, so a
-	// lazy per-id cleanup would keep its entry for the process life.
-	for k, until := range s.banned {
-		if !now.Before(until) {
+	// lazy per-id cleanup would keep its entry for the process life. A
+	// backoff outlives its wait by backoffMax, so that a peer failing
+	// again right after it keeps climbing instead of starting over.
+	for k, e := range s.banned {
+		end := e.until
+		if e.failures > 0 {
+			end = end.Add(s.b.backoffMax)
+		}
+		if !now.Before(end) {
 			delete(s.banned, k)
 		}
 	}
 	out := ids[:0:0]
 	for _, id := range ids {
-		if _, banned := s.banned[banKey{id, global}]; banned {
+		if e, ok := s.banned[banKey{id, global}]; ok && now.Before(e.until) {
 			continue
 		}
 		out = append(out, id)

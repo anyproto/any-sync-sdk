@@ -7,10 +7,9 @@ keeps control over the child without being able to read it.
 
 This is the design of the first version (V1).
 
-"Organization" is application vocabulary. any-sync and the SDK speak only
-of parent, child and legalOwner, and the word does not appear in their
-names, types or APIs. An application that calls a parent space an
-organization, a team or a workspace builds that on this primitive.
+The parent is an **organization**: a space type of its own. The protocol
+and the APIs name the relation parent and child; "organization" names the
+two space types.
 
 ## Model
 
@@ -18,14 +17,20 @@ organization, a team or a workspace builds that on this primitive.
   first-class signed field of `SpaceHeader`, not part of the opaque header
   payload. It is bound into the child's id and never changes. An empty
   value is a top-level space.
-- **The parent is an ordinary space.** It is a regular top-level space. A
-  tech space or a 1-1 space cannot be a parent, and a child cannot be a
-  parent: nesting has one level.
-- **The child is a regular space** with the V1 header, which binds its ACL
-  root into the signed header.
-- **Only SDK spaces nest.** The coordinator signs a child only when the
-  parent and the child both carry the SDK's regular space type
-  (`any.space`). A derived space is neither a parent nor a child.
+- **The parent is an organization.** It is a top-level space of the type
+  `any.organization`, created as one: a space of another type never
+  becomes a parent. Apart from having children and having no guest role it
+  is a full space, with its own content, members and invites.
+- **The child is a space of an organization.** It carries the type
+  `any.organization.space` and the V1 header, which binds its ACL root
+  into the signed header. Nesting has one level.
+- **The type and the parent id agree.** A space of the type
+  `any.organization.space` names a parent that is an organization, and a
+  space of no other type names a parent. A derived space is neither a
+  parent nor a child.
+- **The type tells the network what a space is.** The coordinator stores
+  the type of every space, so limits and payments can treat organizations
+  and their spaces apart from other spaces.
 - **Nothing else records the relation.** Nothing is written to the parent
   when a child is created, and the child's ACL stores nothing about the
   parent's owner.
@@ -41,7 +46,6 @@ organization, a team or a workspace builds that on this primitive.
 |---|---|
 | Create a child | A Writer, an Admin or the Owner of the parent |
 | Add a member to a child | The child's Admins and Owner; only members of the parent can be added |
-| Give outsiders read-only access to a child | The child's Owner, with a guest key |
 | Read or write a child's data | Members of the child |
 | List a parent's children | The parent's Admins and Owner |
 | Remove a member of a child | The child's Admins and Owner; the parent's Admins and Owner, without the child's read key |
@@ -103,8 +107,8 @@ can still be admitted to a child or act on one.
    `parentSpaceId` and the parent's replicationKey.
 3. At the child's first push the coordinator's `SpaceSign` checks that:
    - the parent exists and is not deleted or in deletion;
-   - the parent and the child are regular SDK spaces, the parent is not
-     itself a child, and the child's header is V1;
+   - the parent is an organization, the child is a space of an
+     organization, and the child's header is V1;
    - the caller is a Writer or above in the parent at that moment;
    - the legalOwner's limit is not exceeded.
 4. The creator pushes the child with the receipt.
@@ -140,6 +144,17 @@ A child counts until its deletion is final. A network that configures no
 limit allows no children. An account's stored limit of zero means the
 network's default.
 
+The limit does not hold back a transfer of a parent: a parent can go to an
+owner whose limit its children exceed, and that owner creates no more
+children until it is under the limit.
+
+Only the number of children is charged to the legalOwner. A child's member
+limits and file storage are accounted as for any other space, and a child
+counts toward its creator's cap on the total number of spaces.
+
+An organization that is shared takes a place in its owner's shared-spaces
+limit, like any other space.
+
 ## Membership
 
 A child's own Admins and Owner manage its members, mainly by direct-add
@@ -150,10 +165,10 @@ this on every admission path: a join request when it is posted and when
 it is accepted, direct-add batches and invite joins. The new owner of a
 child must be a member of the parent too.
 
-The exception is a guest key. A child's Owner can create one, and its
-guest identity gives read-only access to holders who are not members of
-the parent. The coordinator admits a guest identity from outside the
-parent only in a record written by the child's Owner.
+An organization and its spaces have no guest role. The coordinator refuses
+a record that gives an account that role, whichever way it does: a guest
+key, a direct add, an accepted request or a change of permissions. A
+read-only member is a Reader.
 
 ## The list of children
 
@@ -200,6 +215,18 @@ An Admin of the parent cannot remove from a child an account it could not
 remove from the parent itself: the parent's Owner or another Admin. The
 parent's Owner can remove anyone but the child's owner.
 
+## Removing a member of the parent
+
+The network does not remove a member of the parent from its children. A
+member who is removed from the parent, or who leaves it, stays a member of
+the children they are in, and a child's owner stays its owner.
+
+Bringing the children in line is the responsibility of the legalOwner.
+With the list of children from the coordinator, the parent's Owner or an
+Admin writes a keyless removal in each child the person is a member of.
+The tool that does this for an organization, a service of its own or a
+part of the application, is outside V1.
+
 ## Changing a child's owner
 
 The parent's Owner can hand a child to any active member of that child and
@@ -207,8 +234,7 @@ names the role the previous owner keeps. The new owner is already a member
 and already holds the read key. The previous owner stays a member; removing
 them is a separate step.
 
-The new owner must also be a member of the parent, and a guest identity
-cannot become the owner.
+The new owner must also be a member of the parent.
 
 ## Deleting a child
 
@@ -239,6 +265,7 @@ No gate refuses a client on an older version for a child space.
 
 The SDK exposes:
 
+- creating an organization;
 - creating a child of a parent;
 - listing a parent's children;
 - reading a child's accounts and its "rotation pending" state as an Admin
@@ -250,7 +277,7 @@ The SDK exposes:
 - the status of a refused child, with retry and removal;
 - the limit on child spaces in the account limits.
 
-`SpaceInfo` carries the parent id. The API is described in
+`SpaceInfo` carries the type and the parent id. The API is described in
 `docs/child-spaces.md`.
 
 ## Children as access scopes
@@ -266,44 +293,35 @@ is the client's work.
 ## Outside V1
 
 - **External members.** Paid seats that admit accounts which are not
-  members of the parent. In V1 an outsider gets read-only access through
-  a guest key.
+  members of the parent, and a guest role that gives read-only access from
+  outside it. In V1 nobody outside the parent is admitted to a child.
+- **Removal from the children with the parent.** The legalOwner's tool
+  that removes from the children a member who was removed from the parent
+  or left it.
 - **A configurable creation role.** The parent's ACL options can hold it;
   a ceiling set by a network or a license belongs on the coordinator.
 - **Deleting a parent together with its children.** In V1 the children
   are deleted first.
 - **More than one level** of nesting.
-- **Other clients.** Child spaces exist only for applications built on the
-  SDK. Anytype clients neither create nor open them; support there comes
-  later.
+- **Other clients.** Organizations exist only for applications built on
+  the SDK. Anytype clients neither create nor open them; support there
+  comes later. A device on an SDK that does not know the two types opens
+  an organization and its spaces as ordinary spaces and creates neither.
 
 ## Open questions
 
-1. **Removing a member of the parent.** The intended rule is that a member
-   removed from the parent is removed from all its children: the remover
-   takes the list of children from the coordinator and writes a keyless
-   removal in each child the person is a member of. Unspecified:
+1. **Removing a member of the parent from its children.** Unspecified for
+   the tool that does it:
    - a removed member who owns children. The ownership first goes to
      another member, which only the parent's Owner can do. A child whose
      only member is the removed person can only be deleted;
    - how the removal is finished when it stops halfway;
-   - a member who leaves the parent by themselves;
    - whether a parent's Admin can remove from a child an Admin or the
      Owner of the parent. V1 refuses it.
-
-   Until this is decided nothing removes a member of the parent from its
-   children, and a child's owner who leaves the parent stays its owner.
-2. **Limits.** Whether a child's member limits and file storage are charged
-   to the legalOwner, as the number of children is. A child still counts
-   toward its creator's cap on the total number of spaces.
-3. **A child in deletion.** V1 counts it as a child until the deletion is
-   final, for the limit and for the deletion of its parent. Whether a
-   pending deletion should stop counting is open.
-4. **A transfer of a parent over the limit.** V1 accepts a transfer to an
-   owner whose limit the parent's children exceed; that owner cannot
-   create more.
-5. **The limit and payments.** The payment service does not set the limit
-   on child spaces yet, so every account takes the network's default.
-6. **A parent handed to an account in deletion.** The ownership change does
+2. **Limits and payments.** The payment service does not set the limit on
+   child spaces yet, so every account takes the network's default. Whether
+   a child's member limits and file storage are charged to the legalOwner
+   is decided with it.
+3. **A parent handed to an account in deletion.** The ownership change does
    not look at the new owner's account, so a parent can end up owned by a
    deleted account, with nobody to govern its children.

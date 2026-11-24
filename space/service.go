@@ -188,7 +188,8 @@ type Service interface {
 	// Create a new space owned by the authenticated account:
 	// SpaceTypeAny, or an organization when req.SpaceType is
 	// SpaceTypeOrganization. An organization is a space like any other
-	// that can have child spaces (CreateChild).
+	// that can have child spaces (CreateChild) and has no guest role
+	// (ErrNoGuestRole).
 	Create(ctx context.Context, req CreateRequest) (Space, error)
 
 	// CreateChild creates a space of the organization
@@ -332,8 +333,7 @@ type Service interface {
 	// neither of the two, ErrNotParentMember for a new owner who is no
 	// member of the parent, ErrAccountNotFound for one who is no member
 	// of the child, ErrInsufficientPermissions for one who is the Owner
-	// already or a guest identity, and for an oldOwnerPerm of none,
-	// guest or owner.
+	// already, and for an oldOwnerPerm of none, guest or owner.
 	ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm Permission) error
 
 	// DeleteChild deletes the child space childSpaceId on the network.
@@ -369,7 +369,8 @@ type Service interface {
 	// is sticky and refused with ErrSpaceDeleted before anything reaches
 	// the network. A child space admits only members of its parent:
 	// ErrNotParentMember when the network refuses the join request of
-	// an account that is not one, with no row written.
+	// an account that is not one, ErrParentSpaceNotAvailable when the
+	// coordinator cannot read the parent's ACL, with no row written.
 	Join(ctx context.Context, req JoinRequest) (Space, error)
 
 	// CancelJoin withdraws this account's pending join request for

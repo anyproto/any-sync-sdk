@@ -10,7 +10,8 @@ import (
 // so consumers classify them with errors.Is against this package.
 var (
 	// ErrParentSpaceNotAvailable: the parent space does not exist on
-	// the network or is deleted.
+	// the network or is deleted, or the coordinator cannot read its
+	// ACL. The calls that return ErrNotParentMember return it then.
 	ErrParentSpaceNotAvailable = coordinatorproto.ErrParentSpaceNotAvailable
 
 	// ErrParentSpaceInvalid: the space cannot be a parent. A parent is
@@ -28,12 +29,22 @@ var (
 	ErrChildSpacesLimitReached = coordinatorproto.ErrChildSpacesLimitReached
 
 	// ErrNotParentMember: only a member of the parent space becomes a
-	// member of a child. Join returns it when this account is not one
-	// and its join request is refused, ACL.AddAccounts when one of the
-	// added accounts is not, ACL.AcceptRequest when the joiner left the
-	// parent after asking. The guest identity of ACL.CreateGuestKey is
-	// exempt.
+	// member of a child, or its owner. Join returns it when this
+	// account is not one and its join request is refused,
+	// ACL.AddAccounts when one of the added accounts is not,
+	// ACL.AcceptRequest when the joiner left the parent after asking,
+	// ACL.OwnershipChange and Service.ChangeChildOwner when the new
+	// owner is not.
 	ErrNotParentMember = coordinatorproto.ErrNotParentMember
+
+	// ErrNoGuestRole: an organization and its spaces have no guest
+	// role and no guest key; a read-only member takes PermissionReader.
+	// There ACL.CreateGuestKey and ACL.RevokeGuestKey return it, and
+	// ACL.AddAccounts, ACL.ChangePermissions and ACL.AcceptRequest when
+	// they name PermissionGuest, in any entry of a batch. The space's
+	// type decides (SpaceInfo.Type), before the caller's role is
+	// checked and with nothing sent.
+	ErrNoGuestRole = coordinatorproto.ErrGuestRoleNotAllowed
 
 	// ErrSpaceHasChildren: an organization that still has child spaces
 	// is not deleted. Delete returns it for one the account owns when

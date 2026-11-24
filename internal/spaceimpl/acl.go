@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -273,6 +274,11 @@ func (a *aclAPI) AcceptRequest(ctx context.Context, requestRecordId string, perm
 	if requestRecordId == "" {
 		return errors.New("acl: AcceptRequest: requestRecordId required")
 	}
+	if perm == space.PermissionGuest {
+		if err := a.s.guestRoleRefusal(ctx, "AcceptRequest"); err != nil {
+			return err
+		}
+	}
 	cl, err := a.client(ctx)
 	if err != nil {
 		return err
@@ -298,6 +304,11 @@ func (a *aclAPI) DeclineRequest(ctx context.Context, identity string) error {
 func (a *aclAPI) ChangePermissions(ctx context.Context, changes []space.PermissionChange) error {
 	if len(changes) == 0 {
 		return errors.New("acl: ChangePermissions: empty changes")
+	}
+	if slices.ContainsFunc(changes, func(ch space.PermissionChange) bool { return ch.Permission == space.PermissionGuest }) {
+		if err := a.s.guestRoleRefusal(ctx, "ChangePermissions"); err != nil {
+			return err
+		}
 	}
 	cl, err := a.client(ctx)
 	if err != nil {
@@ -346,6 +357,11 @@ func (a *aclAPI) RemoveAccounts(ctx context.Context, identities []string) error 
 func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) error {
 	if len(accounts) == 0 {
 		return errors.New("acl: AddAccounts: empty accounts")
+	}
+	if slices.ContainsFunc(accounts, func(m space.MemberAdd) bool { return m.Permission == space.PermissionGuest }) {
+		if err := a.s.guestRoleRefusal(ctx, "AddAccounts"); err != nil {
+			return err
+		}
 	}
 	// Same precondition as CreateInvite: the ACL record is rejected until
 	// the coordinator knows the space ("space not exists" / log not
@@ -439,7 +455,12 @@ func (a *aclAPI) CancelJoinRequest(ctx context.Context) error {
 // an orphaned guest identity would survive every future revocation:
 // RemoveAccounts re-encrypts the rotated key for remaining members,
 // guests included.
+//
+// A space with no guest role is refused before anything else.
 func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
+	if err := a.s.guestRoleRefusal(ctx, "CreateGuestKey"); err != nil {
+		return space.Invite{}, err
+	}
 	if !a.s.localIdentityIsOwner(ctx) {
 		return space.Invite{}, errors.New("acl: CreateGuestKey: owner only")
 	}
@@ -488,8 +509,12 @@ func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
 // RevokeGuestKey removes EVERY guest identity from the ACL (custodied
 // or orphaned — public access must end regardless of which device
 // minted what), rotating the read key, and clears the owner-side
-// custody — see space.ACL.RevokeGuestKey.
+// custody — see space.ACL.RevokeGuestKey. A space with no guest role is
+// refused before anything else.
 func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
+	if err := a.s.guestRoleRefusal(ctx, "RevokeGuestKey"); err != nil {
+		return err
+	}
 	if !a.s.localIdentityIsOwner(ctx) {
 		return errors.New("acl: RevokeGuestKey: owner only")
 	}
@@ -506,6 +531,37 @@ func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
 		return err
 	}
 	return a.s.clearIssuedKey(ctx, techspace.IssuedKeyGuest)
+}
+
+// guestRoleRefusal returns space.ErrNoGuestRole for a space of a type
+// with no guest role: an organization and its spaces. The row's type
+// decides, a set-once copy of the header's. A row with no type yet
+// takes the header's: the space is loaded for it, and one that does not
+// load returns that error.
+func (s *spaceImpl) guestRoleRefusal(ctx context.Context, op string) error {
+	rec, _ := s.tsp.Get(ctx, s.id)
+	spaceType := rec.Type
+	if spaceType == "" {
+		handle, err := s.app.GetSpace(ctx, s.id)
+		if err != nil {
+			return fmt.Errorf("acl: load space: %w", err)
+		}
+		hdr := spaceHeader(ctx, handle)
+		if hdr == nil {
+			return fmt.Errorf("acl: %s: space %q: header not readable", op, s.id)
+		}
+		spaceType = hdr.SpaceType
+	}
+	if hasGuestRole(spaceType) {
+		return nil
+	}
+	return fmt.Errorf("acl: %s: space %q of type %s: %w", op, s.id, spaceType, space.ErrNoGuestRole)
+}
+
+// hasGuestRole reports whether a space of the header type lets an
+// account hold the guest role.
+func hasGuestRole(spaceType string) bool {
+	return spaceType != space.SpaceTypeOrganization && spaceType != space.SpaceTypeOrganizationSpace
 }
 
 // activeGuestIdentities lists every ACL account currently holding

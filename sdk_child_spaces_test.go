@@ -1262,10 +1262,12 @@ func TestSDK_Delete_OwnedSpaceWithHeldChild(t *testing.T) {
 	assert.Equal(t, space.StatusDeleted, parent.Info().Status)
 }
 
-// A child space admits only members of its parent. The coordinator's
-// refusal reads ErrNotParentMember on every way in: a direct add, an
-// accepted join request, a join by invite. A guest key is not a member
-// and is added as before.
+// A child space admits only members of its parent, and takes only one
+// of them as its owner. The coordinator's refusal reads
+// ErrNotParentMember on every way in: a direct add, an accepted join
+// request, a join by invite, a change of the owner. It reads
+// ErrParentSpaceNotAvailable when the coordinator cannot read the ACL
+// of the parent.
 func TestSDK_ChildSpace_OnlyParentMembersAreAdmitted(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1290,22 +1292,61 @@ func TestSDK_ChildSpace_OnlyParentMembersAreAdmitted(t *testing.T) {
 	accept := func(_ string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
 		return network.accept(rec), nil
 	}
-	refuse := func(string, *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
-		return nil, coordinatorproto.ErrNotParentMember
-	}
-
-	// A direct add.
-	net.nodes.set(func() { net.nodes.add = refuse })
-	outsider := randomIdentity(t)
-	err = child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: outsider, Permission: space.PermissionWriter}})
-	require.ErrorIs(t, err, space.ErrNotParentMember)
-	rec, ok := sdk.tsp.Get(ctx, child.Id())
-	require.True(t, ok)
-	assert.Empty(t, rec.InviteNotifyPending, "nobody is notified of an add that did not happen")
-
-	// An accepted join request.
 	net.nodes.set(func() { net.nodes.add = accept })
-	invite, err := child.ACL().CreateInvite(ctx)
+	member := randomIdentity(t)
+	require.NoError(t, child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: member, Permission: space.PermissionWriter}}))
+	request := postJoinRequest(t, ctx, network, child, acl)
+
+	for _, tc := range []struct{ answer, want error }{
+		{coordinatorproto.ErrNotParentMember, space.ErrNotParentMember},
+		{coordinatorproto.ErrParentSpaceNotAvailable, space.ErrParentSpaceNotAvailable},
+	} {
+		net.nodes.set(func() {
+			net.nodes.add = func(string, *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+				return nil, tc.answer
+			}
+		})
+
+		// A direct add.
+		outsider := randomIdentity(t)
+		err = child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: outsider, Permission: space.PermissionWriter}})
+		require.ErrorIs(t, err, tc.want)
+		rec, ok := sdk.tsp.Get(ctx, child.Id())
+		require.True(t, ok)
+		assert.NotContains(t, rec.InviteNotifyPending, outsider, "nobody is notified of an add that did not happen")
+
+		// An accepted join request.
+		require.ErrorIs(t, child.ACL().AcceptRequest(ctx, request, space.PermissionWriter), tc.want)
+
+		// A change of the owner.
+		require.ErrorIs(t, child.ACL().OwnershipChange(ctx, member, space.PermissionAdmin), tc.want)
+
+		// A join by invite, from the joiner's side: the account reads the
+		// ACL of another account's child off the nodes and posts its join
+		// request, which the network refuses.
+		foreign := newForeignChild(t, network, parent.Id())
+		foreignInvite := foreign.invite(t)
+		var requests atomic.Int32
+		foreign.serve(t, &net.nodes, func(*consensusproto.RawRecord) error {
+			requests.Add(1)
+			return tc.answer
+		})
+		token, err := space.EncodeInvite(space.Invite{SpaceId: foreign.id, InviteKey: foreignInvite})
+		require.NoError(t, err)
+		_, err = spaces.Join(ctx, space.JoinRequest{Invite: token})
+		require.ErrorIs(t, err, tc.want)
+		assert.EqualValues(t, 1, requests.Load(), "the request was posted and refused")
+		requireNothingHeld(t, ctx, sdk, foreign.id)
+		net.nodes.set(func() { net.nodes.get = nil })
+	}
+}
+
+// postJoinRequest makes sp hold the join request of a new account, as
+// the network accepted it, and returns its record id. acl is the ACL
+// of sp on this device.
+func postJoinRequest(t *testing.T, ctx context.Context, network testNetworkKey, sp space.Space, acl list.AclList) string {
+	t.Helper()
+	invite, err := sp.ACL().CreateInvite(ctx)
 	require.NoError(t, err)
 	joiner, err := accountdata.NewRandom()
 	require.NoError(t, err)
@@ -1322,36 +1363,188 @@ func TestSDK_ChildSpace_OnlyParentMembersAreAdmitted(t *testing.T) {
 	err = acl.AddRawRecord(request)
 	acl.Unlock()
 	require.NoError(t, err)
+	return request.Id
+}
 
-	net.nodes.set(func() { net.nodes.add = refuse })
-	err = child.ACL().AcceptRequest(ctx, request.Id, space.PermissionWriter)
-	require.ErrorIs(t, err, space.ErrNotParentMember)
+// An organization and its spaces have no guest role. The calls that
+// mint or revoke a guest key, or name the guest role for an account,
+// return ErrNoGuestRole there: for any caller, with nothing sent and
+// nothing stored. The type decides. It is the row's, whether or not the
+// row names a parent, and the header's for a row with no type. A space
+// outside any organization keeps its guest key and its guests.
+func TestSDK_NoGuestRole_InAnOrganizationAndItsSpaces(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	net := installFakeNetwork(t)
+	dataDir := t.TempDir()
+	cfg := childTestConfig(t, dataDir)
+	network := newTestNetworkKey(t, &cfg)
+	var sent atomic.Int32
+	net.coord.shareable = func(string) error {
+		sent.Add(1)
+		return nil
+	}
+	net.nodes.add = func(_ string, rec *consensusproto.RawRecord) (*consensusproto.RawRecordWithId, error) {
+		sent.Add(1)
+		return network.accept(rec), nil
+	}
+	sdk, err := Open(ctx, cfg, wmProvider(t, dataDir))
+	require.NoError(t, err)
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
 
-	// A join by invite, from the joiner's side: the account reads the
-	// ACL of another account's child off the nodes and posts its join
-	// request, which the network refuses.
-	foreign := newForeignChild(t, network, parent.Id())
-	foreignInvite := foreign.invite(t)
-	var requests atomic.Int32
-	foreign.serve(t, &net.nodes, func(*consensusproto.RawRecord) error {
-		requests.Add(1)
-		return coordinatorproto.ErrNotParentMember
+	aclOf := func(spaceId string) list.AclList {
+		handle, err := sdk.app.GetSpace(ctx, spaceId)
+		require.NoError(t, err)
+		return handle.Inner().Acl()
+	}
+	guestsIn := func(acl list.AclList) (guests int) {
+		acl.RLock()
+		defer acl.RUnlock()
+		for _, acc := range acl.AclState().CurrentAccounts() {
+			if acc.Permissions.IsGuest() {
+				guests++
+			}
+		}
+		return guests
+	}
+	// held makes the device hold a space the account owns with the row
+	// rec: the storage a pull leaves, and a handle that has not loaded
+	// the space, so the row stays as given.
+	held := func(spaceType, parentSpaceId string, rec techspace.SpaceIndexRecord) space.Space {
+		keys := sdk.app.AccountKeys()
+		readKey, err := crypto.NewRandomAES()
+		require.NoError(t, err)
+		metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+		require.NoError(t, err)
+		rec.Id, err = sdk.app.SpaceService().CreateSpace(ctx, spacepayloads.SpaceCreatePayload{
+			SigningKey:       keys.SignKey,
+			MasterKey:        keys.SignKey,
+			ReadKey:          readKey,
+			MetadataKey:      metadataKey,
+			SpaceType:        spaceType,
+			FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+			ParentSpaceId:    parentSpaceId,
+		})
+		require.NoError(t, err)
+		rec.RemoteStatus = techspace.StatusActive
+		_, err = sdk.tsp.Add(ctx, rec)
+		require.NoError(t, err)
+		return sdk.spaces.HandleForTest(rec.Id)
+	}
+
+	org, err := spaces.Create(ctx, space.CreateRequest{Name: "Organization", SpaceType: space.SpaceTypeOrganization})
+	require.NoError(t, err)
+	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: org.Id()})
+	require.NoError(t, err)
+	foreign := newForeignChild(t, network, org.Id())
+	foreign.heldBy(t, ctx, sdk, org.Id(), list.AclPermissionsAdmin)
+	asAdmin, err := spaces.Get(ctx, foreign.id)
+	require.NoError(t, err)
+
+	const childType = space.SpaceTypeOrganizationSpace
+	for _, tc := range []struct {
+		name string
+		sp   space.Space
+	}{
+		{"an organization", org},
+		{"a space of an organization", child},
+		{"a space of an organization of which the account is an Admin", asAdmin},
+		{"a row with the type and no parent id", held(childType, org.Id(), techspace.SpaceIndexRecord{Type: childType})},
+		{"a row with no type, of a space of an organization", held(childType, org.Id(), techspace.SpaceIndexRecord{})},
+		{"a row with no type, of an organization", held(space.SpaceTypeOrganization, "", techspace.SpaceIndexRecord{})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sp, id := tc.sp, tc.sp.Id()
+			acl := aclOf(id)
+			// A Reader and a join request: without the refusal the
+			// calls below would go to the network.
+			reader := randomIdentity(t)
+			require.NoError(t, sp.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: reader, Permission: space.PermissionReader}}))
+			request := postJoinRequest(t, ctx, network, sp, acl)
+			rowBefore, ok := sdk.tsp.Get(ctx, id)
+			require.True(t, ok)
+			head, sentBefore := acl.Head().Id, sent.Load()
+
+			member, guest := randomIdentity(t), randomIdentity(t)
+			calls := map[string]func() error{
+				"CreateGuestKey": func() error {
+					_, err := sp.ACL().CreateGuestKey(ctx)
+					return err
+				},
+				"RevokeGuestKey": func() error { return sp.ACL().RevokeGuestKey(ctx) },
+				"AddAccounts": func() error {
+					return sp.ACL().AddAccounts(ctx, []space.MemberAdd{
+						{Identity: member, Permission: space.PermissionWriter},
+						{Identity: guest, Permission: space.PermissionGuest},
+					})
+				},
+				"ChangePermissions": func() error {
+					return sp.ACL().ChangePermissions(ctx, []space.PermissionChange{{Identity: reader, Permission: space.PermissionGuest}})
+				},
+				"AcceptRequest": func() error { return sp.ACL().AcceptRequest(ctx, request, space.PermissionGuest) },
+			}
+			for name, call := range calls {
+				require.ErrorIs(t, call(), space.ErrNoGuestRole, name)
+			}
+
+			assert.Equal(t, sentBefore, sent.Load(), "nothing is sent")
+			assert.Equal(t, head, acl.Head().Id, "the ACL is not written to")
+			assert.Zero(t, guestsIn(acl), "no account is a guest")
+			row, ok := sdk.tsp.Get(ctx, id)
+			require.True(t, ok)
+			assert.Empty(t, row.IssuedInviteKey(techspace.IssuedKeyGuest), "no guest key is stored")
+			assert.NotContains(t, row.InviteNotifyPending, member, "nobody of the batch is notified")
+			assert.NotContains(t, row.InviteNotifyPending, guest, "nobody of the batch is notified")
+			assert.Equal(t, rowBefore.Type, row.Type, "the row's type is as it was")
+			assert.Equal(t, rowBefore.ParentSpaceId, row.ParentSpaceId, "the row's parent id is as it was")
+
+			// The other roles are open.
+			require.NoError(t, sp.ACL().ChangePermissions(ctx, []space.PermissionChange{{Identity: reader, Permission: space.PermissionWriter}}))
+			require.NoError(t, sp.ACL().AcceptRequest(ctx, request, space.PermissionReader))
+		})
+	}
+
+	// A row with no type of a space that does not load: the type is not
+	// known, the call fails on the load and nothing is sent.
+	t.Run("a space that does not load", func(t *testing.T) {
+		require.NoError(t, spaces.Track(ctx, foreignSpaceB))
+		sp := sdk.spaces.HandleForTest(foreignSpaceB)
+		short, stop := context.WithTimeout(ctx, time.Second)
+		defer stop()
+		sentBefore := sent.Load()
+		_, err := sp.ACL().CreateGuestKey(short)
+		require.ErrorIs(t, err, context.DeadlineExceeded, "the load waits for a node")
+		require.NotErrorIs(t, err, space.ErrNoGuestRole)
+		assert.Equal(t, sentBefore, sent.Load(), "nothing is sent")
 	})
-	token, err := space.EncodeInvite(space.Invite{SpaceId: foreign.id, InviteKey: foreignInvite})
-	require.NoError(t, err)
-	_, err = spaces.Join(ctx, space.JoinRequest{Invite: token})
-	require.ErrorIs(t, err, space.ErrNotParentMember)
-	assert.EqualValues(t, 1, requests.Load(), "the request was posted and refused")
-	requireNothingHeld(t, ctx, sdk, foreign.id)
 
-	// A guest key.
-	net.nodes.set(func() { net.nodes.add = accept })
-	guest, err := child.ACL().CreateGuestKey(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, space.InviteKindGuest, guest.Kind)
-	acl.RLock()
-	assert.True(t, acl.AclState().Permissions(guest.InviteKey.GetPublic()).IsGuest())
-	acl.RUnlock()
+	t.Run("a space outside any organization", func(t *testing.T) {
+		plain, err := spaces.Create(ctx, space.CreateRequest{Name: "Plain"})
+		require.NoError(t, err)
+		acl := aclOf(plain.Id())
+		reader := randomIdentity(t)
+		require.NoError(t, plain.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: reader, Permission: space.PermissionReader}}))
+		request := postJoinRequest(t, ctx, network, plain, acl)
+
+		sentBefore := sent.Load()
+		invite, err := plain.ACL().CreateGuestKey(ctx)
+		require.NoError(t, err)
+		assert.Equal(t, space.InviteKindGuest, invite.Kind)
+		assert.Equal(t, plain.Id(), invite.SpaceId)
+		assert.Greater(t, sent.Load(), sentBefore, "the guest identity is published")
+		acl.RLock()
+		assert.True(t, acl.AclState().Permissions(invite.InviteKey.GetPublic()).IsGuest())
+		acl.RUnlock()
+
+		require.NoError(t, plain.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: randomIdentity(t), Permission: space.PermissionGuest}}))
+		require.NoError(t, plain.ACL().ChangePermissions(ctx, []space.PermissionChange{{Identity: reader, Permission: space.PermissionGuest}}))
+		require.NoError(t, plain.ACL().AcceptRequest(ctx, request, space.PermissionGuest))
+		assert.Equal(t, 4, guestsIn(acl), "the guest key, an added guest, a Reader made one and an accepted joiner")
+
+		require.NoError(t, plain.ACL().RevokeGuestKey(ctx))
+		assert.Zero(t, guestsIn(acl))
+	})
 }
 
 // The refusal is on the synced row: a device of the account with no
@@ -1958,10 +2151,6 @@ func TestSDK_ChildSpace_SharingARefusedChild(t *testing.T) {
 		},
 		"AddAccounts": func(ctx context.Context) error {
 			return child.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: randomIdentity(t), Permission: space.PermissionWriter}})
-		},
-		"CreateGuestKey": func(ctx context.Context) error {
-			_, err := child.ACL().CreateGuestKey(ctx)
-			return err
 		},
 	}
 

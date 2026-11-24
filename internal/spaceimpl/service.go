@@ -527,6 +527,12 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
 
+// HandleForTest returns the handle of spaceId with no load of the
+// space and no read of its row. Test seam.
+func (s *Service) HandleForTest(spaceId string) space.Space {
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s)
+}
+
 // ApplyGapCount is the number of spaceId's objects with a stored
 // change that may be unapplied (spaceobjects.GapSet), 0 for a space
 // never loaded this session.

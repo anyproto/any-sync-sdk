@@ -79,9 +79,12 @@ var (
 // space on the network. For a space the coordinator does not know yet
 // they wait for its first push, and return ErrSpaceUnknown when it has
 // not landed in time. A child space the coordinator refused to sign
-// (SpaceInfo.Refusal) is not waited for: they return the error of that
-// refusal, one of ErrParentSpaceNotAvailable, ErrParentSpaceInvalid,
-// ErrParentPermissionDenied and ErrChildSpacesLimitReached.
+// (SpaceInfo.Refusal) is not waited for: CreateInvite and AddAccounts
+// return the error of that refusal, one of ErrParentSpaceNotAvailable,
+// ErrParentSpaceInvalid, ErrParentPermissionDenied and
+// ErrChildSpacesLimitReached.
+//
+// An organization and its spaces have no guest role: ErrNoGuestRole.
 type ACL interface {
 	// CreateInvite mints a RequestToJoin invite. A space holds one at a
 	// time: ErrDuplicateInvite while one is active, until it is revoked
@@ -102,7 +105,9 @@ type ACL interface {
 	// joiner the given permission. requestRecordId is the id from
 	// MembersAPI.JoinRequests. Owner / admin only. In a child space
 	// ErrNotParentMember for a joiner who is no longer a member of the
-	// parent.
+	// parent, and ErrParentSpaceNotAvailable when the coordinator
+	// cannot read the parent's ACL. ErrNoGuestRole for PermissionGuest
+	// in an organization or its spaces.
 	AcceptRequest(ctx context.Context, requestRecordId string, perm Permission) error
 
 	// DeclineRequest rejects a pending join request from identity.
@@ -111,7 +116,8 @@ type ACL interface {
 
 	// ChangePermissions updates the permissions of one or more existing
 	// members in a single batch. Owner / admin only; cannot demote the
-	// owner.
+	// owner. ErrNoGuestRole for a change to PermissionGuest in an
+	// organization or its spaces.
 	ChangePermissions(ctx context.Context, changes []PermissionChange) error
 
 	// RemoveAccounts kicks one or more members out, rotating the read
@@ -131,11 +137,17 @@ type ACL interface {
 	// happens but no notification is sent.
 	//
 	// In a child space every added account is a member of the parent:
-	// ErrNotParentMember otherwise, and nobody of the batch is added.
+	// ErrNotParentMember otherwise, ErrParentSpaceNotAvailable when the
+	// coordinator cannot read the parent's ACL. ErrNoGuestRole for
+	// PermissionGuest in an organization or its spaces. Nobody of a
+	// refused batch is added.
 	AddAccounts(ctx context.Context, accounts []MemberAdd) error
 
 	// OwnershipChange transfers ownership to newOwner; the old owner's
-	// permission becomes oldOwnerPerm (typically PermissionAdmin).
+	// permission becomes oldOwnerPerm (typically PermissionAdmin). In a
+	// child space the new owner is a member of the parent:
+	// ErrNotParentMember otherwise, ErrParentSpaceNotAvailable when the
+	// coordinator cannot read the parent's ACL.
 	OwnershipChange(ctx context.Context, newOwner string, oldOwnerPerm Permission) error
 
 	// RequestSelfRemove asks to be removed from this space. Self-service
@@ -162,6 +174,8 @@ type ACL interface {
 	// (idempotent — the key is not recoverable from the ACL itself).
 	// Owner only: custody lives in the owner's tech space, so admins
 	// can neither fetch nor reissue it.
+	//
+	// ErrNoGuestRole in an organization or its spaces.
 	CreateGuestKey(ctx context.Context) (Invite, error)
 
 	// RotationPending reports that members were removed from this
@@ -181,7 +195,8 @@ type ACL interface {
 	// (already-synced local copies stay readable on their devices).
 	// Clears the stored key; a later CreateGuestKey mints a fresh
 	// identity, so old invites die permanently. No-op error when no
-	// guest key is active.
+	// guest key is active. ErrNoGuestRole in an organization or its
+	// spaces.
 	RevokeGuestKey(ctx context.Context) error
 }
 

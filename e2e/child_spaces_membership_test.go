@@ -17,9 +17,10 @@ import (
 // read the child. An account outside the parent is refused on every way
 // in with ErrNotParentMember: a direct add (nobody of the batch is
 // added), a join request (refused when posted, no row on any of its
-// devices), the acceptance of a request whose author left the parent
-// since, and a guest identity added by anyone but the child's Owner.
-// The Owner's guest key gives an outsider read-only access.
+// devices), and the acceptance of a request whose author left the
+// parent since. The organization and the child have no guest role: the
+// calls that name it return ErrNoGuestRole, for the Owner and for an
+// Admin, and no account becomes a guest.
 func childSpacesMembership(t *testing.T, net *childNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
@@ -116,10 +117,13 @@ func childSpacesMembership(t *testing.T, net *childNet) {
 		}
 	})
 
+	// pendingRequest is the join request the child's ACL is left with.
+	var pendingRequest string
 	t.Run("AcceptedAfterTheRequesterLeftTheParent", func(t *testing.T) {
 		_, err := leaver.spaces().Join(ctx, space.JoinRequest{Invite: token})
 		require.ErrorIs(t, err, space.ErrJoinPending, "a member of the parent posts a join request")
 		req := awaitJoinRequest(t, ctx, child, leaver.id())
+		pendingRequest = req.RecordId
 
 		require.NoError(t, parent.ACL().RemoveAccounts(ctx, []string{leaver.id()}), "the requester leaves the parent")
 		err = child.ACL().AcceptRequest(ctx, req.RecordId, space.PermissionWriter)
@@ -127,44 +131,54 @@ func childSpacesMembership(t *testing.T, net *childNet) {
 		notIn(t, leaver.id())
 	})
 
-	t.Run("GuestIdentityOnlyFromTheChildOwner", func(t *testing.T) {
+	t.Run("NoGuestRole", func(t *testing.T) {
+		require.NotEmpty(t, pendingRequest, "the child's ACL holds a join request")
 		guestIdentity := newRandomIdentity(t)
-		err := memberChild.ACL().AddAccounts(ctx, []space.MemberAdd{
-			{Identity: guestIdentity, Permission: space.PermissionGuest},
-		})
-		require.ErrorIs(t, err, space.ErrNotParentMember, "a child's Admin adds a guest from outside the parent")
-		notIn(t, guestIdentity)
-		// CreateGuestKey is documented as Owner only, with no typed
-		// error: the refusal is read from its message and from the ACL.
-		_, err = memberChild.ACL().CreateGuestKey(ctx)
-		assert.ErrorContains(t, err, "owner only", "a child's Admin creates no guest key")
-		for id, m := range childMembers(t, ctx, owner, child.Id()) {
-			assert.NotEqual(t, space.PermissionGuest, m.Permission, "no guest identity in the child: %s", id)
+		// other is a Reader of the organization and of the child. Only
+		// the child's ACL holds a join request to accept.
+		for _, by := range []struct {
+			who     string
+			sp      space.Space
+			request string
+		}{
+			{"the organization's Owner", parent, ""},
+			{"the child's Owner", child, pendingRequest},
+			{"a child's Admin", memberChild, pendingRequest},
+		} {
+			acl := by.sp.ACL()
+			_, err := acl.CreateGuestKey(ctx)
+			assert.ErrorIs(t, err, space.ErrNoGuestRole, "%s: CreateGuestKey", by.who)
+			assert.ErrorIs(t, acl.RevokeGuestKey(ctx), space.ErrNoGuestRole, "%s: RevokeGuestKey", by.who)
+			err = acl.AddAccounts(ctx, []space.MemberAdd{
+				{Identity: outsider.id(), Permission: space.PermissionGuest},
+				{Identity: guestIdentity, Permission: space.PermissionGuest},
+			})
+			assert.ErrorIs(t, err, space.ErrNoGuestRole, "%s: AddAccounts of guests", by.who)
+			err = acl.ChangePermissions(ctx, []space.PermissionChange{{Identity: other.id(), Permission: space.PermissionGuest}})
+			assert.ErrorIs(t, err, space.ErrNoGuestRole, "%s: ChangePermissions to guest", by.who)
+			if by.request != "" {
+				assert.ErrorIs(t, acl.AcceptRequest(ctx, by.request, space.PermissionGuest), space.ErrNoGuestRole,
+					"%s: AcceptRequest as a guest", by.who)
+			}
 		}
-	})
 
-	t.Run("GuestKeyForAnOutsider", func(t *testing.T) {
-		guest, err := child.ACL().CreateGuestKey(ctx)
-		require.NoError(t, err)
-		guestToken, err := space.EncodeInvite(guest)
-		require.NoError(t, err)
-		guestChild, err := outsider.spaces().JoinGuest(ctx, guestToken)
-		if err != nil {
-			require.ErrorIs(t, err, space.ErrGuestJoinPending)
+		notIn(t, outsider.id(), guestIdentity)
+		for id, m := range childMembers(t, ctx, owner, child.Id()) {
+			assert.NotEqual(t, space.PermissionGuest, m.Permission, "no guest in the child: %s", id)
 		}
-		row := outsider.waitRow(t, ctx, child.Id(), "the guest's copy of the child is active", func(si space.SpaceInfo) bool {
-			return si.Status == space.StatusActive
-		})
-		if guestChild == nil {
-			guestChild = outsider.get(t, ctx, child.Id())
+		_ = parent.SyncHeads(ctx)
+		inParent, err := parent.Members().List(ctx)
+		require.NoError(t, err)
+		for _, m := range inParent {
+			assert.NotEqual(t, space.PermissionGuest, m.Permission, "no guest in the organization: %s", m.Identity)
+			assert.NotEqual(t, guestIdentity, m.Identity, "the guest identity is not in the organization")
 		}
-		waitNote(t, ctx, outsider.name, guestChild, note, "for the members of the child")
-		_, err = guestChild.Types().Create(ctx, space.TypeCreateParams{Name: "written by a guest"})
-		assert.ErrorIs(t, err, space.ErrReadOnlySpace, "a guest only reads")
-		row = outsider.waitRow(t, ctx, child.Id(), "the guest's row names the parent", func(si space.SpaceInfo) bool {
-			return si.ParentSpaceId != ""
-		})
-		assert.Equal(t, parent.Id(), row.ParentSpaceId)
-		assert.Equal(t, space.PermissionGuest, guestChild.Info().OwnRole)
+		for _, d := range []*device{outsider, outsiderB} {
+			require.NoError(t, d.spaces().SyncSpaceList(ctx))
+			for _, id := range []string{parent.Id(), child.Id()} {
+				_, held := d.row(ctx, id)
+				assert.False(t, held, "%s: a refused add writes no row of %s", d.name, id)
+			}
+		}
 	})
 }

@@ -126,9 +126,9 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 	assert.ErrorIs(t, err, space.ErrChildSpacesLimitReached, "CreateInvite on a refused child")
 	assert.ErrorIs(t, over.ACL().AddAccounts(ctx, []space.MemberAdd{{Identity: admin.id(), Permission: space.PermissionWriter}}),
 		space.ErrChildSpacesLimitReached, "AddAccounts on a refused child")
-	_, err = over.ACL().CreateGuestKey(ctx)
-	assert.ErrorIs(t, err, space.ErrChildSpacesLimitReached, "CreateGuestKey on a refused child")
 	assert.Less(t, time.Since(asked), 10*time.Second, "they do not wait for a push that is not coming")
+	_, err = over.ACL().CreateGuestKey(ctx)
+	assert.ErrorIs(t, err, space.ErrNoGuestRole, "a child has no guest key, refused or not")
 
 	// The reason reaches the creator's second device, which holds no copy.
 	onB := ownerB.waitRow(t, ctx, over.Id(), "the refusal reaches the second device", func(si space.SpaceInfo) bool {

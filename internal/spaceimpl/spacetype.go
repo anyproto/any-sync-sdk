@@ -88,6 +88,12 @@ func (s *Service) residentHeader(ctx context.Context, spaceId string) *spacesync
 	if !ok {
 		return nil
 	}
+	return spaceHeader(ctx, handle)
+}
+
+// spaceHeader returns the header of a loaded space, nil when it does
+// not parse.
+func spaceHeader(ctx context.Context, handle anysyncx.SpaceHandle) *spacesyncproto.SpaceHeader {
 	desc, err := handle.Inner().Description(ctx)
 	if err != nil || desc.SpaceHeader == nil {
 		return nil

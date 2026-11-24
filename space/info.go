@@ -22,14 +22,16 @@ const (
 
 	// SpaceTypeOrganization is the type of an organization: a space
 	// like SpaceTypeAny that can have child spaces
-	// (Service.CreateChild). Create makes one when
-	// CreateRequest.SpaceType names it. The type is in the immutable
-	// header, so a space of another type never becomes one.
+	// (Service.CreateChild) and has no guest role (ErrNoGuestRole).
+	// Create makes one when CreateRequest.SpaceType names it. The type
+	// is in the immutable header, so a space of another type never
+	// becomes one.
 	SpaceTypeOrganization = "any.organization"
 
 	// SpaceTypeOrganizationSpace is the type of a child space, a space
 	// of an organization. Only Service.CreateChild makes one; its
-	// header names the organization (SpaceInfo.ParentSpaceId).
+	// header names the organization (SpaceInfo.ParentSpaceId). It has
+	// no guest role (ErrNoGuestRole).
 	SpaceTypeOrganizationSpace = "any.organization.space"
 
 	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two

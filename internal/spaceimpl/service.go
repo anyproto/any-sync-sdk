@@ -844,6 +844,7 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		Id:           spaceId,
 		Type:         spaceType,
 		SpaceType:    spaceType,
+		AnySpaceType: req.AnySpaceType,
 		Name:         req.Name,
 		Description:  req.Description,
 		IconCID:      req.IconCID,
@@ -1112,6 +1113,7 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 		Id:           r.Id,
 		Type:         typ,
 		SpaceType:    s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
+		AnySpaceType: r.AnySpaceType,
 		Author:       author,
 		Name:         r.Name,
 		Description:  r.Description,
@@ -1152,6 +1154,31 @@ func (s *Service) SetSettings(ctx context.Context, spaceId string, set map[strin
 		return fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
 	}
 	_, err := s.tsp.SetSettings(ctx, spaceId, set, unset)
+	return err
+}
+
+// SetAnySpaceType writes the account's use of a space onto its
+// tech-space row (see space.Service.SetAnySpaceType for the contract).
+// The row must exist: the techspace write is a strict modify.
+func (s *Service) SetAnySpaceType(ctx context.Context, spaceId, anySpaceType string) error {
+	if anySpaceType == "" {
+		return errors.New("spaceimpl: SetAnySpaceType: empty value")
+	}
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceUnknown, spaceId)
+	}
+	if rec.IsDeleted() {
+		return fmt.Errorf("spaceimpl: %w %q", space.ErrSpaceDeleted, spaceId)
+	}
+	switch rec.AnySpaceType {
+	case anySpaceType:
+		return nil
+	case "":
+	default:
+		return fmt.Errorf("spaceimpl: %w: %q on %q", space.ErrAnySpaceTypeSet, rec.AnySpaceType, spaceId)
+	}
+	_, err := s.tsp.SetAnySpaceType(ctx, spaceId, anySpaceType)
 	return err
 }
 

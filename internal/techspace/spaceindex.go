@@ -34,6 +34,8 @@ func SpaceIndexSchema() schema.Dataset {
 			Description: "Space icon CID, mirrored from the in-space index."},
 		{Id: FieldSpaceType, Name: "Space type", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Application space type, mirrored from the in-space index."},
+		{Id: FieldAnySpaceType, Name: "Any space type", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "What the account uses the space for; account-private."},
 		{Id: FieldRemoteStatus, Name: "Remote status", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Account-wide lifecycle: deleted, or a pending invite / join state."},
 		{Id: FieldLocalStatus, Name: "Local status", Schema: str(), Scope: schema.ScopeLocal,
@@ -144,6 +146,17 @@ const (
 	// Distinct from FieldType (the on-wire header type): not pinned, so
 	// the watcher can mirror the converged value.
 	FieldSpaceType = "spaceType"
+	// FieldAnySpaceType (synced, account-wide) says what the account
+	// uses the space for, e.g. the space of one app. It is on the row
+	// only: the space itself carries nothing, so its other members never
+	// see it. Written with the row by Create, or on an existing row by
+	// Service.SetAnySpaceType. Plain last-writer-wins: the value is the
+	// caller's, and a set-once gate on local state would pin two
+	// concurrent values divergently. A schema that does not declare the
+	// field drops it on apply, so a device that applied the change under
+	// an older SDK holds a row without it until its tech index is next
+	// rebuilt from its changes.
+	FieldAnySpaceType = "anySpaceType"
 	// FieldOneToOneInviteState is a DEVICE-LOCAL field (schema.ScopeLocal)
 	// tracking whether this device still owes the peer an inbox
 	// notification for a 1-1 it initiated. Value "toSend" means the

@@ -366,6 +366,14 @@ func (s *Service) SetDerived(ctx context.Context, spaceId string) (object.WriteR
 	})
 }
 
+// SetAnySpaceType writes what the account uses the space for
+// (FieldAnySpaceType, synced account-wide).
+func (s *Service) SetAnySpaceType(ctx context.Context, spaceId, anySpaceType string) (object.WriteResult, error) {
+	return s.setRowField(ctx, spaceId, FieldAnySpaceType, false, func(a *anyenc.Arena) *anyenc.Value {
+		return a.NewString(anySpaceType)
+	})
+}
+
 // SetP2PAdvertise writes the per-space p2p advertising switch
 // (FieldP2PAdvertise, synced account-wide).
 func (s *Service) SetP2PAdvertise(ctx context.Context, spaceId string, on bool) (object.WriteResult, error) {

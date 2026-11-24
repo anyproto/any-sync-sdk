@@ -449,37 +449,69 @@ func TestSourceAsksAFailedPeerAgainAfterItsBackoff(t *testing.T) {
 	require.Zero(t, n, "an answer clears the backoff")
 }
 
+// expire ends a peer's current wait, as time passing would.
+func (s *Source) expire(peerId string, global bool) {
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	e := s.banned[banKey{peerId, global}]
+	e.until = time.Now().Add(-time.Millisecond)
+	s.banned[banKey{peerId, global}] = e
+}
+
+func (s *Source) waitOf(peerId string, global bool) time.Duration {
+	s.banMu.Lock()
+	defer s.banMu.Unlock()
+	return time.Until(s.banned[banKey{peerId, global}].until)
+}
+
 // The backoff doubles per consecutive failure up to its cap, and an
 // answer starts it over.
 func TestSourceBackoffGrowsAndResets(t *testing.T) {
 	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{})
-	wait := func() time.Duration {
-		s.banMu.Lock()
-		defer s.banMu.Unlock()
-		return time.Until(s.banned[banKey{"p", true}].until)
-	}
 	for i, want := range []time.Duration{backoffMin, 2 * backoffMin, 4 * backoffMin, 8 * backoffMin, backoffMax, backoffMax} {
 		s.unreachable("p", true)
-		require.InDelta(t, want, wait(), float64(time.Second), "failure %d", i+1)
+		require.InDelta(t, want, s.waitOf("p", true), float64(time.Second), "failure %d", i+1)
+		s.expire("p", true)
 	}
 	require.LessOrEqual(t, 8*backoffMin, backoffMax, "the table above assumes four doublings fit under the cap")
 
 	s.answered("p", true)
 	s.unreachable("p", true)
-	require.InDelta(t, backoffMin, wait(), float64(time.Second), "an answer starts the backoff over")
+	require.InDelta(t, backoffMin, s.waitOf("p", true), float64(time.Second), "an answer starts the backoff over")
 }
 
-// A peer that served invalid content stays out for banTTL: a FileCheck
-// it answers in the meantime does not let it back in.
-func TestSourceBanSurvivesAnAnswer(t *testing.T) {
+// Fetches that ask one peer together lose the same round trip: the
+// burst counts as one failure, not as one per fetch.
+func TestSourceBurstOfFailuresCountsOnce(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"g1": stubPeer{id: "g1"}}}
+	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
+	var wg sync.WaitGroup
+	for range 10 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = s.SourceFor(context.Background(), query(t, "space1"))
+		}()
+	}
+	wg.Wait()
+	require.InDelta(t, backoffMin, s.waitOf("g1", true), float64(time.Second))
+}
+
+// A peer that served invalid content stays out for banTTL: neither a
+// failed check nor an answered one in the meantime lets it back in.
+func TestSourceBanSurvivesChecks(t *testing.T) {
 	s := newTestSource(&hangingDialPool{}, globalOnlyPeers{})
 	s.ban("p", true)
+	s.unreachable("p", true)
 	s.answered("p", true)
 	require.True(t, s.isBanned("p", true))
-	s.banMu.Lock()
-	until := s.banned[banKey{"p", true}].until
-	s.banMu.Unlock()
-	require.InDelta(t, banTTL, time.Until(until), float64(time.Second))
+	require.InDelta(t, banTTL, s.waitOf("p", true), float64(time.Second))
+
+	// Also when the ban followed a backoff.
+	s.unreachable("q", true)
+	s.ban("q", true)
+	s.answered("q", true)
+	require.InDelta(t, banTTL, s.waitOf("q", true), float64(time.Second))
 }
 
 // With no candidate waiting out a backoff, the failure says that nobody
@@ -492,7 +524,8 @@ func TestSourceWithoutCandidatesSaysNobodyHoldsIt(t *testing.T) {
 }
 
 // fakeDialer connects the next scripted peer on each call, as the
-// connector would, and records what it was asked.
+// connector would, and records what it was asked. A nil entry is a
+// dial that found nobody home.
 type fakeDialer struct {
 	pool    *hangingDialPool
 	connect []peer.Peer
@@ -511,6 +544,9 @@ func (d *fakeDialer) ConnectOne(_ context.Context, spaceId, prefer string, skip 
 	}
 	p := d.connect[0]
 	d.connect = d.connect[1:]
+	if p == nil {
+		return "nobody-home", false
+	}
 	d.pool.mu.Lock()
 	d.pool.connected[p.Id()] = p
 	d.pool.mu.Unlock()
@@ -559,12 +595,13 @@ func TestSourceDoesNotDialWhenAnotherSourceExists(t *testing.T) {
 	require.Empty(t, dialer.calls)
 }
 
-// One fetch has at most maxDemandDials peers dialed, and a peer sitting
-// out a backoff is not handed back by the dialer.
+// One fetch has at most maxDemandDials peers brought up, a dial in vain
+// included, and a peer sitting out a backoff is not handed back by the
+// dialer.
 func TestSourceBoundsItsDemandDials(t *testing.T) {
 	pool := &hangingDialPool{connected: map[string]peer.Peer{}}
 	global := []string{"down"}
-	var connect []peer.Peer
+	connect := []peer.Peer{nil}
 	for i := 0; i < maxDemandDials+2; i++ {
 		id := "g" + string(rune('a'+i))
 		global = append(global, id)
@@ -581,6 +618,7 @@ func TestSourceBoundsItsDemandDials(t *testing.T) {
 	for _, call := range dialer.calls {
 		require.Contains(t, call.skip, "down")
 	}
+	require.Contains(t, dialer.calls[1].skip, "nobody-home", "a peer dialed in vain is not asked for again")
 }
 
 // notFullPeer answers FileCheck with nothing held.

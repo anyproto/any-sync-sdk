@@ -65,8 +65,8 @@ const (
 	// banTTL keeps a peer that served invalid content, or stalled a read
 	// that has a fallback, out of selection.
 	banTTL = 5 * time.Minute
-	// maxDemandDials caps the peers one fetch has the connector dial for
-	// a file nothing else can serve.
+	// maxDemandDials caps the peers one fetch has the connector bring
+	// up, dialed or not, for a file nothing else can serve.
 	maxDemandDials = 3
 	// backoffMin / backoffMax bound how long a peer that failed a dial or
 	// a FileCheck is skipped; the wait doubles per consecutive failure. A
@@ -110,11 +110,13 @@ type DialPool interface {
 	Pick(ctx context.Context, id string) (peer.Peer, error)
 }
 
-// Dialer brings up one more global peer of a space on request: a peer
-// outside skip, devices of the prefer identity first. The global
-// layer's connector implements it; it stays the only dialer.
+// Dialer brings up one more global peer of a space on request, with at
+// most one dial: a peer outside skip, devices of the prefer identity
+// first. connected reports a live peer; a peer id with connected false
+// was dialed in vain, and no peer id means nothing was dialed. The
+// global layer's connector implements it; it stays the only dialer.
 type Dialer interface {
-	ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, ok bool)
+	ConnectOne(ctx context.Context, spaceId, prefer string, skip []string) (peerId string, connected bool)
 }
 
 // Source is the fetch.PeerSource: it finds a peer that holds a file in
@@ -213,11 +215,14 @@ func (s *Source) dialHolder(lctx context.Context, q fetch.PeerQuery, skip []stri
 		if lctx.Err() != nil {
 			return nil
 		}
-		id, ok := s.dialer.ConnectOne(lctx, q.SpaceId, q.Author, skip)
-		if !ok {
+		id, connected := s.dialer.ConnectOne(lctx, q.SpaceId, q.Author, skip)
+		if id == "" {
 			return nil
 		}
 		skip = append(skip, id)
+		if !connected {
+			continue
+		}
 		if _, full := s.holdsFull(lctx, id, true, q.SpaceId, q.Root); full {
 			return &peerCar{pool: s.pool, peerId: id, global: true, spaceId: q.SpaceId, root: q.Root}
 		}
@@ -237,7 +242,7 @@ func (s *Source) unavailable(candidates []banKey) error {
 	s.banMu.Lock()
 	for _, k := range candidates {
 		e, ok := s.banned[k]
-		if !ok || e.failures == 0 || !now.Before(e.until) {
+		if !ok || e.banned || !now.Before(e.until) {
 			continue
 		}
 		waiting++
@@ -348,36 +353,41 @@ func (s *Source) peer(ctx context.Context, peerId string, global bool) (peer.Pee
 // relayed path that works.
 func (s *Source) ban(peerId string, global bool) {
 	s.banMu.Lock()
-	s.banned[banKey{peerId, global}] = exclusion{until: time.Now().Add(s.b.ban)}
+	s.banned[banKey{peerId, global}] = exclusion{until: time.Now().Add(s.b.ban), banned: true}
 	s.banMu.Unlock()
 }
 
 // unreachable backs a peer off on one layer after a failed dial or
 // FileCheck: backoffMin, doubled per consecutive failure, up to
-// backoffMax.
+// backoffMax. A failure seen while the peer is already skipped adds
+// nothing: fetches that asked it together lost the same round trip,
+// and a ban is not shortened into a backoff.
 func (s *Source) unreachable(peerId string, global bool) {
 	k := banKey{peerId, global}
+	now := time.Now()
 	s.banMu.Lock()
 	defer s.banMu.Unlock()
 	e := s.banned[k]
+	if now.Before(e.until) {
+		return
+	}
 	e.failures++
+	e.banned = false
 	wait := s.b.backoffMax
 	// the shift is bounded so a long outage cannot overflow it
 	if shift := e.failures - 1; shift < 16 {
 		wait = min(s.b.backoffMin<<shift, s.b.backoffMax)
 	}
-	if until := time.Now().Add(wait); until.After(e.until) {
-		e.until = until
-	}
+	e.until = now.Add(wait)
 	s.banned[k] = e
 }
 
 // answered clears a peer's backoff: it replied to a FileCheck. A ban
-// for invalid content stays.
+// for invalid content stays, also one that followed a backoff.
 func (s *Source) answered(peerId string, global bool) {
 	k := banKey{peerId, global}
 	s.banMu.Lock()
-	if e, ok := s.banned[k]; ok && e.failures > 0 {
+	if e, ok := s.banned[k]; ok && !e.banned {
 		delete(s.banned, k)
 	}
 	s.banMu.Unlock()
@@ -389,11 +399,13 @@ type banKey struct {
 	global bool
 }
 
-// exclusion keeps a peer out of one layer's selection until `until`.
-// failures counts consecutive unreachable verdicts; zero marks a ban.
+// exclusion keeps a peer out of one layer's selection until `until`:
+// a ban, or a backoff after `failures` consecutive unreachable
+// verdicts.
 type exclusion struct {
 	until    time.Time
 	failures int
+	banned   bool
 }
 
 func (s *Source) filterBanned(ids []string, global bool) []string {
@@ -407,7 +419,7 @@ func (s *Source) filterBanned(ids []string, global bool) []string {
 	// again right after it keeps climbing instead of starting over.
 	for k, e := range s.banned {
 		end := e.until
-		if e.failures > 0 {
+		if !e.banned {
 			end = end.Add(s.b.backoffMax)
 		}
 		if !now.Before(end) {

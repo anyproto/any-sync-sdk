@@ -174,9 +174,11 @@ is a peer that stops answering.
 
 A peer that fails a dial or an availability check is skipped for 5 s,
 doubling per consecutive failure up to a minute, and asked again after
-that; any answer clears it. A peer that serves invalid content is
-skipped for 5 minutes. The error says when peers that may hold the file
-are only waiting out that backoff.
+that; any answer clears it. A peer that answers with a refusal, because
+it does not list this device with the space yet, is not skipped at all.
+A peer that serves invalid content is skipped for 5 minutes. The error
+says when peers that may hold the file are only waiting out that
+backoff.
 
 ## Status
 

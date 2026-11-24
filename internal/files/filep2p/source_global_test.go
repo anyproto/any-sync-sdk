@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/commonfile/fileproto/filep2p"
+	"github.com/anyproto/any-sync/commonfile/fileproto/filep2p/filep2perr"
 	"github.com/anyproto/any-sync/net/peer"
 	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
@@ -636,4 +637,32 @@ type emptyConn struct{ drpc.Conn }
 
 func (emptyConn) Invoke(context.Context, string, drpc.Encoding, drpc.Message, drpc.Message) error {
 	return nil
+}
+
+// refusingPeer answers every RPC with the handler's refusal, as a holder
+// does until it lists the asking device with the space.
+type refusingPeer struct {
+	peer.Peer
+	id string
+}
+
+func (r refusingPeer) Id() string { return r.id }
+func (r refusingPeer) DoDrpc(context.Context, func(conn drpc.Conn) error) error {
+	return filep2perr.ErrForbidden
+}
+
+// A refusal is an answer from a live peer: it is not backed off, so the
+// fetch that comes once the peer lists this device is not turned away.
+func TestSourceDoesNotBackOffARefusingPeer(t *testing.T) {
+	pool := &hangingDialPool{connected: map[string]peer.Peer{"g1": refusingPeer{id: "g1"}}}
+	s := newTestSource(pool, globalOnlyPeers{global: []string{"g1"}})
+
+	_, _, err := s.SourceFor(context.Background(), query(t, "space1"))
+	require.ErrorIs(t, err, fetch.ErrNotAvailable)
+	require.False(t, s.isBanned("g1", true))
+
+	pool.connected["g1"] = holderPeer{id: "g1"}
+	src, _, err := s.SourceFor(context.Background(), query(t, "space1"))
+	require.NoError(t, err, "asked again at once")
+	require.Equal(t, "g1", src.(*peerCar).peerId)
 }

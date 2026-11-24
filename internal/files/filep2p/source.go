@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/anyproto/any-sync/commonfile/fileproto/filep2p"
+	"github.com/anyproto/any-sync/commonfile/fileproto/filep2p/filep2perr"
 	"github.com/anyproto/any-sync/net/peer"
+	"github.com/anyproto/any-sync/net/rpc/rpcerr"
 	"github.com/ipfs/go-cid"
 	"storj.io/drpc"
 
@@ -288,7 +290,8 @@ func (s *Source) sweepLayer(lctx context.Context, ids []string, global bool, q f
 // and a FileCheck attempted on it. LAN peers are dialed; a global peer
 // is only picked from the pool and skipped, with no verdict, when it has
 // no live connection. A dial/RPC failure backs the peer off — it is
-// unreachable — and any answer clears that. The layer clock (or the
+// unreachable — and any answer clears that, a refusal included. The
+// layer clock (or the
 // caller) ending first is no verdict: that cut-off says nothing about
 // the peer. Nor is a dial error carrying ANOTHER caller's cancel: the
 // pool shares an in-flight dial's outcome with every waiter (retrying a
@@ -327,13 +330,29 @@ func (s *Source) holdsFull(lctx context.Context, peerId string, global bool, spa
 		return nil
 	})
 	if err != nil {
-		if lctx.Err() == nil {
+		switch {
+		case lctx.Err() != nil:
+		case refused(err):
+			// The peer is there. It turns the check down until it lists
+			// this device with the space, which may be a moment away.
+			s.answered(peerId, global)
+		default:
 			s.unreachable(peerId, global)
 		}
 		return true, false
 	}
 	s.answered(peerId, global)
 	return true, full
+}
+
+// refused reports a check the peer's handler turned down: an answer
+// from a live peer, not a failure to reach it.
+func refused(err error) bool {
+	switch rpcerr.Unwrap(err) {
+	case filep2perr.ErrForbidden, filep2perr.ErrInvalidRequest, filep2perr.ErrFileNotFound, filep2perr.ErrUnexpected:
+		return true
+	}
+	return false
 }
 
 // peer resolves a candidate: dial for LAN, live connection only for

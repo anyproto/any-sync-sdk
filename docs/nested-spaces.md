@@ -109,6 +109,9 @@ can still be admitted to a child or act on one.
    - the parent exists and is not deleted or in deletion;
    - the parent is an organization, the child is a space of an
      organization, and the child's header is V1;
+   - the ACL root in the child's header is written by the creator and is
+     not the root of a 1-1 space, so the creator is the child's first
+     owner;
    - the caller is a Writer or above in the parent at that moment;
    - the legalOwner's limit is not exceeded.
 4. The creator pushes the child with the receipt.
@@ -122,6 +125,10 @@ Only the sign that registers a child is checked this way. A registered
 child is signed again without the parent checks, so a later change in the
 parent never turns a working child into a refused one. A child needs no
 step to become shareable.
+
+An organization is signed with the same check of its ACL root, so it has
+the V1 header too. A node refuses a child whose stored root is not its
+creator's own.
 
 A child the coordinator refuses is kept as a local space with a status
 that names the failed check: the parent is not available, the parent or
@@ -241,7 +248,8 @@ The new owner must also be a member of the parent.
 The parent's Owner can delete a child without access to its data. The
 coordinator accepts the parent's current owner in place of the child's
 owner. The child's owner cannot undo a deletion made by the parent's
-Owner.
+Owner, also when the child's owner had asked for the deletion first: the
+deletion then becomes the parent Owner's.
 
 ## Deleting a parent
 
@@ -251,7 +259,12 @@ parent's Owner deletes the children first, and deletes the parent once its
 list of children is empty.
 
 The deletion of an account is refused the same way while a space it owns
-has a child of another account.
+has a child of another account. The children the account owns itself go
+into deletion with it.
+
+A child in deletion comes back only under a parent that is neither deleted
+nor in deletion. When the deletion of an account is taken back, its
+organizations come back with their children.
 
 ## Protocol version
 

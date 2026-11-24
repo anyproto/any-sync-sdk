@@ -247,56 +247,108 @@ func openChildTestSDK(t *testing.T, ctx context.Context, dataDir string) *SDK {
 }
 
 // A joined child space reaches the index as a row with no type and no
-// parent. Its first load fills both from the space header.
+// parent. Its first load fills both from the space header. A row can
+// hold the type alone, written by a device whose SDK reads no parent
+// from a header: the first load here fills the parent.
 func TestSDK_ChildSpace_JoinedRowTakesParentFromHeader(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	sdk := openChildTestSDK(t, ctx, t.TempDir())
 	defer func() { _ = sdk.Close() }()
 
-	parent, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	assert.Empty(t, parent.Info().ParentSpaceId, "a top-level space has no parent")
 
-	// The child's storage as a pull leaves it, and the row a join
-	// registers before the header is readable.
+	// The child's storage as a pull leaves it.
 	keys := sdk.app.AccountKeys()
-	readKey, err := crypto.NewRandomAES()
-	require.NoError(t, err)
-	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
-	require.NoError(t, err)
-	childId, err := sdk.app.SpaceService().CreateSpace(ctx, spacepayloads.SpaceCreatePayload{
-		SigningKey:       keys.SignKey,
-		MasterKey:        keys.SignKey,
-		ReadKey:          readKey,
-		MetadataKey:      metadataKey,
-		SpaceType:        space.SpaceTypeAny,
-		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
-		ParentSpaceId:    parent.Id(),
-	})
-	require.NoError(t, err)
-	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{Id: childId, RemoteStatus: techspace.StatusActive})
-	require.NoError(t, err)
-
-	child, err := sdk.Spaces().Get(ctx, childId)
-	require.NoError(t, err)
-	info := child.Info()
-	assert.Equal(t, parent.Id(), info.ParentSpaceId)
-	assert.Equal(t, space.SpaceTypeAny, info.Type)
-
-	rec, ok := sdk.tsp.Get(ctx, childId)
-	require.True(t, ok)
-	assert.Equal(t, parent.Id(), rec.ParentSpaceId, "the row keeps the parent id")
-	assert.Equal(t, space.SpaceTypeAny, rec.Type)
-
-	list, err := sdk.Spaces().List(ctx)
-	require.NoError(t, err)
-	parents := map[string]string{}
-	for _, in := range list {
-		parents[in.Id] = in.ParentSpaceId
+	pulled := func() string {
+		readKey, err := crypto.NewRandomAES()
+		require.NoError(t, err)
+		metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
+		require.NoError(t, err)
+		childId, err := sdk.app.SpaceService().CreateSpace(ctx, spacepayloads.SpaceCreatePayload{
+			SigningKey:       keys.SignKey,
+			MasterKey:        keys.SignKey,
+			ReadKey:          readKey,
+			MetadataKey:      metadataKey,
+			SpaceType:        space.SpaceTypeOrganizationSpace,
+			FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
+			ParentSpaceId:    parent.Id(),
+		})
+		require.NoError(t, err)
+		return childId
 	}
-	assert.Equal(t, parent.Id(), parents[childId])
-	assert.Empty(t, parents[parent.Id()])
+
+	rows := map[string]techspace.SpaceIndexRecord{
+		"the row a join registers before the header is readable": {RemoteStatus: techspace.StatusActive},
+		"the row with the type alone":                            {RemoteStatus: techspace.StatusActive, Type: space.SpaceTypeOrganizationSpace},
+	}
+	for name, row := range rows {
+		childId := pulled()
+		row.Id = childId
+		_, err = sdk.tsp.Add(ctx, row)
+		require.NoError(t, err)
+
+		child, err := sdk.Spaces().Get(ctx, childId)
+		require.NoError(t, err)
+		info := child.Info()
+		assert.Equal(t, parent.Id(), info.ParentSpaceId, name)
+		assert.Equal(t, space.SpaceTypeOrganizationSpace, info.Type, name)
+
+		rec, ok := sdk.tsp.Get(ctx, childId)
+		require.True(t, ok)
+		assert.Equal(t, parent.Id(), rec.ParentSpaceId, "%s: the row keeps the parent id", name)
+		assert.Equal(t, space.SpaceTypeOrganizationSpace, rec.Type, name)
+
+		list, err := sdk.Spaces().List(ctx)
+		require.NoError(t, err)
+		parents := map[string]string{}
+		for _, in := range list {
+			parents[in.Id] = in.ParentSpaceId
+		}
+		assert.Equal(t, parent.Id(), parents[childId], name)
+		assert.Empty(t, parents[parent.Id()])
+	}
+}
+
+// Create makes a space outside any organization, or an organization:
+// the type goes into the header, the row and the app-level tag. The
+// type of a child is not accepted: such a space comes from CreateChild.
+func TestSDK_Create_SpaceTypes(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	sdk := openChildTestSDK(t, ctx, t.TempDir())
+	defer func() { _ = sdk.Close() }()
+	spaces := sdk.Spaces()
+
+	for _, tc := range []struct{ asked, want string }{
+		{"", space.SpaceTypeAny},
+		{space.SpaceTypeAny, space.SpaceTypeAny},
+		{space.SpaceTypeOrganization, space.SpaceTypeOrganization},
+	} {
+		sp, err := spaces.Create(ctx, space.CreateRequest{Name: "Space", SpaceType: tc.asked})
+		require.NoError(t, err, tc.asked)
+		info := sp.Info()
+		assert.Equal(t, tc.want, info.Type, tc.asked)
+		assert.Equal(t, tc.want, info.SpaceType, tc.asked)
+		assert.Empty(t, info.ParentSpaceId, tc.asked)
+		hdr := spaceHeaderOf(t, ctx, sdk, sp.Id())
+		assert.Equal(t, tc.want, hdr.SpaceType, tc.asked)
+		assert.Empty(t, hdr.ParentSpaceId, tc.asked)
+		assert.Equal(t, replicationSuffix(sdk.TechSpaceId()), replicationSuffix(sp.Id()), tc.asked)
+		wmWrite(t, ctx, sp, 1)
+	}
+
+	before, err := spaces.List(ctx)
+	require.NoError(t, err)
+	for _, refused := range []string{space.SpaceTypeOrganizationSpace, space.SpaceTypeOneToOne, "anytype.space"} {
+		_, err := spaces.Create(ctx, space.CreateRequest{Name: "Space", SpaceType: refused})
+		require.ErrorIs(t, err, space.ErrBadSpaceType, refused)
+	}
+	after, err := spaces.List(ctx)
+	require.NoError(t, err)
+	assert.Len(t, after, len(before), "a refused Create adds no row")
 }
 
 func spaceHeaderOf(t *testing.T, ctx context.Context, sdk *SDK, spaceId string) *spacesyncproto.SpaceHeader {
@@ -314,15 +366,16 @@ func replicationSuffix(spaceId string) string {
 	return spaceId[strings.LastIndexByte(spaceId, '.'):]
 }
 
-// A child is created with no network. Its v1 header names the parent,
-// its row carries the parent id, and the parent is not written to.
+// A child is created with no network. Its v1 header carries the child
+// type and names the parent, its row carries both, and the parent is
+// not written to.
 func TestSDK_CreateChild_Offline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	dataDir := t.TempDir()
 	sdk := openChildTestSDK(t, ctx, dataDir)
 
-	parent, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := sdk.Spaces().Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	parentHandle, err := sdk.app.GetSpace(ctx, parent.Id())
 	require.NoError(t, err)
@@ -336,13 +389,14 @@ func TestSDK_CreateChild_Offline(t *testing.T) {
 	info := child.Info()
 	assert.Equal(t, parent.Id(), info.ParentSpaceId)
 	assert.Equal(t, space.StatusActive, info.Status)
-	assert.Equal(t, space.SpaceTypeAny, info.Type)
+	assert.Equal(t, space.SpaceTypeOrganizationSpace, info.Type)
+	assert.Equal(t, space.SpaceTypeOrganizationSpace, info.SpaceType)
 	assert.Equal(t, "Child", info.Name)
 
 	hdr := spaceHeaderOf(t, ctx, sdk, childId)
 	assert.Equal(t, parent.Id(), hdr.ParentSpaceId)
 	assert.Equal(t, spacesyncproto.SpaceHeaderVersion_SpaceHeaderVersion1, hdr.Version)
-	assert.Equal(t, space.SpaceTypeAny, hdr.SpaceType)
+	assert.Equal(t, space.SpaceTypeOrganizationSpace, hdr.SpaceType)
 	assert.Equal(t, replicationSuffix(parent.Id()), replicationSuffix(childId))
 
 	assert.Equal(t, aclHeadBefore, parentHandle.Inner().Acl().Head().Id, "the parent's ACL is not written to")
@@ -379,8 +433,8 @@ func TestSDK_CreateChild_TakesParentReplicationKey(t *testing.T) {
 }
 
 // CreateChild refuses a parent the index does not hold as an accepted
-// space, and one the index already shows cannot be a parent. No row is
-// added then.
+// space, and one the index already shows is not an organization. No row
+// is added then.
 func TestSDK_CreateChild_RefusedParents(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -388,25 +442,29 @@ func TestSDK_CreateChild_RefusedParents(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
 	derived, err := spaces.Derive(ctx, space.DeriveRequest{Seed: []byte("test/child/derived-parent")})
 	require.NoError(t, err)
-	deleted, err := spaces.Create(ctx, space.CreateRequest{Name: "Deleted"})
+	plain, err := spaces.Create(ctx, space.CreateRequest{Name: "Plain"})
+	require.NoError(t, err)
+	deleted, err := spaces.Create(ctx, space.CreateRequest{Name: "Deleted", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	require.NoError(t, spaces.Delete(ctx, deleted.Id()))
 
 	const (
-		oneToOne = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.1onetoone"
-		pending  = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.2pending"
-		foreign  = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.3foreign"
+		oneToOne   = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.1onetoone"
+		pending    = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.2pending"
+		foreign    = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.3foreign"
+		typedChild = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.5child"
 	)
 	for _, rec := range []techspace.SpaceIndexRecord{
 		{Id: oneToOne, Type: space.SpaceTypeOneToOne, RemoteStatus: techspace.StatusActive, OneToOnePeer: "peer"},
 		{Id: pending, RemoteStatus: techspace.InvitePendingRemoteStatus},
 		{Id: foreign, Type: "anytype.space", RemoteStatus: techspace.StatusActive},
+		{Id: typedChild, Type: space.SpaceTypeOrganizationSpace, RemoteStatus: techspace.StatusActive},
 	} {
 		_, err := sdk.tsp.Add(ctx, rec)
 		require.NoError(t, err)
@@ -425,6 +483,8 @@ func TestSDK_CreateChild_RefusedParents(t *testing.T) {
 		{"not accepted", pending, space.ErrSpaceNotAccepted},
 		{"tech space", sdk.TechSpaceId(), space.ErrParentSpaceInvalid},
 		{"child", child.Id(), space.ErrParentSpaceInvalid},
+		{"child whose row names no parent", typedChild, space.ErrParentSpaceInvalid},
+		{"space outside any organization", plain.Id(), space.ErrParentSpaceInvalid},
 		{"derived", derived.Id(), space.ErrParentSpaceInvalid},
 		{"1-1", oneToOne, space.ErrParentSpaceInvalid},
 		{"another header type", foreign, space.ErrParentSpaceInvalid},
@@ -452,7 +512,7 @@ func TestSDK_ChildSpace_RefusalRecordedAndCleared(t *testing.T) {
 	sdk := openChildTestSDK(t, ctx, dataDir)
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	sdk.app.NodeAnsweredForTest(parent.Id())
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
@@ -515,7 +575,8 @@ func TestSDK_ChildSpace_RefusalRecordedAndCleared(t *testing.T) {
 	assert.Equal(t, space.RefusalNone, rec.Refusal, "and stays cleared")
 }
 
-// RetryPush is for a child space the account holds.
+// RetryPush is for a child space the account holds. A row with the type
+// of a child and no parent id is the row of one.
 func TestSDK_RetryPush_RefusedSpaces(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -525,7 +586,7 @@ func TestSDK_RetryPush_RefusedSpaces(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
@@ -534,6 +595,15 @@ func TestSDK_RetryPush_RefusedSpaces(t *testing.T) {
 	require.ErrorIs(t, spaces.RetryPush(ctx, "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.4unknown"), space.ErrSpaceUnknown)
 	require.NoError(t, spaces.Delete(ctx, child.Id()))
 	require.ErrorIs(t, spaces.RetryPush(ctx, child.Id()), space.ErrSpaceDeleted)
+
+	const typedChild = "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi.5child"
+	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
+		Id: typedChild, Type: space.SpaceTypeOrganizationSpace, RemoteStatus: techspace.StatusActive,
+	})
+	require.NoError(t, err)
+	require.ErrorIs(t, spaces.RetryPush(ctx, typedChild), space.ErrSpaceNotStored)
+	_, err = spaces.ChildMembers(ctx, typedChild)
+	require.ErrorIs(t, err, space.ErrOffline, "the parent side takes it for a child too")
 	assert.Zero(t, coord.signs, "none of them reaches the coordinator")
 }
 
@@ -556,7 +626,7 @@ func TestSDK_ChildSpace_RefusalClearedByCoordinatorStatus(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	sdk.app.NodeAnsweredForTest(parent.Id())
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
@@ -670,7 +740,7 @@ func foreignChildId(t *testing.T, parentSpaceId string) string {
 		MasterKey:     keys.SignKey,
 		ReadKey:       crypto.NewAES(),
 		MetadataKey:   metadataKey,
-		SpaceType:     space.SpaceTypeAny,
+		SpaceType:     space.SpaceTypeOrganizationSpace,
 		ParentSpaceId: parentSpaceId,
 	})
 	require.NoError(t, err)
@@ -699,7 +769,7 @@ func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string)
 		MasterKey:     owner.SignKey,
 		ReadKey:       crypto.NewAES(),
 		MetadataKey:   metadataKey,
-		SpaceType:     space.SpaceTypeAny,
+		SpaceType:     space.SpaceTypeOrganizationSpace,
 		ParentSpaceId: parentSpaceId,
 	})
 	require.NoError(t, err)
@@ -714,9 +784,9 @@ func newForeignChild(t *testing.T, network testNetworkKey, parentSpaceId string)
 
 // heldBy makes the device of sdk hold the child with its account as a
 // member of role perm: the storage a pull leaves, the ACL record that
-// adds the account, and the row an accepted invite leaves. It returns
-// the child's ACL on that device.
-func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, parentSpaceId string, perm list.AclPermissions) list.AclList {
+// adds the account, and the row an accepted invite leaves, which names
+// rowParent as the parent. It returns the child's ACL on that device.
+func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, rowParent string, perm list.AclPermissions) list.AclList {
 	t.Helper()
 	rec, err := c.ownerAcl(t).RecordBuilder().BuildAccountsAdd(list.AccountsAddPayload{Additions: []list.AccountAdd{
 		{Identity: sdk.app.AccountKeys().SignKey.GetPublic(), Permissions: perm},
@@ -741,10 +811,10 @@ func (c *foreignChild) heldBy(t *testing.T, ctx context.Context, sdk *SDK, paren
 
 	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
 		Id:            c.id,
-		Type:          space.SpaceTypeAny,
-		SpaceType:     space.SpaceTypeAny,
+		Type:          space.SpaceTypeOrganizationSpace,
+		SpaceType:     space.SpaceTypeOrganizationSpace,
 		RemoteStatus:  techspace.StatusActive,
-		ParentSpaceId: parentSpaceId,
+		ParentSpaceId: rowParent,
 	})
 	require.NoError(t, err)
 	return acl
@@ -835,7 +905,7 @@ func TestSDK_ChildGovernance_FromTheParentSide(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	childId := foreignChildId(t, parent.Id())
 	member, newOwner := randomIdentity(t), randomIdentity(t)
@@ -950,7 +1020,7 @@ func TestSDK_DeleteChild_HeldByTheAccount(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	newChild := func() string {
 		child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
@@ -1017,7 +1087,7 @@ func TestSDK_ChildInDeletionOnTheNetwork_IsRemovedByTheReconciler(t *testing.T) 
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
@@ -1076,7 +1146,7 @@ func TestSDK_ChildSpace_RotationCompletedByTheWatcher(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
@@ -1171,7 +1241,7 @@ func TestSDK_Delete_OwnedSpaceWithHeldChild(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	require.Eventually(t, func() bool { return parent.Info().OwnRole == space.PermissionOwner },
 		20*time.Second, 10*time.Millisecond, "the ACL mirror records the role")
@@ -1208,7 +1278,7 @@ func TestSDK_ChildSpace_OnlyParentMembersAreAdmitted(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
@@ -1296,15 +1366,15 @@ func TestSDK_ChildSpace_RefusalOnADeviceWithoutTheSpace(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	// The row as it syncs in from the device that created the child
 	// and was refused.
 	childId := foreignChildId(t, parent.Id())
 	_, err = sdk.tsp.Add(ctx, techspace.SpaceIndexRecord{
 		Id:            childId,
-		Type:          space.SpaceTypeAny,
-		SpaceType:     space.SpaceTypeAny,
+		Type:          space.SpaceTypeOrganizationSpace,
+		SpaceType:     space.SpaceTypeOrganizationSpace,
 		RemoteStatus:  techspace.StatusActive,
 		ParentSpaceId: parent.Id(),
 	})
@@ -1380,7 +1450,7 @@ func TestSDK_ChildSpace_SignWaitsForItsOwnParent(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id()})
 	require.NoError(t, err)
@@ -1417,10 +1487,10 @@ func spaceInfoOf(t *testing.T, ctx context.Context, sdk *SDK, spaceId string) sp
 	return space.SpaceInfo{}
 }
 
-// The owner of a space is usually no member of the children others
-// created under it, so the index does not show them. With the
-// coordinator in reach, Delete asks it before anything is written: a
-// space with children is not deleted and stays as it is.
+// The owner of an organization is usually no member of the children
+// others created under it, so the index does not show them. With the
+// coordinator in reach, Delete asks it before anything is written: an
+// organization with children is not deleted and stays as it is.
 func TestSDK_Delete_OwnedSpaceAsksTheCoordinatorFirst(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1431,7 +1501,7 @@ func TestSDK_Delete_OwnedSpaceAsksTheCoordinatorFirst(t *testing.T) {
 	spaces := sdk.Spaces()
 
 	// Right after Create the ACL mirror may not have written the role.
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	require.ErrorIs(t, spaces.Delete(ctx, parent.Id()), space.ErrSpaceHasChildren)
 	assert.Equal(t, []string{parent.Id()}, coord.deleted, "the coordinator was asked")
@@ -1447,14 +1517,18 @@ func TestSDK_Delete_OwnedSpaceAsksTheCoordinatorFirst(t *testing.T) {
 	assert.Equal(t, space.StatusDeleted, spaceInfoOf(t, ctx, sdk, parent.Id()).Status)
 	assert.False(t, sdk.app.SpaceExists(parent.Id()))
 
-	// A child cannot have children: its delete does not ask first.
-	other, err := spaces.Create(ctx, space.CreateRequest{Name: "Other"})
+	// Only an organization has children: the delete of a child, and of
+	// a space outside any organization, does not ask first.
+	other, err := spaces.Create(ctx, space.CreateRequest{Name: "Other", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child, err := spaces.CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: other.Id()})
+	require.NoError(t, err)
+	plain, err := spaces.Create(ctx, space.CreateRequest{Name: "Plain"})
 	require.NoError(t, err)
 	asked := len(coord.deleted)
 	coord.set(func() { coord.del = func(string) error { return anynet.ErrUnableToConnect } })
 	require.NoError(t, spaces.Delete(ctx, child.Id()))
+	require.NoError(t, spaces.Delete(ctx, plain.Id()))
 	assert.Len(t, coord.deleted, asked)
 }
 
@@ -1516,7 +1590,7 @@ func TestSDK_Delete_DeferredDeleteWaitsForChildren(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	parentId := parent.Id()
 	parentDelete.id.Store(&parentId)
@@ -1564,7 +1638,7 @@ func TestSDK_DeleteChild_SendsAWaitingParentDeleteAgain(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	parentId := parent.Id()
 	parentDelete.id.Store(&parentId)
@@ -1593,7 +1667,7 @@ func TestSDK_ChildMembers_AndTheRecordsBuiltOnThem(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child := newForeignChild(t, network, parent.Id())
 
@@ -1679,7 +1753,7 @@ func TestSDK_Delete_RowWithUnreadHeaderSendsNoSignedDelete(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	childId := foreignChildId(t, parent.Id())
 	require.NoError(t, spaces.Track(ctx, childId))
@@ -1715,7 +1789,7 @@ func TestSDK_ChildCalls_UnknownAndDeletedSpaces(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child := newForeignChild(t, network, parent.Id())
 	member := child.addMember(t, list.AclPermissionsWriter).Account()
@@ -1808,7 +1882,7 @@ func TestSDK_ChildRotationPending(t *testing.T) {
 	defer func() { _ = sdk.Close() }()
 	spaces := sdk.Spaces()
 
-	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent"})
+	parent, err := spaces.Create(ctx, space.CreateRequest{Name: "Parent", SpaceType: space.SpaceTypeOrganization})
 	require.NoError(t, err)
 	child := newForeignChild(t, network, parent.Id())
 
@@ -2033,8 +2107,14 @@ func TestSDK_ChildSpace_AdminAddsMembersWithoutMakeShareable(t *testing.T) {
 
 // A device of an Admin of a child that starts with a rotation pending
 // ends it by itself: the boot pass loads the child and starts the
-// watcher that rotates, with no Get of the space.
+// watcher that rotates, with no Get of the space. The row tells the
+// child by its parent id, and by its type when it names no parent.
 func TestSDK_ChildSpace_RotationAfterRestartWithoutGet(t *testing.T) {
+	t.Run("the row names the parent", func(t *testing.T) { rotationAfterRestartWithoutGet(t, foreignSpaceA) })
+	t.Run("the row has the type alone", func(t *testing.T) { rotationAfterRestartWithoutGet(t, "") })
+}
+
+func rotationAfterRestartWithoutGet(t *testing.T, rowParent string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	net := installFakeNetwork(t)
@@ -2051,7 +2131,7 @@ func TestSDK_ChildSpace_RotationAfterRestartWithoutGet(t *testing.T) {
 	parent := foreignSpaceA
 	require.NoError(t, sdk.Spaces().Track(ctx, parent))
 	child := newForeignChild(t, network, parent)
-	acl := child.heldBy(t, ctx, sdk, parent, list.AclPermissionsAdmin)
+	acl := child.heldBy(t, ctx, sdk, rowParent, list.AclPermissionsAdmin)
 	member := child.addMember(t, list.AclPermissionsWriter)
 	parentAdmin, err := accountdata.NewRandom()
 	require.NoError(t, err)

@@ -36,8 +36,8 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 	require.NotNil(t, limits.ChildSpaces, "the coordinator reports a child spaces limit")
 	require.EqualValues(t, 3, limits.ChildSpaces.Limit, "the suite expects a child spaces limit of 3")
 
-	parent1 := owner.create(t, ctx, "Parent 1")
-	parent2 := owner.create(t, ctx, "Parent 2")
+	parent1 := owner.createOrganization(t, ctx, "Parent 1")
+	parent2 := owner.createOrganization(t, ctx, "Parent 2")
 	addMembers(t, ctx, parent1, grant{admin, space.PermissionAdmin}, grant{reader, space.PermissionReader})
 	addMembers(t, ctx, parent2, grant{writer, space.PermissionWriter})
 
@@ -61,14 +61,16 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 		require.True(t, ok, "%s holds a row of its child", c.by.name)
 		assert.Equal(t, c.parent, row.ParentSpaceId, "%s: ParentSpaceId", c.by.name)
 		assert.Equal(t, space.RefusalNone, row.Refusal, "%s: a signed child has no refusal", c.by.name)
-		assert.Equal(t, space.SpaceTypeAny, row.Type, "%s: a child is a regular space", c.by.name)
+		assert.Equal(t, space.SpaceTypeOrganizationSpace, row.Type, "%s: the type of a child", c.by.name)
 	}
 
-	t.Run("OnlyRegularTopLevelParents", func(t *testing.T) {
+	t.Run("OnlyOrganizationsAreParents", func(t *testing.T) {
 		derived, err := owner.spaces().Derive(ctx, space.DeriveRequest{Seed: []byte("not a parent")})
 		require.NoError(t, err)
+		plain := owner.create(t, ctx, "Outside any organization")
 		for _, p := range []struct{ name, id string }{
 			{"a child", ownersChild.Id()},
+			{"a space outside any organization", plain.Id()},
 			{"a derived space", derived.Id()},
 			{"the tech space", owner.sdk.TechSpaceId()},
 		} {
@@ -138,7 +140,7 @@ func childSpacesCreateAndLimit(t *testing.T, net *childNet) {
 
 	// The creators are not charged: the Writer, who created a child of
 	// the owner's parent, still has a whole limit of its own.
-	writersParent := writer.create(t, ctx, "Writer's own parent")
+	writersParent := writer.createOrganization(t, ctx, "Writer's own parent")
 	var own []space.Space
 	for _, name := range []string{"Own child 1", "Own child 2", "Own child 3"} {
 		own = append(own, writer.createChild(t, ctx, writersParent.Id(), name))
@@ -174,7 +176,7 @@ func childSpacesRefusedChildDeletedElsewhere(t *testing.T, net *childNet) {
 
 	owner := net.account(t, ctx, "owner")
 	creator := net.account(t, ctx, "creator's first device")
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent, grant{creator, space.PermissionReader})
 
 	child := creator.createChild(t, ctx, parent.Id(), "Reader's child")
@@ -247,7 +249,7 @@ func childSpacesCreateOffline(t *testing.T, net *childNet) {
 	owner := net.open(t, ctx, "owner behind proxies", newFixedSeedProvider(t), proxied)
 	ownerB := net.device(t, ctx, owner, "owner's second device")
 
-	parent := owner.create(t, ctx, "Online parent")
+	parent := owner.createOrganization(t, ctx, "Online parent")
 	require.True(t, waitFor(ctx, 60*time.Second, 250*time.Millisecond, func() bool {
 		st := owner.spaces().Status(parent.Id())
 		return st.State == space.SyncStateSynced && st.NetworkPeers > 0
@@ -269,7 +271,7 @@ func childSpacesCreateOffline(t *testing.T, net *childNet) {
 	assert.ErrorIs(t, owner.spaces().RetryPush(offline(), child.Id()), space.ErrOffline, "RetryPush offline")
 
 	// A parent and its child, both created offline.
-	parent2 := owner.create(t, ctx, "Offline parent")
+	parent2 := owner.createOrganization(t, ctx, "Offline parent")
 	child2 := owner.createChild(t, ctx, parent2.Id(), "Child of the offline parent")
 	parent2Note := writeNote(t, ctx, parent2, "written offline in the parent")
 	child2Note := writeNote(t, ctx, child2, "written offline in its child")
@@ -320,7 +322,7 @@ func childSpacesSharedSpacesLimitUntouched(t *testing.T, net *childNet) {
 
 	owner := net.account(t, ctx, "owner")
 	writer := net.account(t, ctx, "writer")
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent, grant{writer, space.PermissionWriter})
 
 	limits, err := writer.sdk.Account().Limits(ctx)

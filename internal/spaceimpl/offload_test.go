@@ -430,26 +430,31 @@ func TestDropSpaceCollectionsPurgesReadState(t *testing.T) {
 	assert.Equal(t, 1, unread)
 }
 
-// Delete asks the coordinator before it writes only for a space that
-// can have children and that the account owns or may own. A row whose
-// header was not read is asked about only under a mirrored Owner role.
+// Delete asks the coordinator before it writes only for an organization
+// that the account owns or may own. A row whose header was not read is
+// asked about only under a mirrored Owner role.
 func TestSettlesDelete(t *testing.T) {
 	const (
 		none  = space.PermissionNone
 		owner = space.PermissionOwner
+		org   = space.SpaceTypeOrganization
+		child = space.SpaceTypeOrganizationSpace
 	)
 	cases := []struct {
 		name string
 		rec  techspace.SpaceIndexRecord
 		want bool
 	}{
-		{"own space, role mirrored", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, OwnRole: owner}, true},
-		{"created moments ago, role not mirrored", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, OwnRole: none}, true},
+		{"own organization, role mirrored", techspace.SpaceIndexRecord{Type: org, OwnRole: owner}, true},
+		{"created moments ago, role not mirrored", techspace.SpaceIndexRecord{Type: org, OwnRole: none}, true},
 		{"header not read, role mirrored as owner", techspace.SpaceIndexRecord{OwnRole: owner}, true},
 		{"header not read, no role: tracked or joined", techspace.SpaceIndexRecord{OwnRole: none}, false},
-		{"member", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, OwnRole: space.PermissionWriter}, false},
-		{"admin", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, OwnRole: space.PermissionAdmin}, false},
-		{"child of the account", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, ParentSpaceId: "p", OwnRole: owner}, false},
+		{"member", techspace.SpaceIndexRecord{Type: org, OwnRole: space.PermissionWriter}, false},
+		{"admin", techspace.SpaceIndexRecord{Type: org, OwnRole: space.PermissionAdmin}, false},
+		{"child of the account", techspace.SpaceIndexRecord{Type: child, ParentSpaceId: "p", OwnRole: owner}, false},
+		{"child whose row names no parent", techspace.SpaceIndexRecord{Type: child, OwnRole: owner}, false},
+		{"header not read, row names a parent", techspace.SpaceIndexRecord{ParentSpaceId: "p", OwnRole: owner}, false},
+		{"own space outside any organization", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, OwnRole: owner}, false},
 		{"derived", techspace.SpaceIndexRecord{Type: space.SpaceTypeAny, Derived: true, OwnRole: owner}, false},
 		{"another header type", techspace.SpaceIndexRecord{Type: "anytype.space", OwnRole: owner}, false},
 	}

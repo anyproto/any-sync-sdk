@@ -18,10 +18,11 @@ import (
 
 var childLog = logger.NewNamed("sdk.childspaces")
 
-// CreateChild creates a child of req.ParentSpaceId: a space created
-// like any other whose header names the parent. The coordinator checks
-// the parent and the caller's role in it when the child is first
-// pushed, so only what the index already shows is refused here.
+// CreateChild creates a child of the organization req.ParentSpaceId: a
+// space created like any other whose header carries the child type and
+// names the parent. The coordinator checks the parent and the caller's
+// role in it when the child is first pushed, so only what the index
+// already shows is refused here.
 func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest) (space.Space, error) {
 	parentId := req.ParentSpaceId
 	if err := validateSpaceId(parentId); err != nil {
@@ -45,19 +46,25 @@ func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest)
 }
 
 // notAParent says why the space of an index row cannot have children,
-// "" when nothing on the row rules it out. A parent is a regular
-// top-level space. A row with no type yet (joined, never loaded) is not
-// judged.
+// "" when nothing on the row rules it out. A parent is an organization.
+// A row with no type yet (joined, never loaded) is not judged.
 func notAParent(rec techspace.SpaceIndexRecord) string {
 	switch {
-	case rec.ParentSpaceId != "":
+	case IsChild(rec):
 		return "a child space"
 	case rec.Derived:
 		return "a derived space"
-	case rec.Type != "" && rec.Type != space.SpaceTypeAny:
+	case rec.Type != "" && rec.Type != space.SpaceTypeOrganization:
 		return "of type " + rec.Type
 	}
 	return ""
+}
+
+// IsChild reports the row of a child space: it names a parent or has
+// the child type. A device that reads no parent from a header fills the
+// type alone.
+func IsChild(rec techspace.SpaceIndexRecord) bool {
+	return rec.ParentSpaceId != "" || rec.Type == space.SpaceTypeOrganizationSpace
 }
 
 // acceptedRow returns the index row of a space the account holds as an
@@ -143,7 +150,7 @@ func (s *Service) RetryPush(ctx context.Context, spaceId string) error {
 	if err != nil {
 		return err
 	}
-	if rec.ParentSpaceId == "" {
+	if !IsChild(rec) {
 		return fmt.Errorf("spaceimpl: RetryPush: space %q: %w", spaceId, space.ErrNotChildSpace)
 	}
 	// Only a device that holds the space can push it, and loading a
@@ -187,7 +194,7 @@ func childStatus(st coordinatorproto.SpaceStatus) space.ChildStatus {
 // childTarget checks that spaceId can be acted on as a child space from
 // the parent side, as far as the index can tell, and returns its row
 // when the account holds one. A row whose header was read (it has a
-// type) and names no parent is a top-level space.
+// type) and that is not the row of a child is a top-level space.
 func (s *Service) childTarget(ctx context.Context, op, spaceId string) (rec techspace.SpaceIndexRecord, held bool, err error) {
 	if err := validateSpaceId(spaceId); err != nil {
 		return rec, false, err
@@ -197,7 +204,7 @@ func (s *Service) childTarget(ctx context.Context, op, spaceId string) (rec tech
 		return rec, false, notChild
 	}
 	rec, held = s.tsp.Get(ctx, spaceId)
-	if held && rec.Type != "" && rec.ParentSpaceId == "" {
+	if held && rec.Type != "" && !IsChild(rec) {
 		return rec, held, notChild
 	}
 	return rec, held, nil
@@ -309,8 +316,8 @@ func (s *Service) DeleteChild(ctx context.Context, childSpaceId string) error {
 	}
 	err = s.app.SpaceDelete(ctx, childSpaceId)
 	if errors.Is(err, coordinatorproto.ErrSpaceIsCreated) {
-		// The coordinator's answer to a delete of an active regular
-		// space with no parent that another account owns.
+		// The coordinator's answer to a delete of an active space with
+		// no parent that another account owns.
 		return fmt.Errorf("spaceimpl: DeleteChild: space %q: %w: %w", childSpaceId, space.ErrNotChildSpace, err)
 	}
 	if err != nil && !errors.Is(err, coordinatorproto.ErrSpaceDeletionPending) && !errors.Is(err, coordinatorproto.ErrSpaceIsDeleted) {

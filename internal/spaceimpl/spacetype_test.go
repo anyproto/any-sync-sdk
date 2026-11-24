@@ -55,11 +55,13 @@ func TestNormalizeSpaceType(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, space.SpaceTypeAny, got, "empty defaults to the any product type")
 
-	got, err = normalizeSpaceType(space.SpaceTypeAny)
-	assert.NoError(t, err)
-	assert.Equal(t, space.SpaceTypeAny, got)
+	for _, accepted := range []string{space.SpaceTypeAny, space.SpaceTypeOrganization} {
+		got, err = normalizeSpaceType(accepted)
+		assert.NoError(t, err)
+		assert.Equal(t, accepted, got)
+	}
 
-	for _, rejected := range []string{"anytype.space", "anytype.chatspace", space.SpaceTypeOneToOne, "other.space"} {
+	for _, rejected := range []string{"anytype.space", "anytype.chatspace", space.SpaceTypeOneToOne, space.SpaceTypeOrganizationSpace, "other.space"} {
 		_, err := normalizeSpaceType(rejected)
 		assert.ErrorIs(t, err, space.ErrBadSpaceType, rejected)
 	}

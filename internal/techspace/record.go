@@ -22,8 +22,9 @@ type SpaceIndexRecord struct {
 	Id string
 
 	// Type mirrors the space header's SpaceType — one of the
-	// space.SpaceType* constants (anytype.space / anytype.chatspace
-	// / anytype.onetoone). First-write-wins: pinned for life by
+	// space.SpaceType* constants (any.space / any.organization /
+	// any.organization.space / any.onetoone) or, on a joined or tracked
+	// row, an anytype.* type. First-write-wins: pinned for life by
 	// SpaceIndexHandler.BeforeModify.
 	Type string
 

@@ -14,9 +14,9 @@ var (
 	ErrParentSpaceNotAvailable = coordinatorproto.ErrParentSpaceNotAvailable
 
 	// ErrParentSpaceInvalid: the space cannot be a parent. A parent is
-	// a regular top-level space of this SDK's header type: not the tech
-	// space, a 1-1 space, a derived space or a child. CreateChild
-	// returns it for a parent the index already shows as one of those.
+	// an organization (SpaceTypeOrganization). CreateChild returns it
+	// for a parent the index already shows is not one: a space of
+	// another type, a child, a derived space, the tech space.
 	ErrParentSpaceInvalid = coordinatorproto.ErrParentSpaceInvalid
 
 	// ErrParentPermissionDenied: the account's role in the parent space
@@ -35,16 +35,16 @@ var (
 	// exempt.
 	ErrNotParentMember = coordinatorproto.ErrNotParentMember
 
-	// ErrSpaceHasChildren: a space that still has child spaces is not
-	// deleted. Delete returns it for a space the account owns when the
-	// index holds a child of it or the coordinator says so.
+	// ErrSpaceHasChildren: an organization that still has child spaces
+	// is not deleted. Delete returns it for one the account owns when
+	// the index holds a child of it or the coordinator says so.
 	ErrSpaceHasChildren = coordinatorproto.ErrSpaceHasChildren
 )
 
 // ErrNotChildSpace is returned by the calls that act on a child space
-// when the index shows the space has no parent, and by DeleteChild for
-// an active regular top-level space of another account, which the
-// coordinator shows.
+// when the index shows the space is not one, and by DeleteChild for an
+// active top-level space of another account, which the coordinator
+// shows.
 var ErrNotChildSpace = errors.New("space: not a child space")
 
 // ErrSpaceNotStored is returned by RetryPush on a device that holds no
@@ -58,8 +58,8 @@ var ErrOffline = errors.New("space: network not reachable")
 
 // CreateChildRequest is the input to Service.CreateChild.
 type CreateChildRequest struct {
-	// ParentSpaceId is the space the child is created under. The
-	// account is a Writer, an Admin or the Owner of it.
+	// ParentSpaceId is the organization the child is created under.
+	// The account is a Writer, an Admin or the Owner of it.
 	ParentSpaceId string
 
 	Name        string
@@ -121,7 +121,7 @@ const (
 	// RefusalParentNotAvailable: the parent does not exist on the
 	// network or is deleted (ErrParentSpaceNotAvailable).
 	RefusalParentNotAvailable
-	// RefusalParentInvalid: the parent cannot be a parent
+	// RefusalParentInvalid: the parent is not an organization
 	// (ErrParentSpaceInvalid). Final: retrying cannot change it.
 	RefusalParentInvalid
 	// RefusalParentPermissionDenied: the account is not a Writer, an

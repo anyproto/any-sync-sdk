@@ -25,7 +25,7 @@ func childSpacesScopes(t *testing.T, net *childNet) {
 	w2 := net.account(t, ctx, "owner of one child")
 	m := net.account(t, ctx, "member of two children")
 
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent,
 		grant{w1, space.PermissionWriter},
 		grant{w2, space.PermissionWriter},

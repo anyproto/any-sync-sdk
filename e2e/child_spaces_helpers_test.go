@@ -206,11 +206,21 @@ func (d *device) get(t *testing.T, ctx context.Context, spaceId string) space.Sp
 	return sp
 }
 
-// create creates a top-level space on d.
+// create creates a space outside any organization on d.
 func (d *device) create(t *testing.T, ctx context.Context, name string) space.Space {
 	t.Helper()
 	sp, err := d.spaces().Create(ctx, space.CreateRequest{Name: name})
 	require.NoError(t, err, "%s: Create %s", d.name, name)
+	return sp
+}
+
+// createOrganization creates an organization on d: the space children
+// are created under.
+func (d *device) createOrganization(t *testing.T, ctx context.Context, name string) space.Space {
+	t.Helper()
+	sp, err := d.spaces().Create(ctx, space.CreateRequest{Name: name, SpaceType: space.SpaceTypeOrganization})
+	require.NoError(t, err, "%s: Create organization %s", d.name, name)
+	require.Equal(t, space.SpaceTypeOrganization, sp.Info().Type, "%s: the type of %s", d.name, name)
 	return sp
 }
 

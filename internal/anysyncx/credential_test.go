@@ -84,12 +84,16 @@ func testSpaceHeader(t *testing.T, parentSpaceId string) *spacesyncproto.RawSpac
 	require.NoError(t, err)
 	metadataKey, _, err := crypto.GenerateRandomEd25519KeyPair()
 	require.NoError(t, err)
+	spaceType := space.SpaceTypeOrganization
+	if parentSpaceId != "" {
+		spaceType = space.SpaceTypeOrganizationSpace
+	}
 	payload, err := spacepayloads.StoragePayloadForSpaceCreateV1(spacepayloads.SpaceCreatePayload{
 		SigningKey:    keys.SignKey,
 		MasterKey:     keys.SignKey,
 		ReadKey:       crypto.NewAES(),
 		MetadataKey:   metadataKey,
-		SpaceType:     space.SpaceTypeAny,
+		SpaceType:     spaceType,
 		ParentSpaceId: parentSpaceId,
 	})
 	require.NoError(t, err)

@@ -37,7 +37,7 @@ func childSpacesRemovalFromTheParent(t *testing.T, net *childNet) {
 	m2 := net.account(t, ctx, "member removed by the parent's admin")
 	m3 := net.account(t, ctx, "member who stays")
 
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent,
 		grant{padmin, space.PermissionAdmin},
 		grant{pwriter, space.PermissionWriter},
@@ -168,7 +168,7 @@ func childSpacesOwnerAndDeletionFromTheParent(t *testing.T, net *childNet) {
 	cadmin := net.account(t, ctx, "child's admin")
 	cmember := net.account(t, ctx, "child's writer")
 
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent,
 		grant{padmin, space.PermissionAdmin},
 		grant{cowner, space.PermissionWriter},

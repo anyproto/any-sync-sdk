@@ -32,7 +32,7 @@ func childSpacesMembership(t *testing.T, net *childNet) {
 	outsider := net.account(t, ctx, "outsider")
 	outsiderB := net.device(t, ctx, outsider, "outsider's second device")
 
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent,
 		grant{member, space.PermissionWriter},
 		grant{other, space.PermissionReader},

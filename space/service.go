@@ -165,10 +165,11 @@ var ErrIsTechSpace = errors.New("cannot track the tech space")
 var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 
 // ErrBadSpaceType is returned by Create when CreateRequest.SpaceType
-// is outside the allow-list (SpaceTypeAny or empty). The type is
-// content-addressed into the immutable space header and coordinator-
-// gated, so a bad value is rejected up front — classify with
-// errors.Is to turn it into a caller-facing 4xx.
+// is outside the allow-list (SpaceTypeAny, SpaceTypeOrganization or
+// empty). SpaceTypeOrganizationSpace is outside it: CreateChild makes
+// such a space. The type is content-addressed into the immutable space
+// header and coordinator-gated, so a bad value is rejected up front —
+// classify with errors.Is to turn it into a caller-facing 4xx.
 var ErrBadSpaceType = errors.New("unsupported space type")
 
 // Settings-patch sentinels — wrapped by SetSettings validation errors
@@ -184,12 +185,16 @@ var (
 // It owns lifecycle (Create / Join / Derive / Delete) and the space
 // list; individual space operations live on Space.
 type Service interface {
-	// Create a new regular space owned by the authenticated account.
+	// Create a new space owned by the authenticated account:
+	// SpaceTypeAny, or an organization when req.SpaceType is
+	// SpaceTypeOrganization. An organization is a space like any other
+	// that can have child spaces (CreateChild).
 	Create(ctx context.Context, req CreateRequest) (Space, error)
 
-	// CreateChild creates a regular space under req.ParentSpaceId, a
-	// space of the account's index. Like Create it is local and needs
-	// no network: the child's header names the parent, the child takes
+	// CreateChild creates a space of the organization
+	// req.ParentSpaceId, a space of the account's index. Like Create it
+	// is local and needs no network: the child's header carries
+	// SpaceTypeOrganizationSpace and names the parent, the child takes
 	// the parent's replication key, and nothing is written to the
 	// parent. The caller owns the child; membership in the parent gives
 	// no access to it.
@@ -205,8 +210,8 @@ type Service interface {
 	// ErrBadSpaceId for a parent id that is not a space id;
 	// ErrSpaceUnknown, ErrSpaceDeleted or ErrSpaceNotAccepted for a
 	// parent the account does not hold as an accepted space;
-	// ErrParentSpaceInvalid for one the index already shows cannot be a
-	// parent.
+	// ErrParentSpaceInvalid for one the index already shows is not an
+	// organization.
 	CreateChild(ctx context.Context, req CreateChildRequest) (Space, error)
 
 	// RetryPush asks the coordinator to sign the child space spaceId
@@ -241,6 +246,11 @@ type Service interface {
 	// ErrParentPermissionDenied for any other caller. A member finds
 	// the children it belongs to in List, by SpaceInfo.ParentSpaceId.
 	//
+	// The type of parentSpaceId is not checked: an Admin or the Owner of
+	// a space that is not an organization gets an empty list. An empty
+	// list does not say that the space can have children;
+	// SpaceInfo.Type does.
+	//
 	// The list is read from the coordinator on every call and kept
 	// nowhere: ErrOffline when it cannot be reached. The account needs
 	// no row for the parent, and none is created for a child.
@@ -260,7 +270,8 @@ type Service interface {
 	//
 	// The child is not added to the index, loaded or stored. ErrOffline
 	// when the nodes cannot be reached, ErrNotChildSpace for a space
-	// the index shows has no parent, ErrBadSpaceId for a malformed id.
+	// the index shows is not a child space, ErrBadSpaceId for a
+	// malformed id.
 	ChildMembers(ctx context.Context, childSpaceId string) ([]ChildMember, error)
 
 	// ChildRotationPending reports, from the ACL the nodes serve,
@@ -298,8 +309,8 @@ type Service interface {
 	// ErrAccountNotFound for an identity the child's ACL holds no
 	// account of, ErrInsufficientPermissions for the child's Owner or
 	// the caller among the identities, ErrNotChildSpace for a space the
-	// index shows has no parent, ErrBadSpaceId / ErrBadIdentity for
-	// malformed input.
+	// index shows is not a child space, ErrBadSpaceId / ErrBadIdentity
+	// for malformed input.
 	//
 	// The record names the ACL head it was built on. When another
 	// record lands in the child's ACL first, the network refuses this
@@ -341,8 +352,9 @@ type Service interface {
 	// ErrOffline when the coordinator cannot be reached (nothing
 	// changes), ErrParentPermissionDenied for a caller who is neither
 	// the parent's Owner nor the child's, ErrNotChildSpace for a space
-	// the index shows has no parent and for an active regular top-level
-	// space of another account, ErrBadSpaceId for a malformed id.
+	// the index shows is not a child space and for an active top-level
+	// space of another account, an organization included, ErrBadSpaceId
+	// for a malformed id.
 	DeleteChild(ctx context.Context, childSpaceId string) error
 
 	// Join a space via an invite. Depending on the invite key mode the
@@ -524,17 +536,18 @@ type Service interface {
 	// If the owner accepted meanwhile, the delete proceeds as for any
 	// member's space.
 	//
-	// A space is deleted after its child spaces: the coordinator
-	// refuses it while one is left. For a space the account owns,
-	// Delete returns ErrSpaceHasChildren and changes nothing when the
-	// index holds a child of it, or when the coordinator is in reach
-	// and holds one: the signed delete is then sent before anything
-	// local is written. With no coordinator in reach the delete is
-	// deferred as for any space; if the coordinator later refuses it
-	// for children, the deleted row reads RefusalHasChildren until they
-	// are gone (Children, DeleteChild) and the delete went through. A
-	// deleted child counts until the coordinator has finished deleting
-	// it: Children lists it until then.
+	// An organization is deleted after its child spaces: the
+	// coordinator refuses it while one is left. For an organization the
+	// account owns, Delete returns ErrSpaceHasChildren and changes
+	// nothing when the index holds a child whose row names it as the
+	// parent, or when the coordinator is in reach and holds one: the
+	// signed delete is then sent before anything local is written. With
+	// no coordinator in reach the delete is deferred as for any space;
+	// if the coordinator later refuses it for children, the deleted row
+	// reads RefusalHasChildren until they are gone (Children,
+	// DeleteChild) and the delete went through. A deleted child counts
+	// until the coordinator has finished deleting it: Children lists it
+	// until then.
 	Delete(ctx context.Context, spaceId string) error
 
 	// SetSettings patches the account-private per-space client settings
@@ -649,10 +662,10 @@ type CreateRequest struct {
 	Description string
 	IconCID     string
 	// SpaceType is stamped into the space header at create time and
-	// gated by the any-sync-coordinator. Must be SpaceTypeAny or empty
-	// (same meaning). Anything else is rejected by Create with a clear
-	// error; passing an invalid type would otherwise produce a space
-	// the coordinator refuses to sync.
+	// gated by the any-sync-coordinator: SpaceTypeAny, empty (same
+	// meaning) or SpaceTypeOrganization. Anything else is rejected by
+	// Create with ErrBadSpaceType; an invalid type would otherwise
+	// produce a space the coordinator refuses to sync.
 	SpaceType string
 }
 

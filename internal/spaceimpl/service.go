@@ -55,15 +55,18 @@ var storeLog = logger.NewNamed("sdk.spacestore")
 // forever — and since the type is content-addressable into the
 // header, you can't fix the space after the fact. Catch it here.
 //
-// The SDK mints only any.space; empty means the same. 1-1 spaces are
-// derived, never created, so their type is not accepted here.
+// Create mints any.space, which empty means too, and any.organization.
+// A space of an organization comes from CreateChild and a 1-1 space is
+// derived, so their types are not accepted here.
 func normalizeSpaceType(t string) (string, error) {
 	switch t {
 	case "", space.SpaceTypeAny:
 		return space.SpaceTypeAny, nil
+	case space.SpaceTypeOrganization:
+		return space.SpaceTypeOrganization, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s or empty)",
-			space.ErrBadSpaceType, t, space.SpaceTypeAny)
+		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s, %s or empty)",
+			space.ErrBadSpaceType, t, space.SpaceTypeAny, space.SpaceTypeOrganization)
 	}
 }
 
@@ -819,16 +822,18 @@ func (s *Service) spaceIndexObjectIdFor(ctx context.Context, spaceId string) (st
 	return s.ensureSpaceIndexWiring(ctx, spaceId)
 }
 
-// Create creates a new regular space owned by the authenticated
-// account, and writes its space-index entry into the tech space.
+// Create creates a new space owned by the authenticated account, of
+// the type req.SpaceType names, and writes its space-index entry into
+// the tech space.
 func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Space, error) {
 	return s.create(ctx, req, "")
 }
 
-// create builds a regular space owned by the authenticated account and
-// its space-index entry. With parentSpaceId the space is a child of
-// that space: the header names it and the space takes its replication
-// key.
+// create builds a space owned by the authenticated account and its
+// space-index entry. With parentSpaceId the space is a child of that
+// organization, whatever req.SpaceType says: the header carries the
+// child type and names the parent, and the space takes the parent's
+// replication key.
 func (s *Service) create(ctx context.Context, req space.CreateRequest, parentSpaceId string) (space.Space, error) {
 	keys := s.app.AccountKeys()
 	if keys == nil {
@@ -844,9 +849,11 @@ func (s *Service) create(ctx context.Context, req space.CreateRequest, parentSpa
 		return nil, fmt.Errorf("spaceimpl: metadata key: %w", err)
 	}
 
-	spaceType, err := normalizeSpaceType(req.SpaceType)
-	if err != nil {
-		return nil, err
+	spaceType := space.SpaceTypeOrganizationSpace
+	if parentSpaceId == "" {
+		if spaceType, err = normalizeSpaceType(req.SpaceType); err != nil {
+			return nil, err
+		}
 	}
 
 	// Reuse the tech-space's replication key so all spaces for this
@@ -1056,26 +1063,34 @@ func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error)
 // from the now-loaded space's header: `type` and, for a child space,
 // `parentSpaceId`. Rows registered on join/track are created before the
 // header is readable and carry neither until the first successful load
-// lands here. Best-effort: a miss retries on the next load, and the
-// handler's set-once rule absorbs races.
+// lands here. A row with the child type and no parent id, as a device
+// that reads no parent from a header leaves it, takes the parent id.
+// Best-effort: a miss retries on the next load, and the handler's
+// set-once rule absorbs races.
 func (s *Service) backfillHeader(ctx context.Context, spaceId string) {
 	rec, ok := s.tsp.Get(ctx, spaceId)
-	if !ok || rec.Type != "" {
+	if !ok {
+		return
+	}
+	lacksParent := rec.Type == space.SpaceTypeOrganizationSpace && rec.ParentSpaceId == ""
+	if rec.Type != "" && !lacksParent {
 		return
 	}
 	hdr := s.residentHeader(ctx, spaceId)
 	if hdr == nil || hdr.SpaceType == "" {
 		return
 	}
-	// The parent id goes first: a row with a type is not read again, so
-	// a pass cut short after it retries both on the next load.
+	// The parent id goes first: a pass cut short after it leaves a row
+	// the next load completes.
 	if hdr.ParentSpaceId != "" && rec.ParentSpaceId == "" {
 		if _, err := s.tsp.SetParentSpaceId(ctx, spaceId, hdr.ParentSpaceId); err != nil {
 			return
 		}
 	}
-	// Failure just leaves the row unknown; the next load retries.
-	_, _ = s.tsp.SetType(ctx, spaceId, hdr.SpaceType)
+	if rec.Type == "" {
+		// Failure just leaves the row unknown; the next load retries.
+		_, _ = s.tsp.SetType(ctx, spaceId, hdr.SpaceType)
+	}
 }
 
 // SyncSpaceList forces an immediate head-sync round on the tech space
@@ -1265,8 +1280,8 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 //
 // The tech space (system-owned, never in the list) and seed-derived
 // spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
-// refused outright, and so is a space with children
-// (space.ErrSpaceHasChildren): for a space the account owns the signed
+// refused outright, and so is an organization with children
+// (space.ErrSpaceHasChildren): for one the account owns the signed
 // delete goes to the coordinator on the call path when it answers,
 // before anything local is written.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
@@ -1317,12 +1332,12 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// silently succeed while writing nothing (strict-skip modify).
 		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
-	// The coordinator refuses to delete a space that has children, and
-	// only its owner's delete reaches the coordinator. The tombstone is
-	// not taken back, so a space the account owns, or may own, and that
-	// can have children is settled before it is written: with the index
-	// for the children it holds, and with the coordinator when it
-	// answers. Without an answer the delete is deferred as before.
+	// The coordinator refuses to delete an organization that has
+	// children, and only its owner's delete reaches the coordinator. The
+	// tombstone is not taken back, so an organization the account owns,
+	// or may own, is settled before it is written: with the index for
+	// the children it holds, and with the coordinator when it answers.
+	// Without an answer the delete is deferred.
 	if settlesDelete(rec) {
 		if child, ok := s.heldChildOf(ctx, spaceId); ok {
 			return fmt.Errorf("spaceimpl: Delete: space %q has the child space %q: %w", spaceId, child, space.ErrSpaceHasChildren)
@@ -1345,12 +1360,12 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 }
 
 // settlesDelete reports a row whose delete is settled with the
-// coordinator before it is written: a space that can have children and
-// that the account owns, or may own while the ACL mirror has not
-// written its role. A row whose header was never read (no type) says
-// neither that the space is top-level nor, without a mirrored role,
-// whose it is. It could be a child of a space the account owns, which
-// a signed delete would delete for all its members, so such a row is
+// coordinator before it is written: an organization that the account
+// owns, or may own while the ACL mirror has not written its role. A
+// row whose header was never read (no type) says neither that the
+// space is an organization nor, without a mirrored role, whose it is.
+// It could be a child of an organization the account owns, which a
+// signed delete would delete for all its members, so such a row is
 // only removed from the account.
 func settlesDelete(rec techspace.SpaceIndexRecord) bool {
 	if notAParent(rec) != "" {

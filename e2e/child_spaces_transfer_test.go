@@ -26,9 +26,9 @@ func childSpacesParentTransfer(t *testing.T, net *childNet) {
 	writer := net.account(t, ctx, "writer")
 	member := net.account(t, ctx, "member")
 
-	parent := old.create(t, ctx, "Parent")
-	oldOther := old.create(t, ctx, "Old owner's other parent")
-	heirOwn := heir.create(t, ctx, "New owner's own parent")
+	parent := old.createOrganization(t, ctx, "Parent")
+	oldOther := old.createOrganization(t, ctx, "Old owner's other parent")
+	heirOwn := heir.createOrganization(t, ctx, "New owner's own parent")
 	addMembers(t, ctx, parent,
 		grant{heir, space.PermissionAdmin},
 		grant{writer, space.PermissionWriter},

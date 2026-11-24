@@ -32,8 +32,8 @@ func childSpacesDeleteParent(t *testing.T, net *childNet) {
 	owner := net.account(t, ctx, "owner")
 	writer := net.account(t, ctx, "writer")
 
-	withOwn := owner.create(t, ctx, "Parent of the owner's child")
-	withOthers := owner.create(t, ctx, "Parent of the writer's child")
+	withOwn := owner.createOrganization(t, ctx, "Parent of the owner's child")
+	withOthers := owner.createOrganization(t, ctx, "Parent of the writer's child")
 	addMembers(t, ctx, withOwn, grant{writer, space.PermissionWriter})
 	addMembers(t, ctx, withOthers, grant{writer, space.PermissionWriter})
 	ownChild := owner.createChild(t, ctx, withOwn.Id(), "Owner's child")
@@ -117,7 +117,7 @@ func childSpacesDeleteParentOffline(t *testing.T, net *childNet) {
 	owner := net.open(t, ctx, "owner behind proxies", newFixedSeedProvider(t), proxied)
 	writer := net.account(t, ctx, "writer")
 
-	parent := owner.create(t, ctx, "Parent")
+	parent := owner.createOrganization(t, ctx, "Parent")
 	addMembers(t, ctx, parent, grant{writer, space.PermissionWriter})
 	child := writer.createChild(t, ctx, parent.Id(), "Writer's child")
 	waitSigned(t, ctx, owner, parent.Id(), child.Id())

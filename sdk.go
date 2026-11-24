@@ -683,7 +683,7 @@ func (s *SDK) bootstrap(ctx context.Context) {
 		// A child space can wait for this device to change its read
 		// key (docs/child-spaces.md § Rotation pending). The watcher
 		// that does it starts here for a child, not at its first Get.
-		if rec.ParentSpaceId != "" {
+		if spaceimpl.IsChild(rec) {
 			s.spaces.StartAclMirror(ctx, rec.Id)
 		}
 	}

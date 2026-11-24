@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/anyproto/any-store/v2/anyenc"
 	"io"
+	"time"
 
 	"github.com/anyproto/any-sync/app/logger"
 	"github.com/ipfs/go-cid"
@@ -167,13 +168,29 @@ func (f *filesAPI) openRow(ctx context.Context, row payloads.Row) (space.FileRea
 		return nil, fmt.Errorf("files: row %s rootCid: %w", row.Id, err)
 	}
 	r, err := f.s.parent.fetch.Open(ctx, fetchObject(f.s.id, root, row), row.Enc.Key, row.Id)
-	if err != nil || row.NetworkSign != "" {
+	if err != nil || row.NetworkSign != "" || f.s.isTechSpace() {
 		return r, err
 	}
 	// The read may complete the local copy of a file nobody backed up.
 	return &takeoverReader{FileReader: r, done: func() {
-		f.s.scheduleTakeover(context.WithoutCancel(ctx), row)
+		// the caller's context may be over by the time it closes
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), takeoverScheduleTimeout)
+		defer cancel()
+		f.s.scheduleTakeover(tctx, row)
 	}}, nil
+}
+
+// takeoverScheduleTimeout bounds what a reader's Close spends on
+// scheduling the takeover.
+const takeoverScheduleTimeout = 2 * time.Second
+
+// isTechSpace reports the tech space. Its files are not taken over on a
+// read: a durable job there marks the device that set an avatar
+// (TechFileUploading), and a sibling that only displayed it must not
+// look like that device.
+func (s *spaceImpl) isTechSpace() bool {
+	tsp := s.parent.tsp
+	return tsp != nil && s.id == tsp.SpaceId()
 }
 
 // takeoverReader runs done once the reader of an unsigned file closes.

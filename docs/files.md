@@ -155,9 +155,10 @@ fails the `Read` there. Content resolves through a source ladder:
 
 1. Local store.
 2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`):
-   a LAN peer, then a connected global peer. For a file that is not
-   durable, global peers that are not connected are dialed too
-   ([global-p2p](global-p2p.md) § Budget). Peers serve ciphertext and
+   a LAN peer, then a connected global peer. For a file with no public
+   object to read (not durable, or no public read base), global peers
+   that are not connected are dialed too ([global-p2p](global-p2p.md)
+   § Budget). Peers serve ciphertext and
    every block is CID-verified, so a peer can neither read nor corrupt
    content.
 3. Public HTTP GET with Range on `{publicReadBaseUrl}/blob/{spaceId}/{rootCid}`,
@@ -191,7 +192,8 @@ A device that completes its local copy of a file that is not durable, by
 reading it to the end or by a pin, and that may write to the space queues
 the backup itself 45–90 s later. The file then survives a creator that
 never uploads it; the job does nothing if the row gained `networkSign`
-in the meantime.
+in the meantime. Tech-space files are taken over by a pin only: there a
+queued backup marks the device that set an avatar.
 
 `FileStatus` also reports `Cached` (complete local copy), `Attempts` and
 `LastErr`. `SubscribeStatus` delivers local transitions only (attach,

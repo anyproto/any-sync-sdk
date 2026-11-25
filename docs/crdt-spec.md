@@ -640,7 +640,7 @@ Terminals:
 
 `Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate`, `AggregateObjects` and `AggregateDataset` run aggregation pipelines over the same collections, snapshot only.
 
-On an object the device holds, a terminal of `Query(objectId, dataset)` or `Aggregate(objectId, dataset, pipeline)` fails with `ErrDatasetUnknown` when the space has no registration for the dataset, as `Modify` does. A dataset the space has reads as empty on an object that holds no records of it. `Subscribe` on an object the device does not hold yet opens an empty window, whatever the dataset.
+On an object the device holds, a terminal of `Query(objectId, dataset)` or `Aggregate(objectId, dataset, pipeline)` fails with `ErrDatasetUnknown` when the space has no registration for the dataset, as `Modify` does. A dataset the space has reads as empty on an object that holds no records of it, and an object still loaded keeps reading a dataset whose definition was removed. `Subscribe` on an object the device does not hold yet opens an empty window, whatever the dataset.
 
 ### 11.1 Projections
 

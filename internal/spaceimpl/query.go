@@ -512,9 +512,9 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 	} else {
 		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
 		// A missing object is an empty initial, whatever the dataset:
-		// its datasets arrive with it. The engine still registers the
-		// sub; if the object lands later, its events flow in — same as
-		// a not-yet-materialised dataset.
+		// no controller says which datasets it carries. The engine
+		// still registers the sub; if the object lands later, its
+		// events flow in — same as a not-yet-materialised dataset.
 		obj, err = q.store.Get(ctx, q.objectId)
 		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
 			return nil, fmt.Errorf("query: %w", err)

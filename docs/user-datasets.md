@@ -461,7 +461,7 @@ declarations reach them through a store-level **catalog**:
   since the schema is the module's; for a per-object records dataset:
   its declared indexes too); a resident controller whose rev
   differs from the catalog's (dataset added, field added/removed,
-  index added/removed, definition removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
+  index added/removed) is stale. Local touch (`Modify`/`Upsert`/`Query`)
   drops and reloads it; user-facing write paths retry once on the
   resulting `object.ErrClosed`, so the eviction never surfaces as a
   caller error. A touch does not drop a controller whose definition

@@ -86,7 +86,7 @@ func TestE2E_UnknownDataset(t *testing.T) {
 	}
 
 	// The object comes first: one the device does not hold is not
-	// found, and a live window on it waits for it.
+	// found, and a live window on it opens empty.
 	t.Run("NoSuchObject", func(t *testing.T) {
 		_, err := sp.Query("no-such-object", "no-such-dataset").All(ctx)
 		assert.ErrorIs(t, err, space.ErrObjectNotFound, "All")
@@ -177,8 +177,9 @@ func TestE2E_UnknownDataset(t *testing.T) {
 	assert.Len(t, lab.rows(t, ctx, holder, lab.plain), 1)
 }
 
-// TestE2E_UnknownDataset_RemovedDefinition: a dataset whose definition
-// was removed is unknown to an object loaded after the removal.
+// TestE2E_UnknownDataset_RemovedDefinition: after a dataset's
+// definition is removed, an object still loaded keeps reading it, and
+// it is unknown to an object loaded after the removal.
 func TestE2E_UnknownDataset_RemovedDefinition(t *testing.T) {
 	t.Parallel()
 	yaml, confPath, err := loadAnySyncNetwork()
@@ -210,6 +211,7 @@ func TestE2E_UnknownDataset_RemovedDefinition(t *testing.T) {
 	holder := lab.newObject(t, ctx)
 	lab.put(t, ctx, holder, lab.plain, "p1", map[string]any{"label": "plain"})
 	require.NoError(t, sp1.Types().RemoveDataset(ctx, lab.typeId, datasetDefs(t, ctx, sp1, lab.typeId)["plain"].Id))
+	assert.Len(t, lab.rows(t, ctx, holder, lab.plain), 1, "the loaded object still reads its record")
 	spaceId := sp1.Id()
 	require.NoError(t, sdk1.Close())
 

@@ -450,8 +450,8 @@ type Service interface {
 	// Query builds a generic read query over a system object's dataset
 	// (e.g. SpaceIndexObjectId() + "spaces"), with the same chainable
 	// Filter / Sort / Limit / Snapshot / Subscribe surface as
-	// Space.Query. The bespoke List / Subscribe methods are convenience
-	// wrappers over this.
+	// Space.Query, ErrDatasetUnknown included. The bespoke List /
+	// Subscribe methods are convenience wrappers over this.
 	Query(objectId, dataset string) Query
 
 	// Datasets returns the JSON-Schema description of the tech-space

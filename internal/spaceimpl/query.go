@@ -510,18 +510,19 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return nil, err
 		}
 	} else {
-		if err = checkDataset(q.store, q.objectId, q.dataset); err != nil {
-			return nil, err
-		}
 		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
-		// A missing object is an empty initial. The engine still
-		// registers the sub; if the object lands later, its events flow
-		// in — same as a not-yet-materialised dataset.
+		// A missing object is an empty initial, whatever the dataset:
+		// its datasets arrive with it. The engine still registers the
+		// sub; if the object lands later, its events flow in — same as
+		// a not-yet-materialised dataset.
 		obj, err = q.store.Get(ctx, q.objectId)
 		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
 			return nil, fmt.Errorf("query: %w", err)
 		}
 		if obj != nil {
+			if err = checkDataset(q.store, obj.Controller(), q.dataset); err != nil {
+				return nil, err
+			}
 			// Warm the controller's handle outside the fence: the first
 			// open of a dataset collection ensures its indexes in a
 			// write tx. Under the fence the lookup is then a map hit; a
@@ -771,7 +772,8 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 // (nil, nil) when the dataset has no rows materialised on the object —
 // callers treat that as an empty result rather than an error, so the
 // first query on a fresh object surfaces an empty list / zero count. A
-// dataset the space does not have is space.ErrDatasetUnknown.
+// dataset the object's controller and the space do not have is
+// space.ErrDatasetUnknown.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if q.allObjects {
 		return resolveDatasetCollection(ctx, q.store, q.dataset)
@@ -794,9 +796,6 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 		coll, err = store.SharedObjects(ctx)
 		return coll, nil, err
 	}
-	if err := checkDataset(store, objectId, dataset); err != nil {
-		return nil, nil, err
-	}
 	// A resident controller built before a runtime dataset was defined
 	// doesn't know its collection; reload it so a just-defined dataset
 	// reads back real rows instead of silently empty results.
@@ -805,20 +804,20 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	if err != nil {
 		return nil, nil, fmt.Errorf("query: %w", err)
 	}
+	ctrl = obj.Controller()
+	if err := checkDataset(store, ctrl, dataset); err != nil {
+		return nil, nil, err
+	}
 	// The controller that supplies the collection says how the object's
 	// rows are scoped in it (objectRows).
-	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
+	return ctrl.Collection(ctx, dataset), ctrl, nil
 }
 
-// checkDataset refuses a per-object read of a dataset the space has no
-// registration for, the name the write path refuses too, before the
-// object is loaded. A resident controller that still serves a dataset
-// whose definition left the catalog keeps reading it.
-func checkDataset(store *spaceobjects.Store, objectId, dataset string) error {
-	if store.DatasetRegistered(dataset) {
-		return nil
-	}
-	if obj := store.PeekLoaded(objectId); obj != nil && obj.Controller() != nil && obj.Controller().HasDataset(dataset) {
+// checkDataset refuses a read through ctrl of a dataset neither it nor
+// the space has: the name the write path refuses too. A controller
+// built before a definition left the catalog keeps reading it.
+func checkDataset(store *spaceobjects.Store, ctrl *crdt.Controller, dataset string) error {
+	if ctrl.HasDataset(dataset) || store.DatasetRegistered(dataset) {
 		return nil
 	}
 	return fmt.Errorf("query: %w: %q", space.ErrDatasetUnknown, dataset)

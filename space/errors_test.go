@@ -37,6 +37,7 @@ func TestSentinelMessages(t *testing.T) {
 		{ErrNotACollection, "names a type, not a collection"},
 		{ErrWrongSlot, "a type goes in any.type, a collection in any.collections"},
 		{ErrMetaType, "not an object's type"},
+		{ErrDatasetUnknown, "unknown dataset"},
 	}
 	for _, c := range cases {
 		if !strings.Contains(c.err.Error(), c.phrase) {

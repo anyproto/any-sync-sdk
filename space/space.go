@@ -102,10 +102,10 @@ type Space interface {
 	// per-object datasets that exist on the object's own controller —
 	// e.g. a type object's `properties` (definitions) dataset. On a
 	// shared dataset it reads that object's records, each with the id
-	// `<objectId>/<recordId>` and the object in `_objectId`. A dataset
-	// the space does not have fails the terminal call with
-	// ErrDatasetUnknown; one it has reads as empty on an object with
-	// no records of it.
+	// `<objectId>/<recordId>` and the object in `_objectId`. On an
+	// object the device holds, a dataset the space does not have fails
+	// the terminal call with ErrDatasetUnknown; one it has reads as
+	// empty on an object with no records of it.
 	Query(objectId, dataset string) Query
 
 	// QueryDataset builds a read query over a shared dataset

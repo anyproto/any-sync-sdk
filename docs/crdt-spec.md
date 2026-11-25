@@ -560,7 +560,7 @@ The handler set isn't fixed at compile time. It can differ across app versions, 
 
 ### 8.2 Unknown Datasets
 
-A change for a dataset with no registered handler is already accepted into the any-sync tree but is not applied to any-store. The space layer's apply gate parks it in the per-space detached-changes collection (`<spaceId>__detached`), the same machinery the DataVersion gate uses, and the drain replays it once a registration exists. A runtime definition applying refreshes the catalog and wakes the drainer, which evicts a stale resident controller so the rebuilt registration applies the row. Until then the dataset is invisible to queries, nothing is lost, and the object's replay doesn't stall. See [user-datasets.md](user-datasets.md) § Runtime registration. A raw Controller with no gate returns `ErrUnknownDataset`.
+A change for a dataset with no registered handler is already accepted into the any-sync tree but is not applied to any-store. The space layer's apply gate parks it in the per-space detached-changes collection (`<spaceId>__detached`), the same machinery the DataVersion gate uses, and the drain replays it once a registration exists. A runtime definition applying refreshes the catalog and wakes the drainer, which evicts a stale resident controller so the rebuilt registration applies the row. Until then a read of the dataset fails with `ErrDatasetUnknown` (§11), nothing is lost, and the object's replay doesn't stall. See [user-datasets.md](user-datasets.md) § Runtime registration. A raw Controller with no gate returns `ErrUnknownDataset`.
 
 ### 8.3 Validation
 
@@ -640,7 +640,7 @@ Terminals:
 
 `Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate`, `AggregateObjects` and `AggregateDataset` run aggregation pipelines over the same collections, snapshot only.
 
-A terminal of `Query(objectId, dataset)` or `Aggregate(objectId, dataset, pipeline)` fails with `ErrDatasetUnknown` when the space has no dataset of that name, as a write does. A dataset the space has reads as empty on an object that holds no records of it.
+On an object the device holds, a terminal of `Query(objectId, dataset)` or `Aggregate(objectId, dataset, pipeline)` fails with `ErrDatasetUnknown` when the space has no registration for the dataset, as `Modify` does. A dataset the space has reads as empty on an object that holds no records of it. `Subscribe` on an object the device does not hold yet opens an empty window, whatever the dataset.
 
 ### 11.1 Projections
 

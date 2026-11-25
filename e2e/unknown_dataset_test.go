@@ -14,10 +14,12 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// TestE2E_UnknownDataset: a per-object read of a dataset the space does
-// not have fails every terminal with ErrDatasetUnknown, as a write
-// does. A dataset the space has reads as empty on an object with no
-// records of it, and a live window on it fills when a record lands.
+// TestE2E_UnknownDataset: a read, on an object the device holds, of a
+// dataset the space does not have fails every terminal with
+// ErrDatasetUnknown, as a write does. A dataset the space has reads as
+// empty on an object with no records of it, and a live window on it
+// fills when a record lands. An object the device does not hold
+// answers as before, whatever the dataset.
 func TestE2E_UnknownDataset(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
@@ -79,10 +81,24 @@ func TestE2E_UnknownDataset(t *testing.T) {
 		{"Empty", holder, ""},
 		{"StorageName", holder, holder + "_" + lab.plain},
 		{"ObjectWithoutRecords", bare, "no-such-dataset"},
-		{"NoSuchObject", "no-such-object", "no-such-dataset"},
 	} {
 		t.Run(tc.name, func(t *testing.T) { refused(t, tc.objectId, tc.dataset) })
 	}
+
+	// The object comes first: one the device does not hold is not
+	// found, and a live window on it waits for it.
+	t.Run("NoSuchObject", func(t *testing.T) {
+		_, err := sp.Query("no-such-object", "no-such-dataset").All(ctx)
+		assert.ErrorIs(t, err, space.ErrObjectNotFound, "All")
+		_, err = sp.Query("no-such-object", "no-such-dataset").Snapshot(ctx, space.QueryOpts{})
+		assert.ErrorIs(t, err, space.ErrObjectNotFound, "Snapshot")
+		_, err = sp.Aggregate("no-such-object", "no-such-dataset", pipeline).All(ctx)
+		assert.ErrorIs(t, err, space.ErrObjectNotFound, "agg All")
+		res, err := sp.Query("no-such-object", "no-such-dataset").Subscribe(ctx, space.QueryOpts{})
+		require.NoError(t, err, "Subscribe")
+		assert.Empty(t, res.Initial)
+		_ = res.Sub.Close()
+	})
 
 	t.Run("Write", func(t *testing.T) {
 		_, err := sp.Modify(ctx, space.ModifyBatch{
@@ -133,6 +149,28 @@ func TestE2E_UnknownDataset(t *testing.T) {
 		log := newSubLog()
 		log.receiveUntil(t, res.Sub, 30*time.Second, func() bool { return log.added["p2"] != nil })
 		assert.Equal(t, "late", log.added["p2"].GetString("label"))
+	})
+
+	// A dataset declared after a refused subscribe is read from then on.
+	t.Run("DeclaredLater", func(t *testing.T) {
+		late := lab.typeId + "_late"
+		_, err := sp.Query(bare, late).Subscribe(ctx, space.QueryOpts{})
+		require.ErrorIs(t, err, space.ErrDatasetUnknown)
+
+		_, err = sp.Types().AddDataset(ctx, lab.typeId, lab.partId, space.DatasetDraft{
+			Key: "late", IdRule: space.IdUser, Fields: []space.DatasetFieldDraft{
+				{Key: "label", Kind: space.PropertyKindString, MutableBy: space.MutableByAnyone},
+			},
+		})
+		require.NoError(t, err)
+		res, err := sp.Query(bare, late).Subscribe(ctx, space.QueryOpts{})
+		require.NoError(t, err)
+		defer func() { _ = res.Sub.Close() }()
+		assert.Empty(t, res.Initial)
+
+		lab.put(t, ctx, bare, late, "l1", map[string]any{"label": "late"})
+		log := newSubLog()
+		log.receiveUntil(t, res.Sub, 30*time.Second, func() bool { return log.added["l1"] != nil })
 	})
 
 	// The refused reads changed nothing.

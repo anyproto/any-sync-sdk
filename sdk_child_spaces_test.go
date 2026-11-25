@@ -12,6 +12,7 @@ import (
 	"github.com/anyproto/any-sync/app"
 	"github.com/anyproto/any-sync/commonspace"
 	"github.com/anyproto/any-sync/commonspace/acl/aclclient"
+	"github.com/anyproto/any-sync/commonspace/headsync/headstorage"
 	"github.com/anyproto/any-sync/commonspace/object/accountdata"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/list/listtest"
@@ -516,6 +517,21 @@ func replicationSuffix(spaceId string) string {
 	return spaceId[strings.LastIndexByte(spaceId, '.'):]
 }
 
+// storedIds lists what sp stores on this device: its ACL, its
+// key-value store and its trees, one with its root alone too. It reads
+// the storage, which holds an entry once the call that wrote it
+// returns.
+func storedIds(t *testing.T, ctx context.Context, sp commonspace.Space) []string {
+	t.Helper()
+	var ids []string
+	err := sp.Storage().HeadStorage().IterateEntries(ctx, headstorage.IterOpts{}, func(e headstorage.HeadsEntry) (bool, error) {
+		ids = append(ids, e.Id)
+		return true, nil
+	})
+	require.NoError(t, err)
+	return ids
+}
+
 // A child is created with no network. Its v1 header carries the child
 // type and names the parent, its row carries both, and the parent is
 // not written to.
@@ -530,7 +546,7 @@ func TestSDK_CreateChild_Offline(t *testing.T) {
 	parentHandle, err := sdk.app.GetSpace(ctx, parent.Id())
 	require.NoError(t, err)
 	aclHeadBefore := parentHandle.Inner().Acl().Head().Id
-	treesBefore := parentHandle.Inner().StoredIds()
+	storedBefore := storedIds(t, ctx, parentHandle.Inner())
 
 	child, err := sdk.Spaces().CreateChild(ctx, space.CreateChildRequest{ParentSpaceId: parent.Id(), Name: "Child"})
 	require.NoError(t, err)
@@ -550,7 +566,7 @@ func TestSDK_CreateChild_Offline(t *testing.T) {
 	assert.Equal(t, replicationSuffix(parent.Id()), replicationSuffix(childId))
 
 	assert.Equal(t, aclHeadBefore, parentHandle.Inner().Acl().Head().Id, "the parent's ACL is not written to")
-	assert.ElementsMatch(t, treesBefore, parentHandle.Inner().StoredIds(), "the parent gets no tree")
+	assert.ElementsMatch(t, storedBefore, storedIds(t, ctx, parentHandle.Inner()), "the parent gets no tree")
 
 	wmWrite(t, ctx, child, 1)
 	require.NoError(t, sdk.Close())

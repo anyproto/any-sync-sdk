@@ -1,0 +1,434 @@
+package spaceimpl
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	"github.com/anyproto/any-sync/app/logger"
+	"github.com/anyproto/any-sync/commonspace/object/acl/list"
+	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/consensus/consensusproto/consensuserr"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
+	anynet "github.com/anyproto/any-sync/net"
+	"github.com/anyproto/any-sync/util/crypto"
+	"go.uber.org/zap"
+
+	"github.com/anyproto/any-sync-sdk/internal/techspace"
+	"github.com/anyproto/any-sync-sdk/space"
+)
+
+var childLog = logger.NewNamed("sdk.childspaces")
+
+// CreateChild creates a child of the organization req.ParentSpaceId: a
+// space created like any other whose header carries the child type and
+// names the parent. The coordinator checks the parent and the caller's
+// role in it when the child is first pushed, so only what the index
+// already shows is refused here.
+func (s *Service) CreateChild(ctx context.Context, req space.CreateChildRequest) (space.Space, error) {
+	parentId := req.ParentSpaceId
+	if err := validateSpaceId(parentId); err != nil {
+		return nil, err
+	}
+	if parentId == s.tsp.SpaceId() {
+		return nil, fmt.Errorf("spaceimpl: CreateChild: the tech space: %w", space.ErrParentSpaceInvalid)
+	}
+	parent, err := s.acceptedRow(ctx, "CreateChild", parentId)
+	if err != nil {
+		return nil, err
+	}
+	if why := notAParent(parent); why != "" {
+		return nil, fmt.Errorf("spaceimpl: CreateChild: parent %q is %s: %w", parentId, why, space.ErrParentSpaceInvalid)
+	}
+	return s.create(ctx, space.CreateRequest{
+		Name:        req.Name,
+		Description: req.Description,
+		IconCID:     req.IconCID,
+	}, parentId)
+}
+
+// notAParent says why the space of an index row cannot have children,
+// "" when nothing on the row rules it out. A parent is an organization.
+// A row with no type yet (joined, never loaded) is not judged.
+func notAParent(rec techspace.SpaceIndexRecord) string {
+	switch {
+	case IsChild(rec):
+		return "a child space"
+	case rec.Derived:
+		return "a derived space"
+	case rec.Type != "" && rec.Type != space.SpaceTypeOrganization:
+		return "of type " + rec.Type
+	}
+	return ""
+}
+
+// IsChild reports the row of a child space: it names a parent or has
+// the child type. A device that reads no parent from a header fills the
+// type alone.
+func IsChild(rec techspace.SpaceIndexRecord) bool {
+	return rec.ParentSpaceId != "" || rec.Type == space.SpaceTypeOrganizationSpace
+}
+
+// acceptedRow returns the index row of a space the account holds as an
+// accepted space: not unknown, deleted or pending.
+func (s *Service) acceptedRow(ctx context.Context, op, spaceId string) (techspace.SpaceIndexRecord, error) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok {
+		return rec, fmt.Errorf("spaceimpl: %s: %w %q", op, space.ErrSpaceUnknown, spaceId)
+	}
+	if rec.IsDeleted() {
+		return rec, fmt.Errorf("spaceimpl: %s: space %q: %w", op, spaceId, space.ErrSpaceDeleted)
+	}
+	return rec, MaterializeBlock(rec)
+}
+
+// childSignAnswered keeps the row's refusal equal to the coordinator's
+// last answer to a request of this device to sign the child spaceId.
+// The write outlives ctx: the answer is given once, and a signed space
+// is not asked about again.
+func (s *Service) childSignAnswered(ctx context.Context, spaceId string, refusal space.Refusal) {
+	s.setRefusal(context.WithoutCancel(ctx), spaceId, refusal)
+}
+
+// recordedRow reads what the index holds for spaceId: its refusal, and
+// whether the row reads deleted; ok is false when it has no row.
+func (s *Service) recordedRow(spaceId string) (refusal space.Refusal, deleted, ok bool) {
+	rec, ok := s.tsp.Get(context.Background(), spaceId)
+	return rec.Refusal, ok && rec.IsDeleted(), ok
+}
+
+// setRefusal writes refusal on spaceId's row when it differs.
+func (s *Service) setRefusal(ctx context.Context, spaceId string, refusal space.Refusal) {
+	rec, ok := s.tsp.Get(ctx, spaceId)
+	if !ok || rec.Refusal == refusal {
+		return
+	}
+	if _, err := s.tsp.SetRefusal(ctx, spaceId, refusal); err != nil {
+		childLog.Warn("record refusal", zap.String("spaceId", spaceId), zap.Error(err))
+	}
+}
+
+// refusalErr returns the coordinator's error behind a recorded refusal
+// to sign a child space; nil for any other value.
+func refusalErr(refusal space.Refusal) error {
+	switch refusal {
+	case space.RefusalParentNotAvailable:
+		return space.ErrParentSpaceNotAvailable
+	case space.RefusalParentInvalid:
+		return space.ErrParentSpaceInvalid
+	case space.RefusalParentPermissionDenied:
+		return space.ErrParentPermissionDenied
+	case space.RefusalChildLimitReached:
+		return space.ErrChildSpacesLimitReached
+	}
+	return nil
+}
+
+// ownsStored reports a space this device stores and the account owns,
+// as far as the index tells: a role the ACL mirror has not written yet
+// counts as the owner's.
+func (s *Service) ownsStored(spaceId string) bool {
+	rec, ok := s.tsp.Get(context.Background(), spaceId)
+	if !ok || rec.IsDeleted() || !mayOwn(rec) {
+		return false
+	}
+	return s.app.SpaceExists(spaceId)
+}
+
+// mayOwn reports a row whose space the account owns, or may own: the
+// ACL mirror has not written a role yet.
+func mayOwn(rec techspace.SpaceIndexRecord) bool {
+	return rec.OwnRole == space.PermissionOwner || rec.OwnRole == space.PermissionNone
+}
+
+// RetryPush asks the coordinator to sign the child spaceId now — see
+// space.Service.RetryPush. The answer reaches the row through
+// childSignAnswered before the call returns.
+func (s *Service) RetryPush(ctx context.Context, spaceId string) error {
+	if err := validateSpaceId(spaceId); err != nil {
+		return err
+	}
+	rec, err := s.acceptedRow(ctx, "RetryPush", spaceId)
+	if err != nil {
+		return err
+	}
+	if !IsChild(rec) {
+		return fmt.Errorf("spaceimpl: RetryPush: space %q: %w", spaceId, space.ErrNotChildSpace)
+	}
+	// Only a device that holds the space can push it, and loading a
+	// space no node holds would wait for one.
+	if !s.app.SpaceExists(spaceId) {
+		return fmt.Errorf("spaceimpl: RetryPush: space %q: %w", spaceId, space.ErrSpaceNotStored)
+	}
+	return networkErr("RetryPush", s.app.SignSpace(ctx, spaceId))
+}
+
+// Children lists the children of parentSpaceId from the coordinator —
+// see space.Service.Children.
+func (s *Service) Children(ctx context.Context, parentSpaceId string) ([]space.ChildSpace, error) {
+	if err := validateSpaceId(parentSpaceId); err != nil {
+		return nil, err
+	}
+	children, err := s.app.Coordinator().SpaceChildren(ctx, parentSpaceId)
+	if err != nil {
+		return nil, networkErr("Children", err)
+	}
+	out := make([]space.ChildSpace, 0, len(children))
+	for _, child := range children {
+		out = append(out, space.ChildSpace{Id: child.SpaceId, Status: childStatus(child.Status)})
+	}
+	return out, nil
+}
+
+func childStatus(st coordinatorproto.SpaceStatus) space.ChildStatus {
+	switch st {
+	case coordinatorproto.SpaceStatus_SpaceStatusCreated:
+		return space.ChildStatusActive
+	case coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
+		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted:
+		return space.ChildStatusDeletionPending
+	case coordinatorproto.SpaceStatus_SpaceStatusDeleted:
+		return space.ChildStatusDeleted
+	}
+	return space.ChildStatusUnknown
+}
+
+// childTarget checks that spaceId can be acted on as a child space from
+// the parent side, as far as the index can tell, and returns its row
+// when the account holds one. A row whose header was read (it has a
+// type) and that is not the row of a child is a top-level space.
+func (s *Service) childTarget(ctx context.Context, op, spaceId string) (rec techspace.SpaceIndexRecord, held bool, err error) {
+	if err := validateSpaceId(spaceId); err != nil {
+		return rec, false, err
+	}
+	notChild := fmt.Errorf("spaceimpl: %s: space %q: %w", op, spaceId, space.ErrNotChildSpace)
+	if spaceId == s.tsp.SpaceId() {
+		return rec, false, notChild
+	}
+	rec, held = s.tsp.Get(ctx, spaceId)
+	if held && rec.Type != "" && !IsChild(rec) {
+		return rec, held, notChild
+	}
+	return rec, held, nil
+}
+
+// ownedIsChild guards DeleteChild for a space the index does not show
+// as a child: the coordinator takes the owner's delete of a top-level
+// space too. A space it holds as another account's passes: that delete
+// it takes only from the Owner of the parent. The account's own space
+// passes when it is active and its header names a parent; in deletion
+// or deleted it reads space.ErrSpaceDeleted. The coordinator names the
+// owner here and takes the delete in another call: a top-level space
+// handed to the account between the two is deleted.
+func (s *Service) ownedIsChild(ctx context.Context, op, spaceId string) error {
+	statuses, err := s.app.SpaceStatuses(ctx, []string{spaceId})
+	if err != nil {
+		return networkErr(op, err)
+	}
+	if len(statuses) != 1 || statuses[0] == nil {
+		return fmt.Errorf("spaceimpl: %s: space %q: no status from the coordinator", op, spaceId)
+	}
+	status, gone := statuses[0].Status, remotelyGone(statuses[0].Status)
+	switch {
+	case status == coordinatorproto.SpaceStatus_SpaceStatusNotExists:
+		return networkErr(op, coordinatorproto.ErrSpaceNotExists)
+	case status != coordinatorproto.SpaceStatus_SpaceStatusCreated && !gone:
+		return fmt.Errorf("spaceimpl: %s: space %q: coordinator status %s", op, spaceId, status)
+	case statuses[0].Permissions != coordinatorproto.SpacePermissions_SpacePermissionsOwner:
+		return nil
+	case gone:
+		return networkErr(op, coordinatorproto.ErrSpaceIsDeleted)
+	}
+	return s.headerNamesParent(ctx, op, spaceId)
+}
+
+// headerNamesParent reads the header of spaceId from the nodes and
+// stores nothing: space.ErrNotChildSpace when it names no parent.
+func (s *Service) headerNamesParent(ctx context.Context, op, spaceId string) error {
+	hdr, err := s.app.SpaceHeader(ctx, spaceId)
+	if err != nil {
+		return networkErr(op, err)
+	}
+	if hdr.GetParentSpaceId() == "" {
+		return fmt.Errorf("spaceimpl: %s: space %q: %w", op, spaceId, space.ErrNotChildSpace)
+	}
+	return nil
+}
+
+// childAcl builds the ACL of a child space from the records the nodes
+// serve, in memory, like the join controller's snapshot: the child
+// needs no row and no storage here.
+func (s *Service) childAcl(ctx context.Context, op, childSpaceId string) (list.AclList, error) {
+	if _, _, err := s.childTarget(ctx, op, childSpaceId); err != nil {
+		return nil, err
+	}
+	acl, err := s.app.AclSnapshot(ctx, childSpaceId)
+	if err != nil {
+		return nil, networkErr(op, err)
+	}
+	return acl, nil
+}
+
+// ChildRotationPending reads the pending rotation of a child space from
+// the ACL the nodes serve — see space.Service.ChildRotationPending.
+func (s *Service) ChildRotationPending(ctx context.Context, childSpaceId string) (bool, error) {
+	acl, err := s.childAcl(ctx, "ChildRotationPending", childSpaceId)
+	if err != nil {
+		return false, err
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().RotationPending(), nil
+}
+
+// ChildMembers lists the accounts of a child space from the ACL the
+// nodes serve — see space.Service.ChildMembers.
+func (s *Service) ChildMembers(ctx context.Context, childSpaceId string) ([]space.ChildMember, error) {
+	acl, err := s.childAcl(ctx, "ChildMembers", childSpaceId)
+	if err != nil {
+		return nil, err
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	accounts := acl.AclState().CurrentAccounts()
+	out := make([]space.ChildMember, 0, len(accounts))
+	for _, acc := range accounts {
+		out = append(out, space.ChildMember{
+			Identity:   acc.PubKey.Account(),
+			Permission: fromAclPermissions(acc.Permissions),
+			Status:     fromAclStatus(acc.Status),
+		})
+	}
+	return out, nil
+}
+
+// RemoveChildMembers removes members of a child space on the account's
+// role in the parent — see space.Service.RemoveChildMembers. Rides the
+// joining client, like CancelJoin: the record is built over the ACL the
+// nodes serve, so the child needs no row and no storage here.
+func (s *Service) RemoveChildMembers(ctx context.Context, childSpaceId string, identities []string) error {
+	if len(identities) == 0 {
+		return errors.New("spaceimpl: RemoveChildMembers: empty identities")
+	}
+	pks := make([]crypto.PubKey, 0, len(identities))
+	for i, id := range identities {
+		pk, err := decodeIdentity(id)
+		if err != nil {
+			return fmt.Errorf("spaceimpl: RemoveChildMembers: identity %d: %w", i, err)
+		}
+		pks = append(pks, pk)
+	}
+	if _, _, err := s.childTarget(ctx, "RemoveChildMembers", childSpaceId); err != nil {
+		return err
+	}
+	jc := s.app.JoiningClient()
+	if jc == nil {
+		return errors.New("spaceimpl: RemoveChildMembers: joining client unavailable")
+	}
+	_, err := jc.RemoveChildMembers(ctx, childSpaceId, pks)
+	return networkErr("RemoveChildMembers", err)
+}
+
+// ChangeChildOwner hands a child space to one of its members on the
+// account's role in the parent — see space.Service.ChangeChildOwner.
+// The record is built over the ACL the nodes serve, like the one of
+// RemoveChildMembers, and names the head it is built on. An ACL takes
+// its owner's change of the owner in a top-level space too: when that
+// ACL names the account the owner and the index shows no child, the
+// header of the space has to name a parent.
+func (s *Service) ChangeChildOwner(ctx context.Context, childSpaceId, newOwner string, oldOwnerPerm space.Permission) error {
+	const op = "ChangeChildOwner"
+	pk, err := decodeIdentity(newOwner)
+	if err != nil {
+		return fmt.Errorf("spaceimpl: ChangeChildOwner: %w", err)
+	}
+	row, _, err := s.childTarget(ctx, op, childSpaceId)
+	if err != nil {
+		return err
+	}
+	acl, err := s.app.AclSnapshot(ctx, childSpaceId)
+	if err != nil {
+		return networkErr(op, err)
+	}
+	if state := acl.AclState(); !IsChild(row) && state.Permissions(state.Identity()).IsOwner() {
+		if err := s.headerNamesParent(ctx, op, childSpaceId); err != nil {
+			return err
+		}
+	}
+	record, err := acl.RecordBuilder().BuildOwnershipChangeByParent(list.OwnershipChangePayload{
+		NewOwner:            pk,
+		OldOwnerPermissions: toAclPermissions(oldOwnerPerm),
+	})
+	if err != nil {
+		return networkErr(op, err)
+	}
+	return networkErr(op, s.app.AclAddRecord(ctx, childSpaceId, record))
+}
+
+// DeleteChild deletes a child space on the network on the account's
+// role in the parent — see space.Service.DeleteChild. A space the index
+// does not show as a child passes ownedIsChild first. The signed delete
+// goes to the coordinator on the call path: only its answer tells
+// whether the account may delete the child, so nothing local is
+// touched before it. A deletion already under way is the answer asked
+// for.
+func (s *Service) DeleteChild(ctx context.Context, childSpaceId string) error {
+	rec, held, err := s.childTarget(ctx, "DeleteChild", childSpaceId)
+	if err != nil {
+		return err
+	}
+	if !IsChild(rec) {
+		err = s.ownedIsChild(ctx, "DeleteChild", childSpaceId)
+	}
+	if err == nil {
+		err = s.app.SpaceDelete(ctx, childSpaceId)
+		if errors.Is(err, coordinatorproto.ErrSpaceIsCreated) {
+			// The coordinator's answer to a delete of an active space
+			// with no parent that another account owns.
+			return fmt.Errorf("spaceimpl: DeleteChild: space %q: %w: %w", childSpaceId, space.ErrNotChildSpace, err)
+		}
+		err = networkErr("DeleteChild", err)
+	}
+	if err != nil && !errors.Is(err, space.ErrSpaceDeleted) {
+		return err
+	}
+	// A deletion of the parent that waits for its children is sent
+	// again now.
+	s.kickDeletionReconciler()
+	if !held || rec.IsDeleted() {
+		return nil
+	}
+	// The account's own copy goes with the child. Cut short here, the
+	// deletion reconciler does the same from the coordinator's status.
+	ctx = context.WithoutCancel(ctx)
+	if _, err := s.tsp.SetRemoteStatus(ctx, childSpaceId, techspace.StatusDeleted); err != nil {
+		s.kickDeletionReconciler()
+		return fmt.Errorf("spaceimpl: DeleteChild: mark deleted: %w", err)
+	}
+	s.OffloadSpace(ctx, childSpaceId)
+	return nil
+}
+
+// networkErr wraps the error of a call that needs an answer from the
+// network. One that reached no coordinator or node reads
+// space.ErrOffline. The coordinator's answers for a space it does not
+// know and for one in deletion or deleted read as the same sentinels a
+// space of the index has: space.ErrSpaceUnknown and
+// space.ErrSpaceDeleted. A space no node holds reads as unknown too:
+// the nodes miss its header, and the coordinator finds no log of its
+// ACL, which the node that stores a space creates.
+func networkErr(op string, err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, anynet.ErrUnableToConnect):
+		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrOffline, err)
+	case errors.Is(err, coordinatorproto.ErrSpaceNotExists),
+		errors.Is(err, spacesyncproto.ErrSpaceMissing),
+		errors.Is(err, consensuserr.ErrLogNotFound):
+		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrSpaceUnknown, err)
+	case errors.Is(err, coordinatorproto.ErrSpaceIsDeleted), errors.Is(err, coordinatorproto.ErrSpaceDeletionPending):
+		return fmt.Errorf("spaceimpl: %s: %w: %w", op, space.ErrSpaceDeleted, err)
+	}
+	return fmt.Errorf("spaceimpl: %s: %w", op, err)
+}

@@ -33,9 +33,10 @@ func anySyncCryptoGenerate() (crypto.PrivKey, crypto.PubKey, error) {
 //   - ACL.CreateInvite mints a valid share token (round-trips through
 //     EncodeInvite/DecodeInvite back to the same spaceId);
 //   - MembersAPI.Invites lists the active invite and recovers the
-//     minting account's key from custody (token re-encodes identically;
-//     a re-mint recovers the replacement, not the stale key);
-//   - ACL.RevokeAllInvites tears it down.
+//     minting account's key from custody (token re-encodes identically);
+//   - ACL.RevokeAllInvites tears it down. A space holds one invite at a
+//     time, so the invite is revoked, then minted again: custody then
+//     recovers the new key, not the stale one.
 //
 // The owner-on-empty-space surface needs no second peer, so it runs
 // against staging without a parallel SDK instance.

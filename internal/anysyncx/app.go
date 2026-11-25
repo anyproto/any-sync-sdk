@@ -18,6 +18,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/object/acl/recordverifier"
 	"github.com/anyproto/any-sync/commonspace/pubsub"
+	"github.com/anyproto/any-sync/consensus/consensusproto"
 	"github.com/anyproto/any-sync/coordinator/coordinatorclient"
 	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/coordinator/inboxclient"
@@ -54,6 +55,7 @@ type App struct {
 	coord        coordinatorclient.CoordinatorClient
 	streamPool   streampool.StreamPool
 	joining      aclclient.AclJoiningClient
+	nodes        NodeClient
 	inbox        inboxclient.InboxClient
 
 	// inboxReceiver holds the live push callback installed by the inbox
@@ -128,10 +130,34 @@ type App struct {
 	// push, no coordinator receipt. See localOnlySpaces.
 	localOnly *localOnlySpaces
 
+	// cred asks the coordinator for space receipts.
+	cred *credentialProvider
+	// onNodeRound is told each head-sync round a tree node answered.
+	onNodeRound atomic.Pointer[func(spaceId string)]
+
 	// pubsub is the commonspace/pubsub engine (ephemeral, ACL-gated
 	// pub/sub). Registered as an app component; reached through the
 	// PubSub* pass-throughs.
 	pubsub pubsub.Service
+}
+
+// componentWrap, when set, may replace the coordinator client, the node
+// client and the joining client as New registers them. Test seam: a
+// test stands in for a network that is not there.
+var componentWrap atomic.Pointer[func(app.Component) app.Component]
+
+// WrapComponentsForTest installs wrap for every App built until the
+// returned func is called. Call it before opening the SDK.
+func WrapComponentsForTest(wrap func(app.Component) app.Component) (restore func()) {
+	prev := componentWrap.Swap(&wrap)
+	return func() { componentWrap.Store(prev) }
+}
+
+func wrapComponent(c app.Component) app.Component {
+	if wrap := componentWrap.Load(); wrap != nil {
+		return (*wrap)(c)
+	}
+	return c
 }
 
 // New brings up the any-sync app. Order matters: keys first (provider
@@ -279,11 +305,12 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		}()
 	})
 
+	cred := newCredentialProvider(localOnly)
 	a := new(app.App)
 	a.Register(cfgAdapter).
 		Register(accountAdapter).
 		Register(debugstat.New()).
-		Register(newCredentialProvider(localOnly)).
+		Register(cred).
 		Register(nodeconfstore.New()).
 		Register(nodeconfsource.New()).
 		Register(nodeconf.New()).
@@ -298,13 +325,13 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		Register(pool.New()).
 		Register(p2pSrv).
 		Register(peerManagers).
-		Register(coordinatorclient.New()).
-		Register(nodeclient.New()).
+		Register(wrapComponent(coordinatorclient.New())).
+		Register(wrapComponent(newNodeClient())).
 		Register(storage).
 		Register(tree).
 		Register(syncqueues.New()).
 		Register(commonspace.New()).
-		Register(aclclient.NewAclJoiningClient()).
+		Register(wrapComponent(aclclient.NewAclJoiningClient())).
 		Register(subscribeclient.New()).
 		Register(inbox).
 		Register(peerStore).
@@ -366,8 +393,10 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 		selectiveTreeTypes: cfg.Sync.TreeTypes,
 		headless:           cfg.Headless,
 		localOnly:          localOnly,
+		cred:               cred,
 		pubsub:             psvc,
 	}
+	cred.kick = sync.SyncSpaces
 	psPeers.app = out
 	psCrypto.app = out
 	psMembership.app = out
@@ -407,6 +436,7 @@ func New(ctx context.Context, cfg config.Config, provider auth.Provider) (*App, 
 	out.coord = a.MustComponent(coordinatorclient.CName).(coordinatorclient.CoordinatorClient)
 	out.streamPool = a.MustComponent(streampool.CName).(streampool.StreamPool)
 	out.joining = a.MustComponent(aclclient.CName).(aclclient.AclJoiningClient)
+	out.nodes = a.MustComponent(nodeclient.CName).(NodeClient)
 	// Wire the responsible-node resolver so per-space trackers can
 	// filter inbound HeadsApply senders.
 	nc := out.nodeConf
@@ -560,6 +590,15 @@ func (a *App) AclSnapshot(ctx context.Context, spaceId string) (list.AclList, er
 		return nil, fmt.Errorf("anysyncx: acl snapshot %q: %w", spaceId, err)
 	}
 	return acl, nil
+}
+
+// AclAddRecord posts rec, built on an AclSnapshot of spaceId, to the
+// ACL of that space through the nodes.
+func (a *App) AclAddRecord(ctx context.Context, spaceId string, rec *consensusproto.RawRecord) error {
+	if _, err := a.nodes.AclAddRecord(ctx, spaceId, rec); err != nil {
+		return fmt.Errorf("anysyncx: acl add record %q: %w", spaceId, err)
+	}
+	return nil
 }
 
 // InboxMessageHandler is the push callback the inbox notifier installs.
@@ -822,6 +861,7 @@ func (a *App) newTreeSyncerForSpace(spaceId string) *treeSyncerAdapter {
 	// read as Synced. Non-zero counts or errors are no-ops here;
 	// the per-tree HeadsApply path still handles them.
 	onRound := func(peerId string, newCount, changedCount int, err error) {
+		a.nodeAnswered(spaceId, peerId)
 		if err != nil || newCount != 0 || changedCount != 0 {
 			return
 		}

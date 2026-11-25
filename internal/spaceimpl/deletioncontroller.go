@@ -2,6 +2,7 @@ package spaceimpl
 
 import (
 	"context"
+	"errors"
 	"sync/atomic"
 	"time"
 
@@ -200,6 +201,9 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 	if st == nil {
 		return
 	}
+	if refusalOver(row.Refusal, st.Status) {
+		s.setRefusal(ctx, row.Id, space.RefusalNone)
+	}
 	if row.Derived {
 		// Derived rows never participate in deletion reconciliation
 		// (space.ErrIsDerivedSpace), and this return is the only guard:
@@ -219,10 +223,16 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 		// active and we own it — send the signed delete. Idempotent: the
 		// coordinator moves it to PendingDeletion and later passes no-op.
 		if err := s.app.SpaceDelete(ctx, row.Id); err != nil {
+			if errors.Is(err, coordinatorproto.ErrSpaceHasChildren) {
+				// The row tells the owner, who deletes the children; the
+				// delete is sent again on every pass.
+				s.setRefusal(ctx, row.Id, space.RefusalHasChildren)
+			}
 			delLog.Warn("coordinator delete failed", zap.String("spaceId", row.Id), zap.Error(err))
 			return
 		}
 		delLog.Info("space delete sent to coordinator", zap.String("spaceId", row.Id))
+		s.setRefusal(ctx, row.Id, space.RefusalNone)
 
 	case actionOffload:
 		// The coordinator reports the space gone (deleted on another
@@ -237,6 +247,20 @@ func (s *Service) reconcileOne(ctx context.Context, row techspace.SpaceIndexReco
 		delLog.Info("offloading remotely-deleted space", zap.String("spaceId", row.Id))
 		s.OffloadSpace(ctx, row.Id)
 	}
+}
+
+// refusalOver reports that the coordinator's status shows what a
+// recorded refusal was about: a child it would not sign is registered,
+// whichever device pushed it, and a space it would not delete for its
+// children is being deleted.
+func refusalOver(refusal space.Refusal, status coordinatorproto.SpaceStatus) bool {
+	switch refusal {
+	case space.RefusalNone:
+		return false
+	case space.RefusalHasChildren:
+		return remotelyGone(status)
+	}
+	return status == coordinatorproto.SpaceStatus_SpaceStatusCreated
 }
 
 // reconcileAction is the decision reconcileOne acts on for one space.

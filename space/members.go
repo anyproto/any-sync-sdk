@@ -193,9 +193,10 @@ type InviteInfo struct {
 	// (the ACL record carries only the public key), so it is present
 	// on every device of the minting account and nil everywhere else —
 	// other members', even admins', devices never held it. Also nil
-	// for invites minted before custody shipped (re-mint once to make
-	// them recoverable) and for custody gone stale (invite replaced /
-	// revoked elsewhere). Non-nil Key re-encodes to the original share
-	// token via EncodeInvite(Invite{SpaceId, InviteKey: Key}).
+	// for invites minted before custody shipped (revoke the invite and
+	// mint again to get a recoverable one) and for custody gone stale
+	// (its invite was revoked elsewhere). Non-nil Key re-encodes to the
+	// original share token via EncodeInvite(Invite{SpaceId, InviteKey:
+	// Key}).
 	Key crypto.PrivKey
 }

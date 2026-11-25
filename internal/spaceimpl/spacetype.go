@@ -6,6 +6,8 @@ import (
 
 	"github.com/anyproto/any-sync/commonspace/object/acl/list"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+
+	"github.com/anyproto/any-sync-sdk/internal/anysyncx"
 )
 
 // derivePayloadV1 is the structured SpaceHeaderPayload the SDK writes for
@@ -67,20 +69,8 @@ func decodeDerivePayload(b []byte) (spaceType string, ok bool) {
 // space (PickSpace) and never triggers a load — callers should prefer
 // the cached tech-space record value and only fall back here.
 func (s *Service) spaceTypeFromHeader(ctx context.Context, spaceId string) string {
-	handle, ok := s.app.PickSpace(ctx, spaceId)
-	if !ok {
-		return ""
-	}
-	desc, err := handle.Inner().Description(ctx)
-	if err != nil || desc.SpaceHeader == nil {
-		return ""
-	}
-	var raw spacesyncproto.RawSpaceHeader
-	if err := raw.UnmarshalVT(desc.SpaceHeader.RawHeader); err != nil {
-		return ""
-	}
-	var hdr spacesyncproto.SpaceHeader
-	if err := hdr.UnmarshalVT(raw.SpaceHeader); err != nil {
+	hdr := s.residentHeader(ctx, spaceId)
+	if hdr == nil {
 		return ""
 	}
 	if t, ok := decodeDerivePayload(hdr.SpaceHeaderPayload); ok && t != "" {
@@ -89,29 +79,26 @@ func (s *Service) spaceTypeFromHeader(ctx context.Context, spaceId string) strin
 	return hdr.SpaceType
 }
 
-// headerTypeFromHeader reads a space's raw on-wire header SpaceType —
-// the coordinator-gated string (any.space / anytype.space / …), NOT
-// the app-level tag spaceTypeFromHeader prefers. Best-effort like the
-// other header readers: "" when the space is not resident or the
-// header does not parse.
-func (s *Service) headerTypeFromHeader(ctx context.Context, spaceId string) string {
+// residentHeader returns the header of a space that is already
+// resident, nil when it is not or the header does not parse. It never
+// loads the space. The on-wire SpaceType (any.space / anytype.space / …)
+// and the parent space id are read from it.
+func (s *Service) residentHeader(ctx context.Context, spaceId string) *spacesyncproto.SpaceHeader {
 	handle, ok := s.app.PickSpace(ctx, spaceId)
 	if !ok {
-		return ""
+		return nil
 	}
+	return spaceHeader(ctx, handle)
+}
+
+// spaceHeader returns the header of a loaded space, nil when it does
+// not parse.
+func spaceHeader(ctx context.Context, handle anysyncx.SpaceHandle) *spacesyncproto.SpaceHeader {
 	desc, err := handle.Inner().Description(ctx)
 	if err != nil || desc.SpaceHeader == nil {
-		return ""
+		return nil
 	}
-	var raw spacesyncproto.RawSpaceHeader
-	if err := raw.UnmarshalVT(desc.SpaceHeader.RawHeader); err != nil {
-		return ""
-	}
-	var hdr spacesyncproto.SpaceHeader
-	if err := hdr.UnmarshalVT(raw.SpaceHeader); err != nil {
-		return ""
-	}
-	return hdr.SpaceType
+	return anysyncx.DecodeSpaceHeader(desc.SpaceHeader.RawHeader)
 }
 
 // resolveSpaceType returns the cached tech-space SpaceType when present,

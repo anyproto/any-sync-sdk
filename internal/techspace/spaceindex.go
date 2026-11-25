@@ -50,6 +50,8 @@ func SpaceIndexSchema() schema.Dataset {
 			Description: "The other participant's account identity on a 1-1 row."},
 		{Id: FieldDerived, Name: "Derived", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
 			Description: "Well-known derived space; undeletable.", XFormat: map[string]any{"type": "checkbox"}},
+		{Id: FieldParentSpaceId, Name: "Parent space id", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "Parent space named by the space header; pinned. Absent on a top-level space."},
 		{Id: FieldP2PAdvertise, Name: "P2P advertise", Schema: schema.Leaf(schema.KindBoolean), Scope: schema.ScopeSynced,
 			Description: "Publish this account's devices' p2p addresses into the space; absent means on.", XFormat: map[string]any{"type": "checkbox"}},
 		{Id: FieldCreatedAt, Name: "Created at", Schema: schema.Leaf(schema.KindDatetime), Scope: schema.ScopeDerived,
@@ -65,6 +67,8 @@ func SpaceIndexSchema() schema.Dataset {
 			Description: "Push-notification key material mirrored from the ACL."},
 		{Id: FieldOwnRole, Name: "Own role", Schema: str(), Scope: schema.ScopeLocal,
 			Description: "This account's ACL permission in the space; absent means not mirrored yet."},
+		{Id: FieldRefusal, Name: "Refusal", Schema: str(), Scope: schema.ScopeSynced,
+			Description: "What the coordinator last refused for the space; absent or none when nothing."},
 		{Id: FieldGuestKey, Name: "Guest key", Schema: str(), Scope: schema.ScopeSynced,
 			Description: "Guest identity key of a public-access space."},
 		// Free-form object like `settings`: subkeys are the issued-key
@@ -242,6 +246,15 @@ const (
 	// Object.LocalSet; absent until the mirror first runs, which
 	// readers must treat as "unknown yet", not as no-access.
 	FieldOwnRole = "ownRole"
+	// FieldRefusal (SYNCED) is what the coordinator last refused for the
+	// space, in the space.Refusal wire vocabulary: the check a child
+	// space failed when the coordinator refused to sign it, or the
+	// deletion of a space that still has children. Synced so
+	// every device of the account reads why no node holds the space,
+	// also one that has no copy of it. Written by the device the
+	// coordinator answered, via Service.SetRefusal; absent or "none" on
+	// a space that was not refused or has been signed since.
+	FieldRefusal = "refusal"
 	// FieldGuestKey marks a guest-mode (public-access) space: the shared
 	// read-only guest identity's private key, string-encoded, written
 	// once by Service (JoinGuest path) when the account adds the space
@@ -270,6 +283,11 @@ const (
 	// space.ErrIsDerivedSpace. Absent on created / joined / tracked /
 	// 1-1 rows.
 	FieldDerived = "derived"
+	// FieldParentSpaceId is the parent of a child space (SYNCED, set-once
+	// like `type`): the parentSpaceId of the space header. The creating
+	// device writes it with the row, a joiner fills it from the loaded
+	// header together with `type`. Absent on a top-level space.
+	FieldParentSpaceId = "parentSpaceId"
 	// FieldP2PAdvertise (synced, account-wide) is the per-space p2p
 	// advertising switch: false stops this account's devices from
 	// publishing their global p2p row into the space, so other members
@@ -411,6 +429,7 @@ var (
 	ErrStatusTerminal     = errors.New("techspace: status=deleted is terminal")
 	ErrDeleteOpNotAllowed = errors.New("techspace: deletion is via remoteStatus=deleted, not a delete op")
 	ErrDerivedImmutable   = errors.New("techspace: `derived` is pinned after first true write")
+	ErrParentImmutable    = errors.New("techspace: `parentSpaceId` is pinned after first non-empty write")
 	ErrDerivedUndeletable = errors.New("techspace: derived rows refuse status=deleted")
 )
 
@@ -434,6 +453,8 @@ var statusFields = map[string]struct{}{
 //     (terminal — deleted spaces stay in the index);
 //   - `derived` is set-once like `type`, and derived rows refuse
 //     remoteStatus=deleted from any writer (see FieldDerived);
+//   - `parentSpaceId` is set-once like `type`: both come from the
+//     immutable space header;
 //   - delete ops are rejected wholesale; deletion is a status edit,
 //     not a CRDT delete.
 //
@@ -486,7 +507,8 @@ func (SpaceIndexHandler) BeforeModify(ctx *crdt.ChangeCtx, _ *crdt.RecordChange,
 // headRuleErr is the per-field write rule shared by BeforeModify's
 // single-path branch and rejectMultiField's walk — one rule table, so
 // a pin added to one path can't be bypassed through the other:
-//   - `type` / `derived` are set-once (see the Field docs);
+//   - `type` / `derived` / `parentSpaceId` are set-once (see the Field
+//     docs);
 //   - status fields never move out of "deleted" (terminal);
 //   - a derived row refuses remoteStatus=deleted from any writer —
 //     derived spaces are permanent (space.ErrIsDerivedSpace), and the
@@ -497,6 +519,9 @@ func headRuleErr(head string, payload, before *anyenc.Value) error {
 	}
 	if head == FieldDerived && currentDerived(before) {
 		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrDerivedImmutable)
+	}
+	if head == FieldParentSpaceId && currentString(before, FieldParentSpaceId) != "" {
+		return fmt.Errorf("%w: %w", crdt.ErrValidation, ErrParentImmutable)
 	}
 	if _, isStatus := statusFields[head]; isStatus {
 		if currentStatus(before, head) == StatusDeleted {
@@ -564,14 +589,7 @@ func currentDerived(before *anyenc.Value) bool {
 // absent record, missing field, and an explicit "" — all of which mean
 // "unknown, still fillable" for the set-once rule.
 func currentType(before *anyenc.Value) string {
-	if before == nil {
-		return ""
-	}
-	v := before.Get(FieldType)
-	if v == nil || v.Type() != anyenc.TypeString {
-		return ""
-	}
-	return string(v.GetStringBytes())
+	return currentString(before, FieldType)
 }
 
 // currentStatus reads the named status field off the pre-op record.
@@ -579,6 +597,12 @@ func currentType(before *anyenc.Value) string {
 // missing/non-string — both of which mean "not yet deleted" for the
 // terminal-status check.
 func currentStatus(before *anyenc.Value, field string) string {
+	return currentString(before, field)
+}
+
+// currentString reads a string field off the pre-op record; "" for an
+// absent record and a missing or non-string field.
+func currentString(before *anyenc.Value, field string) string {
 	if before == nil {
 		return ""
 	}

@@ -20,7 +20,7 @@ type fakeLimits struct {
 	account                string
 	noFileNodes            bool
 	limitBytes, usageBytes uint64
-	shared                 uint32
+	shared, children       uint32
 	storageErr, sharedErr  error
 	hang                   chan struct{} // non-nil: every fetch blocks on it
 	storageCalls           int
@@ -76,14 +76,14 @@ func (f *fakeLimits) storage(ctx context.Context) (uint64, uint64, error) {
 	return f.limitBytes, f.usageBytes, f.storageErr
 }
 
-func (f *fakeLimits) sharedSpaces(ctx context.Context) (uint32, error) {
+func (f *fakeLimits) spaces(ctx context.Context) (uint32, uint32, error) {
 	f.set(func(f *fakeLimits) { f.sharedCalls++ })
 	if err := f.block(ctx); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.shared, f.sharedErr
+	return f.shared, f.children, f.sharedErr
 }
 
 // memKV is the device store; getErr and setErr make it fail.
@@ -123,7 +123,7 @@ func newLimitsAccount(t *testing.T, net limitsSource, kv limitsKV) *accountImpl 
 	ctx, cancel := context.WithCancel(context.Background())
 	acc := &accountImpl{limits: net, limitsKV: kv, closeCtx: ctx, closeCancel: cancel}
 	acc.initLimits()
-	acc.storageLimits.fresh, acc.sharedSpacesLimits.fresh = 0, 0
+	acc.storageLimits.fresh, acc.spacesLimits.fresh = 0, 0
 	t.Cleanup(acc.close)
 	return acc
 }
@@ -136,7 +136,7 @@ func limitsRunOf[T any](p *limitsPart[T]) *limitsRun {
 
 // settle waits until the fetches in flight have ended and stored.
 func settle(acc *accountImpl) {
-	for _, run := range []*limitsRun{limitsRunOf(&acc.storageLimits), limitsRunOf(&acc.sharedSpacesLimits)} {
+	for _, run := range []*limitsRun{limitsRunOf(&acc.storageLimits), limitsRunOf(&acc.spacesLimits)} {
 		if run != nil {
 			<-run.done
 		}
@@ -148,9 +148,9 @@ func retryNow(acc *accountImpl) {
 	acc.storageLimits.mu.Lock()
 	acc.storageLimits.retryAt = time.Time{}
 	acc.storageLimits.mu.Unlock()
-	acc.sharedSpacesLimits.mu.Lock()
-	acc.sharedSpacesLimits.retryAt = time.Time{}
-	acc.sharedSpacesLimits.mu.Unlock()
+	acc.spacesLimits.mu.Lock()
+	acc.spacesLimits.retryAt = time.Time{}
+	acc.spacesLimits.mu.Unlock()
 }
 
 var errDown = errors.New("unable to connect")
@@ -159,26 +159,31 @@ func down(f *fakeLimits) { f.storageErr, f.sharedErr = errDown, errDown }
 
 func TestAccountLimits_Live(t *testing.T) {
 	ctx := context.Background()
-	net := &fakeLimits{limitBytes: 1 << 30, usageBytes: 42, shared: 3}
+	net := &fakeLimits{limitBytes: 1 << 30, usageBytes: 42, shared: 3, children: 7}
 	acc := newLimitsAccount(t, net, newMemKV())
 
 	got, err := acc.Limits(ctx)
 	require.NoError(t, err)
 	require.NotNil(t, got.Storage)
 	require.NotNil(t, got.SharedSpaces)
+	require.NotNil(t, got.ChildSpaces)
 	assert.Equal(t, uint64(1<<30), got.Storage.LimitBytes)
 	assert.Equal(t, uint64(42), got.Storage.UsageBytes)
 	assert.Equal(t, uint32(3), got.SharedSpaces.Limit)
+	assert.Equal(t, uint32(7), got.ChildSpaces.Limit)
 	assert.WithinDuration(t, time.Now(), got.Storage.FetchedAt, time.Minute)
 	assert.WithinDuration(t, time.Now(), got.SharedSpaces.FetchedAt, time.Minute)
+	assert.Equal(t, got.SharedSpaces.FetchedAt, got.ChildSpaces.FetchedAt, "one answer of the coordinator")
 
 	// Past the fresh window a call on a healthy network is a new answer.
 	settle(acc)
-	net.set(func(f *fakeLimits) { f.usageBytes, f.shared = 43, 4 })
+	net.set(func(f *fakeLimits) { f.usageBytes, f.shared, f.children = 43, 4, 0 })
 	next, err := acc.Limits(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, uint64(43), next.Storage.UsageBytes)
 	assert.Equal(t, uint32(4), next.SharedSpaces.Limit)
+	require.NotNil(t, next.ChildSpaces, "a limit of zero is an answer")
+	assert.Zero(t, next.ChildSpaces.Limit)
 	assert.False(t, next.Storage.FetchedAt.Before(got.Storage.FetchedAt))
 
 	// The caller owns what it got.
@@ -194,7 +199,7 @@ func TestAccountLimits_Fresh(t *testing.T) {
 	ctx := context.Background()
 	net := &fakeLimits{limitBytes: 100, shared: 3}
 	acc := newLimitsAccount(t, net, newMemKV())
-	acc.storageLimits.fresh, acc.sharedSpacesLimits.fresh = time.Hour, time.Hour
+	acc.storageLimits.fresh, acc.spacesLimits.fresh = time.Hour, time.Hour
 
 	first, err := acc.Limits(ctx)
 	require.NoError(t, err)
@@ -323,7 +328,7 @@ func TestAccountLimits_Hang(t *testing.T) {
 	net := &fakeLimits{limitBytes: 5, shared: 2, hang: release}
 	acc := newLimitsAccount(t, net, newMemKV())
 	const wait = 300 * time.Millisecond
-	acc.storageLimits.wait, acc.sharedSpacesLimits.wait = wait, wait
+	acc.storageLimits.wait, acc.spacesLimits.wait = wait, wait
 
 	start := time.Now()
 	got, err := acc.Limits(ctx)
@@ -362,7 +367,7 @@ func TestAccountLimits_Slow(t *testing.T) {
 	release := make(chan struct{})
 	net := &fakeLimits{limitBytes: 1, shared: 1, hang: release}
 	acc := newLimitsAccount(t, net, newMemKV())
-	acc.storageLimits.wait, acc.sharedSpacesLimits.wait = wait, wait
+	acc.storageLimits.wait, acc.spacesLimits.wait = wait, wait
 
 	// First fetch: succeeds, but only after the wait bound.
 	_, err := acc.Limits(ctx)
@@ -497,6 +502,34 @@ func TestAccountLimits_StoreFailure(t *testing.T) {
 	assert.Equal(t, uint64(5), got.Storage.LimitBytes)
 }
 
+// The child-spaces limit is kept on the device with the shared-spaces
+// limit and served from there while the network is away. An answer
+// stored before the coordinator gave one has none.
+func TestAccountLimits_ChildSpacesStored(t *testing.T) {
+	ctx := context.Background()
+	kv := newMemKV()
+	net := &fakeLimits{limitBytes: 5, shared: 2, children: 9}
+	acc := newLimitsAccount(t, net, kv)
+	_, err := acc.Limits(ctx)
+	require.NoError(t, err)
+	settle(acc)
+	acc.close()
+
+	net.set(down)
+	offline, err := newLimitsAccount(t, net, kv).Limits(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, offline.ChildSpaces)
+	assert.Equal(t, uint32(9), offline.ChildSpaces.Limit)
+	assert.Equal(t, uint32(2), offline.SharedSpaces.Limit)
+
+	kv.m[sharedSpacesLimitsKey+net.scope()] = `{"limit":2,"fetchedAt":"2026-01-02T03:04:05Z"}`
+	old, err := newLimitsAccount(t, net, kv).Limits(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, old.SharedSpaces)
+	assert.Equal(t, uint32(2), old.SharedSpaces.Limit)
+	assert.Nil(t, old.ChildSpaces)
+}
+
 // A stored value this code did not write is no answer, whatever it
 // decodes to.
 func TestAccountLimits_StoredGarbage(t *testing.T) {
@@ -509,6 +542,7 @@ func TestAccountLimits_StoredGarbage(t *testing.T) {
 		require.NoError(t, err, raw)
 		assert.Nil(t, got.Storage, raw)
 		assert.Nil(t, got.SharedSpaces, raw)
+		assert.Nil(t, got.ChildSpaces, raw)
 	}
 }
 

@@ -105,7 +105,11 @@ type AclSpaceClient interface {
   `DeclineRequest`, `CancelJoinRequest`), membership (`AddAccounts`,
   `RemoveAccounts`, `ChangePermissions`, `OwnershipChange`,
   `RequestSelfRemove`, `StopSharing`) and guest access
-  (`CreateGuestKey`, `RevokeGuestKey`).
+  (`CreateGuestKey`, `RevokeGuestKey`). An organization and its spaces
+  have no guest role: there the calls that name it return
+  `ErrNoGuestRole` (docs/child-spaces.md § Members of a child).
+  `RotationPending` reads the state a removal without a read key change
+  leaves (docs/child-spaces.md).
 - **Invite format.** SDK-defined: one base58 token carrying the space
   id, the invite private key minted by any-sync's `BuildInvite`, and the
   kind (member request-to-join, or guest). Not compatible with
@@ -259,6 +263,14 @@ removed: it stays in `List` with `StatusDeleted`. A coordinator
 push and never purges a registered record, so `NotExists` means the space
 was never registered (its first push has not landed, it was deleted
 before it could push, or the push was refused) and the row is left alone.
+
+**Organizations and child spaces.** An organization (`Create` with
+`space.SpaceTypeOrganization`) is a space under which child spaces are
+created (`CreateChild`). The two types, creation, a child the
+coordinator refuses, the calls of the parent's Admins and Owner and the
+deletion of a parent are in docs/child-spaces.md. `Delete` of an
+organization the account owns asks the coordinator before it writes
+anything: the coordinator refuses it while a child is left.
 
 **1-1 and guest spaces** delete locally only. `Delete` writes a synced,
 non-terminal marker (`oneToOneDeleted` / `guestDeleted`) and offloads;
@@ -444,18 +456,31 @@ cross-space transactions).
 
 - The on-wire `header.SpaceType` is gated by the any-sync coordinator
   (`spacestatus/changeverifier.go`). Accepted: the `any` product's
-  `any.space`, `any.techspace`, `any.onetoone` (all require
-  `fileprotoVersion=2` in the header) and anytype's `anytype.space`,
+  `any.space`, `any.organization`, `any.organization.space`,
+  `any.techspace`, `any.onetoone` (all require `fileprotoVersion=2` in
+  the header) and anytype's `anytype.space`,
   `anytype.techspace`, `anytype.chatspace`, `anytype.onetoone`. Anything
   else fails periodic headsync with `unknown space type: <value>`, and
   because the type is content-addressed into the immutable header, a
   rejected value breaks the space permanently.
-- The SDK mints only `any.*`, all with fileproto v2: created and derived
-  spaces use `any.space` (`space.SpaceTypeAny`, the only non-empty value
-  `CreateRequest.SpaceType` accepts), the tech space `any.techspace`, 1-1s
-  `any.onetoone` (`space.SpaceTypeOneToOne`). `anytype.*` spaces belong
-  to anytype-heart clients; the SDK can join or track them but never
-  creates them.
+- The SDK mints only `any.*`, all with fileproto v2:
+  - `any.space` (`space.SpaceTypeAny`): `Create`, also for an empty
+    `CreateRequest.SpaceType`, and `Derive`;
+  - `any.organization` (`space.SpaceTypeOrganization`): `Create` with
+    that `CreateRequest.SpaceType`. An organization has child spaces;
+  - `any.organization.space` (`space.SpaceTypeOrganizationSpace`):
+    `CreateChild` only. `Create` refuses it with `ErrBadSpaceType`;
+  - `any.techspace`: the tech space;
+  - `any.onetoone` (`space.SpaceTypeOneToOne`): 1-1 spaces.
+
+  `anytype.*` spaces belong to anytype-heart clients; the SDK can join
+  or track them but never creates them.
+- A header's type and its parent agree: a space of type
+  `any.organization.space` names its organization, and no other type
+  names a parent (docs/child-spaces.md).
+- Read `SpaceInfo.Type` to tell an organization or one of its spaces:
+  `SpaceInfo.SpaceType` is the header type only on a created space, and
+  on a derived space a free-text tag the application chooses.
 - The 1-1 type feeds the symmetric derived 1-1 id, so an any↔anytype 1-1
   is structurally impossible.
 - What an account uses a space for is not a space type. It is

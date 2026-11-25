@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -37,8 +38,10 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 	return handle.Inner().AclClient(), nil
 }
 
-// CreateInvite mints a fresh RequestToJoin invite, replacing any
-// prior invite. Output is a share-friendly base58 token.
+// CreateInvite mints a RequestToJoin invite. ReplaceInvite refuses it
+// with ErrDuplicateInvites while one is active, and revokes the active
+// invites of other types in the same record. Output is a
+// share-friendly base58 token.
 //
 // The space must be registered with the coordinator before any ACL
 // record can be published — otherwise the node returns
@@ -51,7 +54,8 @@ func (a *aclAPI) client(ctx context.Context) (aclclient.AclSpaceClient, error) {
 // custody (synced tech-space row), so every device of the minting
 // account can re-encode the same token — Members.Invites returns it
 // on the matching row. Persist failure fails the call: the ACL invite
-// stands, but an unrecoverable token defeats the contract; re-mint.
+// stands with a token nobody holds, and the next mint is refused as a
+// duplicate until that invite is revoked.
 func (a *aclAPI) CreateInvite(ctx context.Context) (space.Invite, error) {
 	if err := ensureShareable(ctx, a.s); err != nil {
 		return space.Invite{}, err
@@ -132,15 +136,24 @@ func isLogNotReady(err error) bool {
 // the first tick fires immediately, but peer connections may not be
 // established yet, so the first attempt is best-effort).
 //
+// Only the space's Owner makes the call: the coordinator refuses it
+// from any other account, and an account that is not the Owner acts in
+// a space that is shared already, or it would not be a member of it.
+//
 // Idempotent on the coordinator — calling it many times is cheap.
 //
 // Total retry window ≈ 35s — long enough to clear the worst case of
 // peer-connect-then-syncperiod-tick.
+//
+// A child the coordinator refused to sign is on no node: once the
+// coordinator answers that it does not know the space, a refusal its
+// row holds is returned with no further wait. A wait that runs out
+// returns space.ErrSpaceUnknown.
 func ensureShareable(ctx context.Context, s *spaceImpl) error {
-	const (
-		maxAttempts = 35
-		backoff     = time.Second
-	)
+	const maxAttempts = 35
+	if !s.localIdentityIsOwner(ctx) {
+		return nil
+	}
 	coord := s.app.Coordinator()
 	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
@@ -149,16 +162,47 @@ func ensureShareable(ctx context.Context, s *spaceImpl) error {
 			if !isSpaceNotPushedYet(err) {
 				return fmt.Errorf("acl: make shareable: %w", err)
 			}
+			// Read after the coordinator's answer: the row can still hold
+			// a refusal for a child another device got signed.
+			if refused := s.signRefusal(ctx); refused != nil {
+				return refused
+			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(backoff):
+			case <-time.After(time.Duration(makeShareableBackoff.Load())):
 			}
 			continue
 		}
 		return nil
 	}
-	return fmt.Errorf("acl: make shareable (after %d attempts): %w", maxAttempts, lastErr)
+	return fmt.Errorf("acl: make shareable (after %d attempts): %w: %w", maxAttempts, space.ErrSpaceUnknown, lastErr)
+}
+
+// makeShareableBackoff is the pause between two make-shareable requests
+// for a space the coordinator does not know yet.
+var makeShareableBackoff = newAtomicInterval(time.Second)
+
+// SetMakeShareableBackoffForTest overrides that pause and returns a
+// func that restores it. Test seam.
+func SetMakeShareableBackoffForTest(d time.Duration) (restore func()) {
+	prev := makeShareableBackoff.Swap(int64(d))
+	return func() { makeShareableBackoff.Store(prev) }
+}
+
+// signRefusal returns the error of the check this space failed when
+// the coordinator refused to sign it, nil when its row holds no such
+// refusal.
+func (s *spaceImpl) signRefusal(ctx context.Context) error {
+	rec, ok := s.tsp.Get(ctx, s.id)
+	if !ok {
+		return nil
+	}
+	cause := refusalErr(rec.Refusal)
+	if cause == nil {
+		return nil
+	}
+	return fmt.Errorf("acl: space %q is on no node, the coordinator refused it (%s): %w", s.id, rec.Refusal, cause)
 }
 
 // isSpaceNotPushedYet matches the coordinator's "space not exists"
@@ -230,6 +274,11 @@ func (a *aclAPI) AcceptRequest(ctx context.Context, requestRecordId string, perm
 	if requestRecordId == "" {
 		return errors.New("acl: AcceptRequest: requestRecordId required")
 	}
+	if perm == space.PermissionGuest {
+		if err := a.s.guestRoleRefusal(ctx, "AcceptRequest"); err != nil {
+			return err
+		}
+	}
 	cl, err := a.client(ctx)
 	if err != nil {
 		return err
@@ -255,6 +304,11 @@ func (a *aclAPI) DeclineRequest(ctx context.Context, identity string) error {
 func (a *aclAPI) ChangePermissions(ctx context.Context, changes []space.PermissionChange) error {
 	if len(changes) == 0 {
 		return errors.New("acl: ChangePermissions: empty changes")
+	}
+	if slices.ContainsFunc(changes, func(ch space.PermissionChange) bool { return ch.Permission == space.PermissionGuest }) {
+		if err := a.s.guestRoleRefusal(ctx, "ChangePermissions"); err != nil {
+			return err
+		}
 	}
 	cl, err := a.client(ctx)
 	if err != nil {
@@ -303,6 +357,11 @@ func (a *aclAPI) RemoveAccounts(ctx context.Context, identities []string) error 
 func (a *aclAPI) AddAccounts(ctx context.Context, accounts []space.MemberAdd) error {
 	if len(accounts) == 0 {
 		return errors.New("acl: AddAccounts: empty accounts")
+	}
+	if slices.ContainsFunc(accounts, func(m space.MemberAdd) bool { return m.Permission == space.PermissionGuest }) {
+		if err := a.s.guestRoleRefusal(ctx, "AddAccounts"); err != nil {
+			return err
+		}
 	}
 	// Same precondition as CreateInvite: the ACL record is rejected until
 	// the coordinator knows the space ("space not exists" / log not
@@ -396,7 +455,12 @@ func (a *aclAPI) CancelJoinRequest(ctx context.Context) error {
 // an orphaned guest identity would survive every future revocation:
 // RemoveAccounts re-encrypts the rotated key for remaining members,
 // guests included.
+//
+// A space with no guest role is refused before anything else.
 func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
+	if err := a.s.guestRoleRefusal(ctx, "CreateGuestKey"); err != nil {
+		return space.Invite{}, err
+	}
 	if !a.s.localIdentityIsOwner(ctx) {
 		return space.Invite{}, errors.New("acl: CreateGuestKey: owner only")
 	}
@@ -445,8 +509,12 @@ func (a *aclAPI) CreateGuestKey(ctx context.Context) (space.Invite, error) {
 // RevokeGuestKey removes EVERY guest identity from the ACL (custodied
 // or orphaned — public access must end regardless of which device
 // minted what), rotating the read key, and clears the owner-side
-// custody — see space.ACL.RevokeGuestKey.
+// custody — see space.ACL.RevokeGuestKey. A space with no guest role is
+// refused before anything else.
 func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
+	if err := a.s.guestRoleRefusal(ctx, "RevokeGuestKey"); err != nil {
+		return err
+	}
 	if !a.s.localIdentityIsOwner(ctx) {
 		return errors.New("acl: RevokeGuestKey: owner only")
 	}
@@ -463,6 +531,37 @@ func (a *aclAPI) RevokeGuestKey(ctx context.Context) error {
 		return err
 	}
 	return a.s.clearIssuedKey(ctx, techspace.IssuedKeyGuest)
+}
+
+// guestRoleRefusal returns space.ErrNoGuestRole for a space of a type
+// with no guest role: an organization and its spaces. The row's type
+// decides, a set-once copy of the header's. A row with no type yet
+// takes the header's: the space is loaded for it, and one that does not
+// load returns that error.
+func (s *spaceImpl) guestRoleRefusal(ctx context.Context, op string) error {
+	rec, _ := s.tsp.Get(ctx, s.id)
+	spaceType := rec.Type
+	if spaceType == "" {
+		handle, err := s.app.GetSpace(ctx, s.id)
+		if err != nil {
+			return fmt.Errorf("acl: load space: %w", err)
+		}
+		hdr := spaceHeader(ctx, handle)
+		if hdr == nil {
+			return fmt.Errorf("acl: %s: space %q: header not readable", op, s.id)
+		}
+		spaceType = hdr.SpaceType
+	}
+	if hasGuestRole(spaceType) {
+		return nil
+	}
+	return fmt.Errorf("acl: %s: space %q of type %s: %w", op, s.id, spaceType, space.ErrNoGuestRole)
+}
+
+// hasGuestRole reports whether a space of the header type lets an
+// account hold the guest role.
+func hasGuestRole(spaceType string) bool {
+	return spaceType != space.SpaceTypeOrganization && spaceType != space.SpaceTypeOrganizationSpace
 }
 
 // activeGuestIdentities lists every ACL account currently holding
@@ -512,6 +611,22 @@ func (a *aclAPI) removeAllGuestIdentities(ctx context.Context) error {
 		return fmt.Errorf("acl: remove guest accounts: %w", err)
 	}
 	return nil
+}
+
+// RotationPending reads the ACL's pending rotation — see
+// space.ACL.RotationPending.
+func (a *aclAPI) RotationPending(ctx context.Context) (bool, error) {
+	handle, err := a.s.app.GetSpace(ctx, a.s.id)
+	if err != nil {
+		return false, fmt.Errorf("acl: load space: %w", err)
+	}
+	acl := handle.Inner().Acl()
+	if acl == nil {
+		return false, errors.New("acl: space has no acl")
+	}
+	acl.RLock()
+	defer acl.RUnlock()
+	return acl.AclState().RotationPending(), nil
 }
 
 func (a *aclAPI) StopSharing(ctx context.Context) error {

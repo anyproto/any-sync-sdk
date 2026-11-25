@@ -15,10 +15,24 @@ import "time"
 // anytype-heart clients; the SDK can join/track them but never mints
 // them.
 const (
-	// SpaceTypeAny is the type of every created or derived space.
-	// Used when CreateRequest.SpaceType is empty (the only accepted
-	// value).
+	// SpaceTypeAny is the type of a space outside any organization, and
+	// of every derived space. Create uses it when
+	// CreateRequest.SpaceType is empty.
 	SpaceTypeAny = "any.space"
+
+	// SpaceTypeOrganization is the type of an organization: a space
+	// like SpaceTypeAny that can have child spaces
+	// (Service.CreateChild) and has no guest role (ErrNoGuestRole).
+	// Create makes one when CreateRequest.SpaceType names it. The type
+	// is in the immutable header, so a space of another type never
+	// becomes one.
+	SpaceTypeOrganization = "any.organization"
+
+	// SpaceTypeOrganizationSpace is the type of a child space, a space
+	// of an organization. Only Service.CreateChild makes one; its
+	// header names the organization (SpaceInfo.ParentSpaceId). It has
+	// no guest role (ErrNoGuestRole).
+	SpaceTypeOrganizationSpace = "any.organization.space"
 
 	// SpaceTypeOneToOne is for derived 1-1 spaces shared between two
 	// identities. The type is content-addressed into the symmetric
@@ -33,11 +47,14 @@ const (
 // Service.Subscribe for live changes.
 type SpaceInfo struct {
 	Id   string
-	Type string // on-wire header type (any.space, any.onetoone, …; the tech type only on the tech handle)
-	// SpaceType is the app-level tag set via DeriveRequest.SpaceType,
-	// read from the in-space spaceIndex. Independent of the header Type;
-	// use it for client-side classification/filtering. Untagged spaces
-	// carry SpaceTypeAny.
+	Type string // on-wire header type (any.space, any.organization, any.organization.space, any.onetoone, …; the tech type only on the tech handle)
+	// SpaceType is the app-level tag read from the in-space spaceIndex,
+	// for client-side classification/filtering. A created space carries
+	// its header type here (SpaceTypeAny, SpaceTypeOrganization,
+	// SpaceTypeOrganizationSpace). A derived space carries the tag of
+	// DeriveRequest.SpaceType, SpaceTypeAny when none was given: the tag
+	// is free text and independent of the header Type, so Type, not
+	// SpaceType, tells an organization or one of its spaces.
 	SpaceType string
 	// AnySpaceType says what the account uses the space for, e.g. the
 	// space of one app (CreateRequest.AnySpaceType,
@@ -98,6 +115,20 @@ type SpaceInfo struct {
 	// the account's discovery record either way. Synced account-wide;
 	// written via Space.SetP2PAdvertise.
 	P2PAdvertise bool
+	// ParentSpaceId is the parent of a child space, as the space header
+	// names it; empty for a top-level space. A joined space carries it
+	// from its first load on.
+	ParentSpaceId string
+	// Refusal is set on a child space the coordinator refused to sign:
+	// it names the failed check. The space stays usable on a device
+	// that holds it and exists on no node. Synced account-wide, so a
+	// device with no copy of the space reads it too, and back to
+	// RefusalNone once the coordinator signs the space
+	// (Service.RetryPush asks it now). Status is not affected.
+	//
+	// On a deleted space RefusalHasChildren says that its deletion on
+	// the network waits for its child spaces (Service.Delete).
+	Refusal Refusal
 }
 
 // PushKeys is the per-space key material a push RECEIVER needs,

@@ -24,6 +24,7 @@ import (
 	"github.com/anyproto/any-sync/commonspace/spacepayloads"
 	"github.com/anyproto/any-sync/commonspace/spacestorage"
 	"github.com/anyproto/any-sync/commonspace/spacesyncproto"
+	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/anyproto/any-sync/util/crypto"
 	"go.uber.org/zap"
 
@@ -54,15 +55,18 @@ var storeLog = logger.NewNamed("sdk.spacestore")
 // forever — and since the type is content-addressable into the
 // header, you can't fix the space after the fact. Catch it here.
 //
-// The SDK mints only any.space; empty means the same. 1-1 spaces are
-// derived, never created, so their type is not accepted here.
+// Create mints any.space, which empty means too, and any.organization.
+// A space of an organization comes from CreateChild and a 1-1 space is
+// derived, so their types are not accepted here.
 func normalizeSpaceType(t string) (string, error) {
 	switch t {
 	case "", space.SpaceTypeAny:
 		return space.SpaceTypeAny, nil
+	case space.SpaceTypeOrganization:
+		return space.SpaceTypeOrganization, nil
 	default:
-		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s or empty)",
-			space.ErrBadSpaceType, t, space.SpaceTypeAny)
+		return "", fmt.Errorf("spaceimpl: %w: %q (allowed: %s, %s or empty)",
+			space.ErrBadSpaceType, t, space.SpaceTypeAny, space.SpaceTypeOrganization)
 	}
 }
 
@@ -294,6 +298,9 @@ func New(app *anysyncx.App, tsp *techspace.Service, indexer space.Indexer, db an
 		inviteKick:          make(chan struct{}, 1),
 	}
 	s.seedCtx, s.seedCancel = context.WithCancel(context.Background())
+	app.OnChildSign(s.childSignAnswered, s.recordedRow)
+	app.SetOwnStoredFn(s.ownsStored)
+	app.OnNodeRound(s.nodeRound)
 	s.startJoinController()
 	// Wire the Total source for the sync-status rollup. The rollup
 	// loop reads the per-space `objects` row count via the live Store
@@ -520,6 +527,12 @@ func (s *Service) buildStore(spaceId string, closing bool) *spaceobjects.Store {
 // store handle without going through Get / Create / Derive.
 func (s *Service) StoreFor(spaceId string) *spaceobjects.Store { return s.storeFor(spaceId) }
 
+// HandleForTest returns the handle of spaceId with no load of the
+// space and no read of its row. Test seam.
+func (s *Service) HandleForTest(spaceId string) space.Space {
+	return newSpace(spaceId, s.app, s.tsp, s.storeFor(spaceId), s)
+}
+
 // ApplyGapCount is the number of spaceId's objects with a stored
 // change that may be unapplied (spaceobjects.GapSet), 0 for a space
 // never loaded this session.
@@ -707,58 +720,83 @@ func (s *Service) ensureSpaceIndexWiring(ctx context.Context, spaceId string) (s
 	}
 
 	// ACL mirror: ACL state → this space's tech-space row `push` +
-	// `ownRole` fields (aclmirror_watcher.go). Same dedup dance; the
-	// initial mirror pass is primed inside newAclMirrorWatcher.
-	// Registered on the space's ACL kick fan-out so read-key rotations
-	// and permission changes land promptly.
-	if s.tsp != nil {
-		s.mu.Lock()
-		_, dup := s.aclMirrorWatchers[spaceId]
-		s.mu.Unlock()
-		if !dup {
-			w := newAclMirrorWatcher(s, spaceId)
-			s.mu.Lock()
-			if _, raced := s.aclMirrorWatchers[spaceId]; raced {
-				s.mu.Unlock()
-				w.stop()
-			} else {
-				s.aclMirrorWatchers[spaceId] = w
-				s.watchers.register(w)
-				s.mu.Unlock()
-				var mux *aclKickMux
-				if acl := handle.Inner().Acl(); acl != nil {
-					mux = s.aclKickFanout(spaceId, acl)
-					mux.add(w)
-					// Close the wiring gap: the primed mirror pass may
-					// already have read ACL state BEFORE the mux
-					// subscription above — an ACL record applied in that
-					// window produced no kick, and on a quiet space
-					// nothing else ever would. One post-subscribe kick
-					// re-mirrors from current state; coalescing makes it
-					// free when the primed pass hasn't run yet.
-					w.kick()
-				}
-				// Re-check against a concurrent offload: closeSpaceRuntime
-				// stops watchers and clears the maps under s.mu, but this
-				// wiring ran outside it — if the space was torn down
-				// meanwhile (spaceIndexIds entry gone), unwind so no live
-				// watcher survives against a closed space.
-				s.mu.Lock()
-				if _, live := s.spaceIndexIds[spaceId]; !live {
-					delete(s.aclMirrorWatchers, spaceId)
-					s.mu.Unlock()
-					if mux != nil {
-						mux.remove(w)
-					}
-					s.watchers.unregister(w)
-					w.stop()
-				} else {
-					s.mu.Unlock()
-				}
-			}
-		}
-	}
+	// `ownRole` fields (aclmirror_watcher.go). Unwound when the space
+	// was torn down while it was wired (spaceIndexIds entry gone).
+	s.ensureAclMirror(spaceId, handle.Inner().Acl(), func() bool {
+		_, live := s.spaceIndexIds[spaceId]
+		return live
+	})
 	return objectId, nil
+}
+
+// ensureAclMirror starts spaceId's ACL mirror watcher, once per loaded
+// lifetime of the space, and registers it on the space's ACL kick
+// fan-out so read-key rotations and permission changes land promptly.
+// The initial mirror pass is primed inside newAclMirrorWatcher. live is
+// asked under s.mu once the watcher is wired: the wiring runs outside
+// the lock, and closeSpaceRuntime stops watchers and clears the maps
+// under it, so a watcher wired for a space torn down meanwhile is
+// unwound.
+func (s *Service) ensureAclMirror(spaceId string, acl list.AclList, live func() bool) {
+	if s.tsp == nil {
+		return
+	}
+	s.mu.Lock()
+	_, dup := s.aclMirrorWatchers[spaceId]
+	s.mu.Unlock()
+	if dup {
+		return
+	}
+	w := newAclMirrorWatcher(s, spaceId)
+	s.mu.Lock()
+	if _, raced := s.aclMirrorWatchers[spaceId]; raced {
+		s.mu.Unlock()
+		w.stop()
+		return
+	}
+	s.aclMirrorWatchers[spaceId] = w
+	s.watchers.register(w)
+	s.mu.Unlock()
+	var mux *aclKickMux
+	if acl != nil {
+		mux = s.aclKickFanout(spaceId, acl)
+		mux.add(w)
+		// Close the wiring gap: the primed mirror pass may already have
+		// read ACL state BEFORE the mux subscription above — an ACL
+		// record applied in that window produced no kick, and on a
+		// quiet space nothing else ever would. One post-subscribe kick
+		// re-mirrors from current state; coalescing makes it free when
+		// the primed pass hasn't run yet.
+		w.kick()
+	}
+	s.mu.Lock()
+	if live() {
+		s.mu.Unlock()
+		return
+	}
+	delete(s.aclMirrorWatchers, spaceId)
+	s.mu.Unlock()
+	if mux != nil {
+		mux.remove(w)
+	}
+	s.watchers.unregister(w)
+	w.stop()
+}
+
+// StartAclMirror starts the ACL mirror watcher of a loaded space
+// without the rest of the wiring a Get does. The boot pass calls it for
+// the child spaces it loads, after it built their store: the watcher is
+// what ends a pending key rotation (rotation.go), and a device of an
+// Admin or the Owner of a child ends one without waiting for a Get.
+func (s *Service) StartAclMirror(ctx context.Context, spaceId string) {
+	handle, ok := s.app.PickSpace(ctx, spaceId)
+	if !ok {
+		return
+	}
+	s.ensureAclMirror(spaceId, handle.Inner().Acl(), func() bool {
+		_, live := s.stores[spaceId]
+		return live
+	})
 }
 
 // spaceIndexTreeId is the id of spaceId's derived spaceIndex tree, a
@@ -790,9 +828,19 @@ func (s *Service) spaceIndexObjectIdFor(ctx context.Context, spaceId string) (st
 	return s.ensureSpaceIndexWiring(ctx, spaceId)
 }
 
-// Create creates a new regular space owned by the authenticated
-// account, and writes its space-index entry into the tech space.
+// Create creates a new space owned by the authenticated account, of
+// the type req.SpaceType names, and writes its space-index entry into
+// the tech space.
 func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Space, error) {
+	return s.create(ctx, req, "")
+}
+
+// create builds a space owned by the authenticated account and its
+// space-index entry. With parentSpaceId the space is a child of that
+// organization, whatever req.SpaceType says: the header carries the
+// child type and names the parent, and the space takes the parent's
+// replication key.
+func (s *Service) create(ctx context.Context, req space.CreateRequest, parentSpaceId string) (space.Space, error) {
 	keys := s.app.AccountKeys()
 	if keys == nil {
 		return nil, errors.New("spaceimpl: anysyncx app has no account keys")
@@ -807,16 +855,22 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		return nil, fmt.Errorf("spaceimpl: metadata key: %w", err)
 	}
 
-	spaceType, err := normalizeSpaceType(req.SpaceType)
-	if err != nil {
-		return nil, err
+	spaceType := space.SpaceTypeOrganizationSpace
+	if parentSpaceId == "" {
+		if spaceType, err = normalizeSpaceType(req.SpaceType); err != nil {
+			return nil, err
+		}
 	}
 
 	// Reuse the tech-space's replication key so all spaces for this
 	// account land on the same coordinator shard. The tech space is
 	// derived deterministically from the account key, so its repKey
 	// is the canonical per-account value (per docs/space.md
-	// § "Replication key").
+	// § "Replication key"). A child lives on its parent's nodes instead.
+	replicationKeySource := s.tsp.SpaceId()
+	if parentSpaceId != "" {
+		replicationKeySource = parentSpaceId
+	}
 	// Owner metadata in the ACL root is the owner's metadata symkey only,
 	// so joiners learn the key and resolve the owner's profile from
 	// identityRepo (no inline name/icon on the ACL).
@@ -833,7 +887,8 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 		SpaceType:   spaceType,
 		// any.* headers are files-v2 only (coordinator-enforced).
 		FileProtoVersion: spacesyncproto.SpaceFileProtoVersion_SpaceFileProtoVersionV2,
-		ReplicationKey:   replicationKeyFromSpaceId(s.tsp.SpaceId()),
+		ReplicationKey:   replicationKeyFromSpaceId(replicationKeySource),
+		ParentSpaceId:    parentSpaceId,
 	}
 	spaceId, err := s.app.SpaceService().CreateSpace(ctx, payload)
 	if err != nil {
@@ -841,14 +896,15 @@ func (s *Service) Create(ctx context.Context, req space.CreateRequest) (space.Sp
 	}
 
 	if _, err := s.tsp.Add(ctx, techspace.SpaceIndexRecord{
-		Id:           spaceId,
-		Type:         spaceType,
-		SpaceType:    spaceType,
-		AnySpaceType: req.AnySpaceType,
-		Name:         req.Name,
-		Description:  req.Description,
-		IconCID:      req.IconCID,
-		RemoteStatus: techspace.StatusActive,
+		Id:            spaceId,
+		Type:          spaceType,
+		SpaceType:     spaceType,
+		AnySpaceType:  req.AnySpaceType,
+		Name:          req.Name,
+		Description:   req.Description,
+		IconCID:       req.IconCID,
+		RemoteStatus:  techspace.StatusActive,
+		ParentSpaceId: parentSpaceId,
 	}); err != nil {
 		return nil, fmt.Errorf("spaceimpl: write index entry: %w", err)
 	}
@@ -1006,26 +1062,42 @@ func (s *Service) load(ctx context.Context, spaceId string) (space.Space, error)
 	// owner can write the initial spaceIndex properties, and non-
 	// owners skip silently (the owner's eventual write propagates).
 	s.goSeed(sp)
-	s.backfillHeaderType(ctx, spaceId)
+	s.backfillHeader(ctx, spaceId)
 	return sp, nil
 }
 
-// backfillHeaderType fills the set-once tech-space row `type` from the
-// now-loaded space's on-wire header. Rows registered on join/track are
-// created before the header is readable and carry an empty type until
-// the first successful load lands here. Best-effort: a miss retries on
-// the next load, and the handler's set-once rule absorbs races.
-func (s *Service) backfillHeaderType(ctx context.Context, spaceId string) {
+// backfillHeader fills the set-once tech-space row fields that come
+// from the now-loaded space's header: `type` and, for a child space,
+// `parentSpaceId`. Rows registered on join/track are created before the
+// header is readable and carry neither until the first successful load
+// lands here. A row with the child type and no parent id, as a device
+// that reads no parent from a header leaves it, takes the parent id.
+// Best-effort: a miss retries on the next load, and the handler's
+// set-once rule absorbs races.
+func (s *Service) backfillHeader(ctx context.Context, spaceId string) {
 	rec, ok := s.tsp.Get(ctx, spaceId)
-	if !ok || rec.Type != "" {
+	if !ok {
 		return
 	}
-	ht := s.headerTypeFromHeader(ctx, spaceId)
-	if ht == "" {
+	lacksParent := rec.Type == space.SpaceTypeOrganizationSpace && rec.ParentSpaceId == ""
+	if rec.Type != "" && !lacksParent {
 		return
 	}
-	// Failure just leaves the row unknown; the next load retries.
-	_, _ = s.tsp.SetType(ctx, spaceId, ht)
+	hdr := s.residentHeader(ctx, spaceId)
+	if hdr == nil || hdr.SpaceType == "" {
+		return
+	}
+	// The parent id goes first: a pass cut short after it leaves a row
+	// the next load completes.
+	if hdr.ParentSpaceId != "" && rec.ParentSpaceId == "" {
+		if _, err := s.tsp.SetParentSpaceId(ctx, spaceId, hdr.ParentSpaceId); err != nil {
+			return
+		}
+	}
+	if rec.Type == "" {
+		// Failure just leaves the row unknown; the next load retries.
+		_, _ = s.tsp.SetType(ctx, spaceId, hdr.SpaceType)
+	}
 }
 
 // SyncSpaceList forces an immediate head-sync round on the tech space
@@ -1104,26 +1176,31 @@ func (s *Service) recordToInfo(ctx context.Context, r techspace.SpaceIndexRecord
 	}
 	// An empty row type (joined/tracked space not yet loaded on any
 	// device) falls back to the header when the space happens to be
-	// resident; the durable backfill happens in load.
-	typ := r.Type
+	// resident, and so does the parent id; the durable backfill happens
+	// in load.
+	typ, parentSpaceId := r.Type, r.ParentSpaceId
 	if typ == "" {
-		typ = s.headerTypeFromHeader(peekCtx, r.Id)
+		if hdr := s.residentHeader(peekCtx, r.Id); hdr != nil {
+			typ, parentSpaceId = hdr.SpaceType, hdr.ParentSpaceId
+		}
 	}
 	info := space.SpaceInfo{
-		Id:           r.Id,
-		Type:         typ,
-		SpaceType:    s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
-		AnySpaceType: r.AnySpaceType,
-		Author:       author,
-		Name:         r.Name,
-		Description:  r.Description,
-		IconCID:      r.IconCID,
-		Status:       mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
-		OwnRole:      r.OwnRole,
-		Settings:     r.Settings,
-		PushKeys:     r.PushKeys,
-		Derived:      r.Derived,
-		P2PAdvertise: r.P2PAdvertise,
+		Id:            r.Id,
+		Type:          typ,
+		SpaceType:     s.resolveSpaceType(peekCtx, r.Id, r.SpaceType),
+		AnySpaceType:  r.AnySpaceType,
+		Author:        author,
+		Name:          r.Name,
+		Description:   r.Description,
+		IconCID:       r.IconCID,
+		Status:        mapStatus(r.Type, r.LocalStatus, r.RemoteStatus),
+		OwnRole:       r.OwnRole,
+		Settings:      r.Settings,
+		PushKeys:      r.PushKeys,
+		Derived:       r.Derived,
+		P2PAdvertise:  r.P2PAdvertise,
+		ParentSpaceId: parentSpaceId,
+		Refusal:       r.Refusal,
 	}
 	// A 1-1 has no space-set name; show the friend's resolved profile from
 	// the identities directory (the row's name/icon stays as an out-of-band
@@ -1236,7 +1313,10 @@ func (s *Service) ListDevices(ctx context.Context) ([]space.Device, error) {
 //
 // The tech space (system-owned, never in the list) and seed-derived
 // spaces (rows flagged FieldDerived — see space.ErrIsDerivedSpace) are
-// refused outright.
+// refused outright, and so is an organization with children
+// (space.ErrSpaceHasChildren): for one the account owns the signed
+// delete goes to the coordinator on the call path when it answers,
+// before anything local is written.
 func (s *Service) Delete(ctx context.Context, spaceId string) error {
 	if spaceId == s.tsp.SpaceId() {
 		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrIsTechSpace)
@@ -1285,12 +1365,78 @@ func (s *Service) Delete(ctx context.Context, spaceId string) error {
 		// silently succeed while writing nothing (strict-skip modify).
 		return fmt.Errorf("spaceimpl: Delete: %w", space.ErrSpaceUnknown)
 	}
+	// The coordinator refuses to delete an organization that has
+	// children, and only its owner's delete reaches the coordinator. The
+	// tombstone is not taken back, so an organization the account owns,
+	// or may own, is settled before it is written: with the index for
+	// the children it holds, and with the coordinator when it answers.
+	// Without an answer the delete is deferred.
+	if settlesDelete(rec) {
+		if child, ok := s.heldChildOf(ctx, spaceId); ok {
+			return fmt.Errorf("spaceimpl: Delete: space %q has the child space %q: %w", spaceId, child, space.ErrSpaceHasChildren)
+		}
+		switch err := s.askDelete(ctx, spaceId); {
+		case errors.Is(err, coordinatorproto.ErrSpaceHasChildren):
+			return fmt.Errorf("spaceimpl: Delete: space %q: %w", spaceId, space.ErrSpaceHasChildren)
+		case err == nil:
+			// The network delete is under way: the local half follows
+			// whatever becomes of the caller's context.
+			ctx = context.WithoutCancel(ctx)
+		}
+	}
 	if _, err := s.tsp.SetRemoteStatus(ctx, spaceId, techspace.StatusDeleted); err != nil {
 		return fmt.Errorf("spaceimpl: mark deleted: %w", err)
 	}
 	s.OffloadSpace(ctx, spaceId)
 	s.kickDeletionReconciler()
 	return nil
+}
+
+// settlesDelete reports a row whose delete is settled with the
+// coordinator before it is written: an organization that the account
+// owns, or may own while the ACL mirror has not written its role. A
+// row whose header was never read (no type) says neither that the
+// space is an organization nor, without a mirrored role, whose it is.
+// It could be a child of an organization the account owns, which a
+// signed delete would delete for all its members, so such a row is
+// only removed from the account.
+func settlesDelete(rec techspace.SpaceIndexRecord) bool {
+	if notAParent(rec) != "" {
+		return false
+	}
+	if rec.OwnRole == space.PermissionOwner {
+		return true
+	}
+	return rec.Type != "" && rec.OwnRole == space.PermissionNone
+}
+
+// deleteSettleTimeout bounds how long Delete waits for the coordinator
+// before it defers the network delete to the reconciler.
+const deleteSettleTimeout = 5 * time.Second
+
+// askDelete sends the signed delete of spaceId to the coordinator on
+// the call path. An error other than the coordinator's refusal for
+// children leaves the delete to the reconciler: the coordinator is out
+// of reach, does not know the space yet, or knows another owner.
+func (s *Service) askDelete(ctx context.Context, spaceId string) error {
+	ctx, cancel := context.WithTimeout(ctx, deleteSettleTimeout)
+	defer cancel()
+	return s.app.SpaceDelete(ctx, spaceId)
+}
+
+// heldChildOf returns a child of parentSpaceId the index holds as a
+// live row.
+func (s *Service) heldChildOf(ctx context.Context, parentSpaceId string) (string, bool) {
+	rows, err := s.tsp.List(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, r := range rows {
+		if r.ParentSpaceId == parentSpaceId && !r.IsDeleted() {
+			return r.Id, true
+		}
+	}
+	return "", false
 }
 
 // Subscribe delivers live space-list deltas. It registers a sub on the

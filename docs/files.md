@@ -150,12 +150,17 @@ doubling to 10 min.
 ## Open
 
 `Open(ctx, fileId, variant)` returns a seekable reader over verified
-plaintext. Content resolves through a source ladder:
+plaintext. `Seek` reads nothing: a position whose bytes cannot be had
+fails the `Read` there. Content resolves through a source ladder:
 
 1. Local store.
-2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`).
-   Peers serve ciphertext and every block is CID-verified, so a peer
-   can neither read nor corrupt content.
+2. A peer holding the CAR, when p2p is enabled (`internal/files/filep2p`):
+   a LAN peer, then a connected global peer. For a file with no public
+   object to read (not durable, or no public read base), global peers
+   that are not connected are dialed too ([global-p2p](global-p2p.md)
+   § Budget). Peers serve ciphertext and
+   every block is CID-verified, so a peer can neither read nor corrupt
+   content.
 3. Public HTTP GET with Range on `{publicReadBaseUrl}/blob/{spaceId}/{rootCid}`,
    for durable files only. The base URL is resolved once from the
    network's fileV2 nodes and cached; `config.Files.PublicReadBaseUrl`
@@ -164,7 +169,16 @@ plaintext. Content resolves through a source ladder:
 Every fetched block is verified and persisted into a sparse local CAR,
 so streaming, seeking and interrupted reads accrete toward a complete
 copy. A file that is neither local, durable, nor held by a reachable
-peer fails with `ErrFileNotAvailable`.
+peer fails with `ErrFileNotAvailable`, as does a read whose only source
+is a peer that stops answering.
+
+A peer that fails a dial or an availability check is skipped for 5 s,
+doubling per consecutive failure up to a minute, and asked again after
+that; any answer clears it. A peer that answers with a refusal, because
+it does not list this device with the space yet, is not skipped at all.
+A peer that serves invalid content is skipped for 5 minutes. The error
+says when peers that may hold the file are only waiting out that
+backoff.
 
 ## Status
 
@@ -175,6 +189,13 @@ peer fails with `ErrFileNotAvailable`.
 | `durable` | receipt recorded, or inline |
 | `inflight` | registered; backup queued, running, or driven by another device |
 | `limited` | the network refused backup for storage limit |
+
+A device that completes its local copy of a file that is not durable, by
+reading it to the end or by a pin, and that may write to the space queues
+the backup itself 45–90 s later. The file then survives a creator that
+never uploads it; the job does nothing if the row gained `networkSign`
+in the meantime. Tech-space files are taken over by a pin only: there a
+queued backup marks the device that set an avatar.
 
 `FileStatus` also reports `Cached` (complete local copy), `Attempts` and
 `LastErr`. `SubscribeStatus` delivers local transitions only (attach,

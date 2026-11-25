@@ -32,7 +32,9 @@ key-value store, plus the account record for the account's own devices
   `P2PAdvertise` switch is on (default on). Readers cannot write rows and
   stay dial-only; local-only and guest-mode spaces take no part.
 - **Never blocking.** No sync path waits for a global dial. Global peers are
-  used only while already connected. One background connector is the sole
+  used only while already connected, with one exception: a file fetch
+  whose only possible source is a peer asks the connector to dial and
+  waits for it (see Budget). One background connector is the sole
   dialer and the only ctx that opts in to the iroh scheme
   (`peerservice.CtxWithGlobalDial`). It dials through the peer service and
   hands the connection to the pool as an incoming peer rather than calling
@@ -89,6 +91,18 @@ Device-wide, in `config.P2P.Global` (`config.GlobalP2P`):
   cover need no dial), then the peer covering the most uncovered spaces,
   ties to own devices, then most recently seen. When connected peers cover
   every loaded space, nothing is dialed.
+- Dial on demand: a fetch of a file that only a peer can serve (not
+  durable, or no public read base) and that no connected peer holds has
+  the connector bring up peers of that space outside the cover, one at a
+  time: devices of the file's author first, then own devices, then the
+  rest, most recently seen first. The fetch waits inside its 8 s global
+  selection clock and asks for at most 3 peers, one dial each; a dial
+  still running when the clock ends completes, so a retry finds the peer
+  connected. Such dials may spend half of `MaxDialsPerMinute`, skip a
+  peer whose dial failed in the last 30 s whatever its tier, stop once
+  `MaxConnections` plus half of `MaxInbound` peers are connected, obey
+  the power hint, and their connections close after 5 idle minutes
+  instead of 30.
 - `MaxInbound` (8): headroom above `MaxConnections` for connections the
   other side opened, counted as distinct peers with a live connection.
 - `MaxDialsPerMinute` (6), one dial in flight, `DialTimeout` (6 s), per-peer

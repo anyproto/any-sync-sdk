@@ -238,6 +238,19 @@ type Space interface {
 	// offline device with no local index keeps waiting).
 	WaitIndexSynced(ctx context.Context) error
 
+	// IndexSeeded reports whether the space's index metadata is on this
+	// device: seeded here when Create made the space, or received by
+	// sync on a space this device downloaded. WaitIndexSynced's first
+	// exit as a probe: it reads local storage and runs no sync round.
+	// False on a downloaded space until the index arrives,
+	// on a derived space until an owner's online load seeds it, on a
+	// 1-1 space always, and when the read fails. An owner's device also
+	// seeds a downloaded space whose index one sync round did not bring,
+	// so true does not prove the creator's index is here. The tech space
+	// always answers true; Service.WaitListSynced tells whether the
+	// account itself has synced.
+	IndexSeeded(ctx context.Context) bool
+
 	// SyncHeads forces an immediate head-sync (diff) round on this
 	// space against its responsible nodes, instead of waiting for the
 	// periodic timer. Blocks until the round completes. Use it to

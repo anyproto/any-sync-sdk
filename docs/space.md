@@ -483,6 +483,11 @@ cross-space transactions).
   on a derived space a free-text tag the application chooses.
 - The 1-1 type feeds the symmetric derived 1-1 id, so an any↔anytype 1-1
   is structurally impossible.
+- What an account uses a space for is not a space type. It is
+  `AnySpaceType`, a field on the account's own tech-space row
+  (`tech-space.md` § Space Index): given at `Create` or once by
+  `Spaces().SetAnySpaceType`, synced across the account's devices,
+  absent from the header and from the space.
 - Rows registered before the header is readable (join, track, invite
   pending) carry an empty `type`, filled once from the header on first
   load.

@@ -19,10 +19,11 @@ import (
 	"github.com/anyproto/any-sync-sdk/space"
 )
 
-// Durability-takeover stagger: a downloader waits this long (base +
-// jitter) before uploading a non-durable file, so an online creator or
-// another downloader usually makes it durable first and the delayed job
-// no-ops. The jitter also spreads multiple downloaders apart.
+// Durability-takeover stagger: a device that completed its copy of a
+// non-durable file (a read or a pin) waits this long (base + jitter)
+// before uploading it, so an online creator or another downloader
+// usually makes it durable first and the delayed job no-ops. The jitter
+// also spreads multiple downloaders apart. See scheduleTakeover.
 const (
 	takeoverBaseDelay = 45 * time.Second
 	takeoverJitter    = 45 * time.Second
@@ -81,26 +82,11 @@ func (s *Service) RunFileJob(ctx context.Context, job status.Job) error {
 		if err != nil {
 			return err
 		}
-		if err := s.fetch.Fetch(ctx, job.SpaceId, root, row.NetworkSign != "", job.FileId); err != nil {
+		if err := s.fetch.Fetch(ctx, fetchObject(job.SpaceId, root, row), job.FileId); err != nil {
 			return err
 		}
-		// Durability takeover (SYN-48): we now hold the complete file. If
-		// it is NOT durable — its creator never uploaded it to the file
-		// nodes (e.g. we pulled it from that peer over the LAN and the
-		// peer then went offline) — and we have write rights, take over
-		// so the file survives the creator leaving.
-		//
-		// We are a DOWNLOADER, not the creator (the creator's own durable
-		// job was enqueued immediately at attach). So DELAY, with jitter:
-		// if the creator (or another downloader) is online it uploads
-		// first, our delayed job then no-ops on its NetworkSign re-check,
-		// and we avoid two devices uploading the same file at once. Only
-		// when nobody else made it durable within the window do we upload.
-		if row.NetworkSign == "" && impl.canWrite(ctx) {
-			if s.fqueue != nil {
-				_ = s.fqueue.EnqueueDelayed(ctx, status.KindDurable, job.SpaceId, job.FileId, takeoverDelay())
-			}
-		}
+		// We now hold the complete file: back it up if nobody has.
+		impl.scheduleTakeover(ctx, row)
 		return nil
 	default:
 		return fmt.Errorf("files: unknown job kind %q", job.Kind)

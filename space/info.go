@@ -56,6 +56,12 @@ type SpaceInfo struct {
 	// is free text and independent of the header Type, so Type, not
 	// SpaceType, tells an organization or one of its spaces.
 	SpaceType string
+	// AnySpaceType says what the account uses the space for, e.g. the
+	// space of one app (CreateRequest.AnySpaceType,
+	// Service.SetAnySpaceType). Account-private: it is read from the
+	// account's own row, synced across its devices, and no other member
+	// of the space sees it. Empty when the account gave the space none.
+	AnySpaceType string
 	// Author is the space owner's account identity, resolved from the
 	// ACL. Best-effort: empty when the ACL is not loadable.
 	//

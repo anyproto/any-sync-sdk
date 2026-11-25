@@ -32,6 +32,7 @@ type SetMetadataRequest struct {
 sp.SetMetadata(ctx, SetMetadataRequest) error
 sp.SpaceIndexObjectId() string
 sp.WaitIndexSynced(ctx) error
+sp.IndexSeeded(ctx) bool
 ```
 
 - `SetMetadata` writes the non-nil fields in one multi-field `$set`. A nil
@@ -47,6 +48,8 @@ sp.WaitIndexSynced(ctx) error
   finishes with the sync-status rollup at `Synced`. The second exit covers
   spaces that never seed metadata (one-to-one and nameless derived
   spaces); an absent object after convergence is a valid answer.
+- `IndexSeeded` is the first exit as a probe: it reports whether the
+  metadata row is in this device's storage and runs no sync round.
 
 ## Seeding
 

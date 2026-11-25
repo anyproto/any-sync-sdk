@@ -235,6 +235,10 @@ func (t *techSpace) SpaceIndexObjectId() string { return t.inner.techIndexId }
 // WaitIndexSynced: the tech index object is the space list itself.
 func (t *techSpace) WaitIndexSynced(ctx context.Context) error { return t.parent.WaitListSynced(ctx) }
 
+// IndexSeeded: Open derives the tech index object, so it is always
+// here. Whether the account has synced is WaitListSynced's answer.
+func (t *techSpace) IndexSeeded(context.Context) bool { return true }
+
 func (t *techSpace) SyncHeads(ctx context.Context) error { return t.inner.SyncHeads(ctx) }
 func (t *techSpace) TreeHeads(ctx context.Context) ([]space.TreeHeads, error) {
 	return t.inner.TreeHeads(ctx)

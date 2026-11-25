@@ -34,6 +34,11 @@ type SpaceIndexRecord struct {
 	// with the converged in-space value.
 	SpaceType string
 
+	// AnySpaceType says what the account uses the space for
+	// (FieldAnySpaceType, synced, account-private). Empty on a space
+	// the account gave no such use.
+	AnySpaceType string
+
 	Name        string
 	IconCID     string
 	Description string
@@ -145,6 +150,7 @@ func DecodeSpaceIndexRecord(v *anyenc.Value) SpaceIndexRecord {
 		Id:                  v.GetString("id"),
 		Type:                v.GetString(FieldType),
 		SpaceType:           v.GetString(FieldSpaceType),
+		AnySpaceType:        v.GetString(FieldAnySpaceType),
 		Name:                v.GetString(FieldName),
 		Description:         v.GetString(FieldDescription),
 		IconCID:             v.GetString(FieldIcon),
@@ -222,6 +228,9 @@ func (r SpaceIndexRecord) EncodeCreate(a *anyenc.Arena) *anyenc.Value {
 	}
 	if r.SpaceType != "" {
 		obj.Set(FieldSpaceType, a.NewString(r.SpaceType))
+	}
+	if r.AnySpaceType != "" {
+		obj.Set(FieldAnySpaceType, a.NewString(r.AnySpaceType))
 	}
 	if r.Name != "" {
 		obj.Set(FieldName, a.NewString(r.Name))

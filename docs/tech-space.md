@@ -62,7 +62,8 @@ Supported:
   leaves its losers claimed (`bundles.md` § Known edges).
 - `Info()` (synthetic: owner-only, derived, `any.techspace`),
   `SyncStatus`, `Debug`, `SyncHeads`, `TreeHeads`, `WaitIndexSynced`
-  (same as `WaitListSynced`).
+  (same as `WaitListSynced`), `IndexSeeded` (always true: `Open` derives
+  the tech index object).
 
 Everything else returns `space.ErrUnsupported`: `Objects().Create` /
 `Derive`, `Types().Create` / `Delete`, `Collections().Create` /
@@ -93,6 +94,7 @@ shape (tombstone, offload markers, ended join) surfaces as `Removed`.
 | `type` | synced | On-wire header type: `any.space`, `any.organization`, `any.organization.space`, `any.onetoone`, or an `anytype.*` type on a joined or tracked row. Set once; empty until the header is readable (join/track rows), then filled from the loaded header |
 | `name`, `description`, `icon` | synced | Display metadata, mirrored from the space's `spaceIndex` object |
 | `spaceType` | synced | App-level tag mirrored from `spaceIndex.spaceType`; not pinned |
+| `anySpaceType` | synced | What the account uses the space for, below |
 | `localStatus` | local | Per-device lifecycle, below |
 | `remoteStatus` | synced | Account-wide lifecycle, below |
 | `aclHeadId` | local | Join-request head credential, below |
@@ -123,6 +125,21 @@ request-to-join pair `joining` / `joinEnded`
 device classifies a row the same way: none materializes a space the
 account is not a member of, and a verdict observed on one device
 converges the others.
+
+**`anySpaceType`** — what the account uses the space for, such as the
+space of one app (`SpaceInfo.AnySpaceType`). It is on the row only: the
+space carries nothing, so no other member sees it, and every device of
+the account reads it with the space list, before the space loads.
+`Create` writes it with the row (`CreateRequest.AnySpaceType`);
+`Spaces().SetAnySpaceType` writes it on a row that has none and refuses
+another value (`ErrAnySpaceTypeSet`) and a deleted row. The refusal
+reads this device's row and the handler pins nothing, so a writer that
+does not see another's value succeeds and the later change in the tree
+stands. A schema that does not declare the field drops it on apply and
+keeps the rest of the row: a device that applied the change under an
+SDK without the field holds a row without it, also after it upgrades,
+until its tech index is next rebuilt from its changes
+(`versioning.md`).
 
 **`aclHeadId`** — an ACL head at or after the account's current join
 request. The any-sync ACL waiter reports a decline only when the request

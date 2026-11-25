@@ -384,6 +384,13 @@ root whose tree or row hasn't arrived; retry after sync),
   condition covers 1-1 and nameless derived spaces that never seed
   metadata: an absent index after convergence reads as "nothing set up".
   It covers projection, not just heads.
+- **`Space.IndexSeeded`** — the first condition as a probe: a read of
+  local storage that runs no sync round. True on a space this device
+  created with `Create`, and on a downloaded space once its index has
+  arrived or an owner's device has seeded it (§ Known edges). A caller
+  that must not act on a registry it has not received refuses on false
+  instead of waiting. The tech space always answers true: its gate is
+  `WaitListSynced`.
 
 ## Restore flow
 
@@ -419,6 +426,12 @@ avoid demoting an unseen created install (§ Derived roots).
 - A never-seeded index blocks `WaitIndexSynced` only while offline: a
   converged round returns and the caller reads an empty registry. There
   is no forced re-setup.
+- An owner's device seeds the index of a space whose creator never
+  did, after one head-sync round that brought no index. On a space
+  another device created, that round can end without the creator's
+  index: the index tree has not reached the node, or its fetch failed
+  while the round returned nil. `IndexSeeded` then reads true before
+  the creator's registry is here.
 - `Losers` counts a root whose deletion status is unknown (tree not
   local) as live. `ResolveLoser` re-validates and deletion is idempotent,
   so over-reporting is safe.

@@ -123,7 +123,7 @@ func TestSDK_QuerySubscribe_RoutingAndIsolation(t *testing.T) {
 
 	// Wrong-dataset subscription on right object — must stay silent
 	// when we write to `objects` only.
-	wrongDsRes, err := sp.Query(objectId, "no-such-dataset").Subscribe(ctx, space.QueryOpts{})
+	wrongDsRes, err := sp.Query(objectId, "properties").Subscribe(ctx, space.QueryOpts{})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = wrongDsRes.Sub.Close() })
 

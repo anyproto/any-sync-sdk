@@ -640,6 +640,8 @@ Terminals:
 
 `Filter` accepts whatever `query.ParseCondition` accepts: a built `query.Filter`, a JSON string, or a map with Mongo-style operators. `Sort` accepts `query.ParseSort` input: `"name"`, `"-_ver.id"` for descending, or a built `query.Sort`. Parse errors surface on the first terminal call. `Aggregate`, `AggregateObjects` and `AggregateDataset` run aggregation pipelines over the same collections, snapshot only.
 
+A terminal of `Query(objectId, dataset)` or `Aggregate(objectId, dataset, pipeline)` fails with `ErrDatasetUnknown` when the space has no dataset of that name, as a write does. A dataset the space has reads as empty on an object that holds no records of it.
+
 ### 11.1 Projections
 
 Records come back verbatim, with `_ver` and `_traces`, in the shape the SDK stores. Values of every scope sit at their normal paths.

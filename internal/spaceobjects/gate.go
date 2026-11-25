@@ -426,7 +426,7 @@ func (s *Store) Drain(ctx context.Context) error {
 		// yet — skip before paying the payload decode. Retried when a
 		// later defs apply refreshes the catalog. Rows from older SDKs
 		// carry no dataset and take the decode path as before.
-		if row.Dataset != "" && !s.datasetRegistered(row.Dataset) {
+		if row.Dataset != "" && !s.DatasetRegistered(row.Dataset) {
 			return true
 		}
 		ready = append(ready, row)

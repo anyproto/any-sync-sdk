@@ -510,6 +510,9 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 			return nil, err
 		}
 	} else {
+		if err = checkDataset(q.store, q.objectId, q.dataset); err != nil {
+			return nil, err
+		}
 		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
 		// A missing object is an empty initial. The engine still
 		// registers the sub; if the object lands later, its events flow
@@ -765,13 +768,10 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 }
 
 // collection resolves the dataset's any-store collection. Returns
-// (nil, nil) when the dataset has no rows materialised yet — callers
-// treat that as an empty result rather than an error, so the first
-// query on a fresh object surfaces an empty list / zero count instead
-// of a 500. The (nil, nil) signal also fires for unknown datasets;
-// distinguishing the two cases would require a Controller-level
-// accessor and isn't worth it — querying a typo dataset name already
-// silently returns empty in any-store too.
+// (nil, nil) when the dataset has no rows materialised on the object —
+// callers treat that as an empty result rather than an error, so the
+// first query on a fresh object surfaces an empty list / zero count. A
+// dataset the space does not have is space.ErrDatasetUnknown.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if q.allObjects {
 		return resolveDatasetCollection(ctx, q.store, q.dataset)
@@ -794,6 +794,9 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 		coll, err = store.SharedObjects(ctx)
 		return coll, nil, err
 	}
+	if err := checkDataset(store, objectId, dataset); err != nil {
+		return nil, nil, err
+	}
 	// A resident controller built before a runtime dataset was defined
 	// doesn't know its collection; reload it so a just-defined dataset
 	// reads back real rows instead of silently empty results.
@@ -805,6 +808,20 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	// The controller that supplies the collection says how the object's
 	// rows are scoped in it (objectRows).
 	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
+}
+
+// checkDataset refuses a per-object read of a dataset the space has no
+// registration for, the name the write path refuses too, before the
+// object is loaded. A resident controller that still serves a dataset
+// whose definition left the catalog keeps reading it.
+func checkDataset(store *spaceobjects.Store, objectId, dataset string) error {
+	if store.DatasetRegistered(dataset) {
+		return nil
+	}
+	if obj := store.PeekLoaded(objectId); obj != nil && obj.Controller() != nil && obj.Controller().HasDataset(dataset) {
+		return nil
+	}
+	return fmt.Errorf("query: %w: %q", space.ErrDatasetUnknown, dataset)
 }
 
 // emptyIterator is the Iter() result when the dataset has no

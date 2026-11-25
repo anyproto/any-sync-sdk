@@ -72,6 +72,15 @@ var ErrModuleReserved = errors.New("space: module is reserved for the consumer's
 // 4xx.
 var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of the object's types")
 
+// ErrDatasetUnknown is returned by a per-object read (the Query and
+// Aggregate terminals, Subscribe) and by the write surface when the
+// space has no dataset of that name: none built in, none registered
+// and none a type of the space declares. A dataset the space has reads
+// as empty on an object that holds no records of it. After a
+// definition is removed its name is unknown, except to a read through
+// an object still loaded from before. A client error → 4xx.
+var ErrDatasetUnknown = errors.New("space: unknown dataset")
+
 // ErrRecordIdOfAnotherObject is returned by a write to a shared
 // dataset whose record id does not belong to the target object: it
 // carries another object's prefix, or contains "/" without being one of

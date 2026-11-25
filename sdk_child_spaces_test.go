@@ -1405,8 +1405,9 @@ func TestSDK_ChildSpace_RotationCompletedByTheWatcher(t *testing.T) {
 	apply(removal)
 
 	// No network: the change is not published and the rotation stays
-	// pending.
-	require.Eventually(t, func() bool { return unreached.Load() == 1 },
+	// pending. A pass under way when the removal is applied tries as
+	// well as the pass the removal starts: the tries are not counted.
+	require.Eventually(t, func() bool { return unreached.Load() > 0 },
 		20*time.Second, 10*time.Millisecond, "the watcher tries at once")
 	pending, err = child.ACL().RotationPending(ctx)
 	require.NoError(t, err)

@@ -5,7 +5,7 @@ go 1.26.2
 require (
 	github.com/anyproto/any-store v1.0.3
 	github.com/anyproto/any-store/v2 v2.5.0
-	github.com/anyproto/any-sync v0.13.9-0.20261124143616-74c5dbf419cd
+	github.com/anyproto/any-sync v0.13.9-0.20261124180638-7d4b49b1ce33
 	github.com/anyproto/anytype-push-server/pushclient v0.0.0-20261014142855-af71aa8b1662
 	github.com/anyproto/go-slip10 v1.0.1
 	github.com/anyproto/go-sqlite v1.4.2-any

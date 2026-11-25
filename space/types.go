@@ -72,6 +72,16 @@ var ErrModuleReserved = errors.New("space: module is reserved for the consumer's
 // 4xx.
 var ErrDatasetNotDeclared = errors.New("space: dataset is declared by none of the object's types")
 
+// ErrDatasetUnknown is returned by Modify, ModifyMany and Delete, and
+// by a read (the Query and Aggregate terminals, Subscribe) on an object
+// the device holds, when the space has no registration for the dataset:
+// it is not built in, not registered by the consumer, and no valid
+// definition of it is applied on this device — one still syncing, or
+// one removed. A dataset the space has reads as empty on an object
+// that holds no records of it. An object still loaded keeps reading a
+// dataset whose definition was removed. A client error → 4xx.
+var ErrDatasetUnknown = errors.New("space: unknown dataset")
+
 // ErrRecordIdOfAnotherObject is returned by a write to a shared
 // dataset whose record id does not belong to the target object: it
 // carries another object's prefix, or contains "/" without being one of

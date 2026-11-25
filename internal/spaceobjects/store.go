@@ -65,9 +65,9 @@ import (
 
 var storeLog = logger.NewNamed("sdk.spaceobjects")
 
-// ErrUnknownDataset is returned by DataVersion when the caller asks
-// for a dataset the store doesn't know how to version.
-var ErrUnknownDataset = errors.New("spaceobjects: unknown dataset")
+// ErrUnknownDataset is returned for a dataset the store has no
+// registration for (DatasetRegistered).
+var ErrUnknownDataset = space.ErrDatasetUnknown
 
 // builtinDataVersions is the dataset → DataVersion stamp for the
 // SDK's built-in handlers (always registered on every controller).
@@ -1790,9 +1790,9 @@ func (s *Store) EnsureDatasetRegistered(ctx context.Context, objectId, dataset s
 	s.Drop(objectId)
 }
 
-// datasetRegistered reports whether the dataset is currently known to
+// DatasetRegistered reports whether the dataset is currently known to
 // any registration source (static catalog or runtime snapshot).
-func (s *Store) datasetRegistered(dataset string) bool {
+func (s *Store) DatasetRegistered(dataset string) bool {
 	if _, static := s.dataVersions[dataset]; static {
 		return true
 	}

@@ -102,7 +102,10 @@ type Space interface {
 	// per-object datasets that exist on the object's own controller —
 	// e.g. a type object's `properties` (definitions) dataset. On a
 	// shared dataset it reads that object's records, each with the id
-	// `<objectId>/<recordId>` and the object in `_objectId`.
+	// `<objectId>/<recordId>` and the object in `_objectId`. On an
+	// object the device holds, a dataset the space does not have fails
+	// the terminal call with ErrDatasetUnknown; one it has reads as
+	// empty on an object with no records of it.
 	Query(objectId, dataset string) Query
 
 	// QueryDataset builds a read query over a shared dataset
@@ -127,7 +130,8 @@ type Space interface {
 	// marshaled-anyenc []byte, or a Go value converted like a record
 	// value (see Op.Value). A Go map has no key order, so a stage whose
 	// key order matters ($sort over several keys) is given as JSON
-	// text or *fastjson.Value. Snapshot-only. See Agg.
+	// text or *fastjson.Value. Snapshot-only; an unknown dataset fails
+	// as on Query. See Agg.
 	Aggregate(objectId, dataset string, pipeline any) Agg
 
 	// AggregateDataset builds an aggregation pipeline over a shared

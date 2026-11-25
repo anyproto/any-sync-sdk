@@ -152,10 +152,10 @@ func TestSDK_Aggregate(t *testing.T) {
 	assert.Equal(t, 2, rows[1].GetInt("n"))
 
 	// Non-materialised dataset → empty result, zero count, no error.
-	empty, err := sp.Aggregate(objId, "no-such-dataset", nil).All(ctx)
+	empty, err := sp.Aggregate(objId, "properties", nil).All(ctx)
 	require.NoError(t, err)
 	assert.Empty(t, empty)
-	n, err = sp.Aggregate(objId, "no-such-dataset", nil).Count(ctx)
+	n, err = sp.Aggregate(objId, "properties", nil).Count(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 0, n)
 }

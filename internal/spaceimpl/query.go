@@ -511,14 +511,18 @@ func (q *queryImpl) Subscribe(ctx context.Context, opts space.QueryOpts) (*space
 		}
 	} else {
 		q.store.EnsureDatasetRegistered(ctx, q.objectId, q.dataset)
-		// A missing object is an empty initial. The engine still
-		// registers the sub; if the object lands later, its events flow
-		// in — same as a not-yet-materialised dataset.
+		// A missing object is an empty initial, whatever the dataset:
+		// no controller says which datasets it carries. The engine
+		// still registers the sub; if the object lands later, its
+		// events flow in — same as a not-yet-materialised dataset.
 		obj, err = q.store.Get(ctx, q.objectId)
 		if err != nil && !errors.Is(err, treestorage.ErrUnknownTreeId) {
 			return nil, fmt.Errorf("query: %w", err)
 		}
 		if obj != nil {
+			if err = checkDataset(q.store, obj.Controller(), q.dataset); err != nil {
+				return nil, err
+			}
 			// Warm the controller's handle outside the fence: the first
 			// open of a dataset collection ensures its indexes in a
 			// write tx. Under the fence the lookup is then a map hit; a
@@ -765,13 +769,11 @@ func (q *queryImpl) Iter(ctx context.Context) (space.Iterator, error) {
 }
 
 // collection resolves the dataset's any-store collection. Returns
-// (nil, nil) when the dataset has no rows materialised yet — callers
-// treat that as an empty result rather than an error, so the first
-// query on a fresh object surfaces an empty list / zero count instead
-// of a 500. The (nil, nil) signal also fires for unknown datasets;
-// distinguishing the two cases would require a Controller-level
-// accessor and isn't worth it — querying a typo dataset name already
-// silently returns empty in any-store too.
+// (nil, nil) when the dataset has no rows materialised on the object —
+// callers treat that as an empty result rather than an error, so the
+// first query on a fresh object surfaces an empty list / zero count. A
+// dataset the object's controller and the space do not have is
+// space.ErrDatasetUnknown.
 func (q *queryImpl) collection(ctx context.Context) (anystore.Collection, error) {
 	if q.allObjects {
 		return resolveDatasetCollection(ctx, q.store, q.dataset)
@@ -802,9 +804,23 @@ func resolveCollection(ctx context.Context, store *spaceobjects.Store, objectId,
 	if err != nil {
 		return nil, nil, fmt.Errorf("query: %w", err)
 	}
+	ctrl = obj.Controller()
+	if err := checkDataset(store, ctrl, dataset); err != nil {
+		return nil, nil, err
+	}
 	// The controller that supplies the collection says how the object's
 	// rows are scoped in it (objectRows).
-	return obj.Controller().Collection(ctx, dataset), obj.Controller(), nil
+	return ctrl.Collection(ctx, dataset), ctrl, nil
+}
+
+// checkDataset refuses a read through ctrl of a dataset neither it nor
+// the space has: the name the write path refuses too. A controller
+// built before a definition left the catalog keeps reading it.
+func checkDataset(store *spaceobjects.Store, ctrl *crdt.Controller, dataset string) error {
+	if ctrl.HasDataset(dataset) || store.DatasetRegistered(dataset) {
+		return nil
+	}
+	return fmt.Errorf("query: %w: %q", space.ErrDatasetUnknown, dataset)
 }
 
 // emptyIterator is the Iter() result when the dataset has no

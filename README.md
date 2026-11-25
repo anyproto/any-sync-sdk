@@ -147,6 +147,7 @@ See [`docs/`](docs/):
 - `one-to-one-spaces.md`: derived 1-1 spaces and inbox discovery
 - `identities.md`: account-global identity directory
 - `direct-add-invites.md`: adding accounts to a space by identity
+- `nested-spaces.md`: parent and child spaces, the legalOwner (V1 design)
 - `user-datasets.md`: parts, modules, runtime dataset schemas, batch upsert
 - `global-p2p.md`: internet-wide device-to-device sync
 - `account-discovery.md`: finding the account's own devices

@@ -159,6 +159,10 @@ var ErrIsDerivedSpace = errors.New("derived spaces cannot be deleted")
 // errors.Is to turn it into a caller-facing 4xx.
 var ErrBadSpaceType = errors.New("unsupported space type")
 
+// ErrAnySpaceTypeSet is returned by SetAnySpaceType when this device's
+// row of the space already carries a different AnySpaceType.
+var ErrAnySpaceTypeSet = errors.New("any space type is already set")
+
 // Settings-patch sentinels — wrapped by SetSettings validation errors
 // so callers can classify with errors.Is.
 var (
@@ -373,6 +377,16 @@ type Service interface {
 	// where the subtree appears under the row's `settings` field.
 	SetSettings(ctx context.Context, spaceId string, set map[string]any, unset []string) error
 
+	// SetAnySpaceType gives a space the account already has its
+	// AnySpaceType (see CreateRequest.AnySpaceType), on the account's
+	// own row. A no-op when the row carries the same value,
+	// ErrAnySpaceTypeSet when it carries another one. The check reads
+	// this device's row and takes no lock: a writer that does not see
+	// another's value succeeds, and the later change in the tree stands.
+	// ErrSpaceUnknown when the account has no row for spaceId,
+	// ErrSpaceDeleted when List reports the row as deleted.
+	SetAnySpaceType(ctx context.Context, spaceId, anySpaceType string) error
+
 	// SetDevice upserts THIS device's row in the account's devices
 	// registry — a system dataset in the tech space, one row per device,
 	// synced account-wide (SYN-165). The row id is always the local peer
@@ -470,6 +484,12 @@ type CreateRequest struct {
 	// error; passing an invalid type would otherwise produce a space
 	// the coordinator refuses to sync.
 	SpaceType string
+	// AnySpaceType says what the account uses the space for, e.g. the
+	// space of one app. Written on the account's own row of the space
+	// (SpaceInfo.AnySpaceType), never into the space: its other members
+	// do not see it. Stored verbatim; empty leaves the space without
+	// one.
+	AnySpaceType string
 }
 
 // JoinRequest is the input to Service.Join.

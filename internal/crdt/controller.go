@@ -208,6 +208,9 @@ type Controller struct {
 	// opens by name per call, so it can never retain a handle that a
 	// successor controller's eviction later closes under it.
 	collsReleased atomic.Bool
+	// lazyOpens counts the per-object handles the lazy open paths have
+	// cached; applyRecordChange compares it around a record's call.
+	lazyOpens atomic.Uint64
 	// shared maps a dataset to a "shared" (typically per-space)
 	// collection that supersedes the per-object collection. Writes to
 	// such a dataset use the change's ObjectId as the row id (not
@@ -573,6 +576,7 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 		coll = existing
 	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
+		c.lazyOpens.Add(1)
 	}
 	c.collMu.Unlock()
 	return coll, nil
@@ -621,9 +625,29 @@ func (c *Controller) openForRead(ctx context.Context, dataset string) (anystore.
 		coll = existing
 	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
+		c.lazyOpens.Add(1)
 	}
 	c.collMu.Unlock()
 	return coll, nil
+}
+
+// reconcileOwned reconciles the indexes of every cached per-object
+// handle again.
+func (c *Controller) reconcileOwned(ctx context.Context) error {
+	c.collMu.Lock()
+	owned := make(map[string]anystore.Collection, len(c.collections))
+	for dataset, coll := range c.collections {
+		if _, ok := c.shared[dataset]; !ok {
+			owned[dataset] = coll
+		}
+	}
+	c.collMu.Unlock()
+	for dataset, coll := range owned {
+		if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
+			return fmt.Errorf("crdt: indexes for %q: %w", dataset, err)
+		}
+	}
+	return nil
 }
 
 // CloseOwnedCollections closes and forgets every cached PER-OBJECT
@@ -1461,6 +1485,7 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 	}()
 
 	var err error
+	opens := c.lazyOpens.Load()
 	if hasDelete(rc.Ops) || rc.Upsert {
 		_, err = coll.UpsertId(ctx, id, mod)
 	} else {
@@ -1475,10 +1500,19 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 			return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
 		}
 	}
-	// A dropped record wrote nothing; its rejection is in mod. A failed
-	// rollback joined to the drop fails the apply.
-	if err != nil && !droppedOnly(err) {
-		return nil, nil, false, err
+	if err != nil {
+		// A dropped record wrote nothing; its rejection is in mod. A
+		// failed rollback joined to the drop fails the apply.
+		if !droppedOnly(err) {
+			return nil, nil, false, err
+		}
+		// The drop rolled back the call's savepoint, and with it the
+		// indexes of a dataset a hook opened first: reconcile again.
+		if c.lazyOpens.Load() != opens {
+			if err := c.reconcileOwned(ctx); err != nil {
+				return nil, nil, false, err
+			}
+		}
 	}
 
 	rejections := mod.takeRejections()

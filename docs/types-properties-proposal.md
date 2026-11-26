@@ -174,6 +174,12 @@ bypassing the gate, with `orderId` as the VersionId; a Controller with a
 stale registration is evicted and reloaded first. An applied row is
 deleted; a failing row stays for the next pass.
 
+The ready rows of one object are applied in `orderId` order, the order of
+its tree, because a handler's verdict can depend on it: a strict update
+lands nothing on a record whose create has not applied, and
+`DeleteBy: author` rejects the delete of a record never created. A row is
+not held back for an earlier one that stays parked.
+
 A row whose schema never arrives stays parked. It is never applied, so it
 does no damage; there is no GC.
 

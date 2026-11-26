@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 
 	"github.com/anyproto/any-store/v2/anyenc"
 	"go.uber.org/zap"
@@ -412,6 +413,11 @@ func (s *Store) postValueFor(ctx context.Context, obj *object.Object, ch *crdt.C
 // two callers can't both collect a row before either unparks it and
 // double-replay it (a replayed change re-tracks as unread if the user
 // read it between the deliveries).
+//
+// The ready changes of one object replay in the order of its tree. A
+// handler's verdict can depend on that order: a strict update lands
+// nothing on a record whose create has not applied, and an
+// author-gated delete of a record never created is rejected.
 func (s *Store) Drain(ctx context.Context) error {
 	s.drainMu.Lock()
 	defer s.drainMu.Unlock()
@@ -434,6 +440,14 @@ func (s *Store) Drain(ctx context.Context) error {
 	}); err != nil {
 		return err
 	}
+	// The collection iterates in change-id order, which is unrelated to
+	// the tree; the order id is the change's place in it.
+	sort.SliceStable(ready, func(i, j int) bool {
+		if ready[i].ObjectId != ready[j].ObjectId {
+			return ready[i].ObjectId < ready[j].ObjectId
+		}
+		return ready[i].OrderId < ready[j].OrderId
+	})
 	for _, row := range ready {
 		if err := s.replayParked(ctx, row); err != nil {
 			if treeDeleted(err) || errors.Is(err, crdt.ErrInvalidChange) {

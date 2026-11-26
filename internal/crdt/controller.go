@@ -208,6 +208,9 @@ type Controller struct {
 	// opens by name per call, so it can never retain a handle that a
 	// successor controller's eviction later closes under it.
 	collsReleased atomic.Bool
+	// lazyOpens counts the per-object handles the lazy open paths have
+	// cached; applyRecordChange compares it around a record's call.
+	lazyOpens atomic.Uint64
 	// shared maps a dataset to a "shared" (typically per-space)
 	// collection that supersedes the per-object collection. Writes to
 	// such a dataset use the change's ObjectId as the row id (not
@@ -573,6 +576,7 @@ func (c *Controller) collectionForWrite(ctx context.Context, dataset string) (an
 		coll = existing
 	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
+		c.lazyOpens.Add(1)
 	}
 	c.collMu.Unlock()
 	return coll, nil
@@ -621,9 +625,29 @@ func (c *Controller) openForRead(ctx context.Context, dataset string) (anystore.
 		coll = existing
 	} else if !c.collsReleased.Load() {
 		c.collections[dataset] = coll
+		c.lazyOpens.Add(1)
 	}
 	c.collMu.Unlock()
 	return coll, nil
+}
+
+// reconcileOwned reconciles the indexes of every cached per-object
+// handle again.
+func (c *Controller) reconcileOwned(ctx context.Context) error {
+	c.collMu.Lock()
+	owned := make(map[string]anystore.Collection, len(c.collections))
+	for dataset, coll := range c.collections {
+		if _, ok := c.shared[dataset]; !ok {
+			owned[dataset] = coll
+		}
+	}
+	c.collMu.Unlock()
+	for dataset, coll := range owned {
+		if err := c.reconcileIndexes(ctx, dataset, coll); err != nil {
+			return fmt.Errorf("crdt: indexes for %q: %w", dataset, err)
+		}
+	}
+	return nil
 }
 
 // CloseOwnedCollections closes and forgets every cached PER-OBJECT
@@ -1460,22 +1484,34 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 		c.sinkPool.Put(sink)
 	}()
 
+	var err error
+	opens := c.lazyOpens.Load()
 	if hasDelete(rc.Ops) || rc.Upsert {
-		if _, err := coll.UpsertId(ctx, id, mod); err != nil {
+		_, err = coll.UpsertId(ctx, id, mod)
+	} else {
+		_, err = coll.UpdateId(ctx, id, mod)
+		if errors.Is(err, anystore.ErrDocNotFound) {
+			// Strict mode: the record doesn't exist. The change still
+			// commits to the tree (caller already ran AddContent), but
+			// nothing lands in the projection. Surface this as a
+			// per-record rejection so callers can distinguish "wrote
+			// successfully" from "structural id resolved but no
+			// projection happened".
+			return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
+		}
+	}
+	if err != nil {
+		// A dropped record wrote nothing; its rejection is in mod. A
+		// failed rollback joined to the drop fails the apply.
+		if !droppedOnly(err) {
 			return nil, nil, false, err
 		}
-	} else {
-		if _, err := coll.UpdateId(ctx, id, mod); err != nil {
-			if errors.Is(err, anystore.ErrDocNotFound) {
-				// Strict mode: the record doesn't exist. The change still
-				// commits to the tree (caller already ran AddContent), but
-				// nothing lands in the projection. Surface this as a
-				// per-record rejection so callers can distinguish "wrote
-				// successfully" from "structural id resolved but no
-				// projection happened".
-				return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
+		// The drop rolled back the call's savepoint, and with it the
+		// indexes of a dataset a hook opened first: reconcile again.
+		if c.lazyOpens.Load() != opens {
+			if err := c.reconcileOwned(ctx); err != nil {
+				return nil, nil, false, err
 			}
-			return nil, nil, false, err
 		}
 	}
 
@@ -1669,6 +1705,32 @@ func isTombstone(r *anyenc.Value) bool {
 	return r.Get(DeletedAtField) != nil
 }
 
+// errRecordDropped is what Modify returns for a record the handler
+// rejects. UpsertId of a new id inserts {id} when the modifier reports
+// no change; an error writes nothing, and inside a transaction rolls
+// back only that call.
+var errRecordDropped = errors.New("crdt: record dropped")
+
+// droppedOnly reports whether err is errRecordDropped and nothing else.
+// any-store joins the callback's error with its rollback's.
+func droppedOnly(err error) bool {
+	for err != errRecordDropped {
+		switch e := err.(type) {
+		case interface{ Unwrap() []error }:
+			errs := e.Unwrap()
+			if len(errs) != 1 {
+				return false
+			}
+			err = errs[0]
+		case interface{ Unwrap() error }:
+			err = e.Unwrap()
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 // recordModifier implements query.Modifier without a closure allocation
 // per UpsertId call. Pulled from a Controller-scoped sync.Pool, populated
 // via set or setSibling, used once, returned to the pool. All fields are
@@ -1860,7 +1922,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 		if err := m.handler.BeforeDelete(ctx, rc, m.sink); err != nil {
 			m.recordedErr = err
 			m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
-			return existing, false, nil // drop record, batch keeps going
+			return nil, false, errRecordDropped // batch keeps going
 		}
 		tomb := newTombstone(a, m.id, *ch, existing)
 		m.stampObject(a, tomb)
@@ -1904,7 +1966,7 @@ func (m *recordModifier) Modify(a *anyenc.Arena, existing *anyenc.Value) (*anyen
 			if err := m.handler.BeforeCreate(ctx, rc, m.sink); err != nil {
 				m.recordedErr = err
 				m.rejections = append(m.rejections, OpRejection{OpIndex: -1, Err: err})
-				return existing, false, nil
+				return nil, false, errRecordDropped
 			}
 		}
 		m.wrote = true

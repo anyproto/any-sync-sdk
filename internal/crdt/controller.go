@@ -1475,8 +1475,9 @@ func (c *Controller) applyRecordChange(ctx context.Context, coll anystore.Collec
 			return []OpRejection{{OpIndex: -1, RecordId: id, Err: ErrStrictSkipAbsent}}, nil, false, nil
 		}
 	}
-	// A dropped record wrote nothing; its rejection is in mod.
-	if err != nil && !errors.Is(err, errRecordDropped) {
+	// A dropped record wrote nothing; its rejection is in mod. A failed
+	// rollback joined to the drop fails the apply.
+	if err != nil && !droppedOnly(err) {
 		return nil, nil, false, err
 	}
 
@@ -1675,6 +1676,26 @@ func isTombstone(r *anyenc.Value) bool {
 // no change; an error writes nothing, and inside a transaction rolls
 // back only that call.
 var errRecordDropped = errors.New("crdt: record dropped")
+
+// droppedOnly reports whether err is errRecordDropped and nothing else.
+// any-store joins the callback's error with its rollback's.
+func droppedOnly(err error) bool {
+	for err != errRecordDropped {
+		switch e := err.(type) {
+		case interface{ Unwrap() []error }:
+			errs := e.Unwrap()
+			if len(errs) != 1 {
+				return false
+			}
+			err = errs[0]
+		case interface{ Unwrap() error }:
+			err = e.Unwrap()
+		default:
+			return false
+		}
+	}
+	return true
+}
 
 // recordModifier implements query.Modifier without a closure allocation
 // per UpsertId call. Pulled from a Controller-scoped sync.Pool, populated

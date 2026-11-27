@@ -1132,9 +1132,8 @@ type AccountAPI interface {
 	// seconds. A call that fails that way may still have reached the
 	// coordinator: the SDK, unless headless, reads the state right
 	// after, and Deletion and SubscribeDeletion report what the
-	// network holds. Requests
-	// and reverts run one at a time; one that waits for its turn
-	// longer than thirty seconds fails the same way.
+	// network holds. Requests and reverts run one at a time; one that
+	// waits for its turn longer than thirty seconds fails the same way.
 	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)
 
 	// RevertDeletion cancels a pending deletion: the account's spaces

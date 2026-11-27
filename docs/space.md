@@ -271,17 +271,17 @@ Other devices offload when the marker arrives. `OneToOne(peer)` or
 
 **Account deletion.** `Account().RequestDeletion` asks the coordinator
 to delete the account. The coordinator moves every space the account
-owns — its tech space, its regular spaces and the 1-1 spaces it
-registered — to pending deletion for the network's deletion period, and
-returns the date it deletes them. Spaces the account only joined are not
+owns, whatever its type — the tech space, derived and regular spaces,
+the 1-1 spaces it registered — to pending deletion for the network's
+deletion period, and returns the date it deletes them. Spaces the account only joined are not
 touched.
 
 - Nothing changes on the device, and local reads and writes keep
   working. While the deletion is pending, sync of those spaces with the
   network is not guaranteed: the coordinator refuses their ACL changes
   (`space.ErrCoordinatorSpaceDeleted`) and the registration of new
-  spaces, and a sync node refuses a pending space it has to load. A space a node already holds in memory keeps
-  syncing.
+  spaces, and a sync node refuses a pending space it has to load. A
+  space a node already holds in memory keeps syncing.
 - `Account().RevertDeletion` returns the spaces to active.
 - Once the period has passed the coordinator deletes the spaces, and the
   reconciler offloads them on every device that holds them, members'

@@ -33,6 +33,7 @@ type fakeDeletion struct {
 	lostReply   bool
 	hang        chan struct{} // non-nil: state blocks on it
 	requestGate chan struct{} // non-nil: request blocks on it
+	revertDelay time.Duration // how long revert takes
 	stateCalls  int
 	revertCalls int
 }
@@ -102,7 +103,17 @@ func (f *fakeDeletion) request(ctx context.Context) (time.Time, bool, error) {
 	return f.deleteAt, false, nil
 }
 
-func (f *fakeDeletion) revert(context.Context) (bool, error) {
+func (f *fakeDeletion) revert(ctx context.Context) (bool, error) {
+	f.mu.Lock()
+	delay := f.revertDelay
+	f.mu.Unlock()
+	if delay > 0 {
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return false, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revertCalls++
@@ -350,14 +361,10 @@ func TestAccountDeletion_Closed(t *testing.T) {
 	acc.startDeletionWatch()
 	cancel := acc.SubscribeDeletion(func(space.AccountDeletion) { t.Error("a closed account delivers nothing") })
 	defer cancel()
-	// A change after the close is kept and reaches no subscriber.
-	_, err := acc.RevertDeletion(context.Background())
-	require.NoError(t, err)
+	// A change after the close reaches no subscriber.
+	acc.keepDeletion(space.AccountDeletion{State: space.AccountActive, FetchedAt: time.Now().UTC()}, 0, true)
 	time.Sleep(30 * time.Millisecond)
 	assert.Zero(t, net.calls(), "a closed account starts no watch")
-	kept := deletionOf(t, acc)
-	require.NotNil(t, kept)
-	assert.Equal(t, space.AccountActive, kept.State)
 }
 
 // A change that lands between a read of the state and the first
@@ -511,31 +518,47 @@ func TestAccountStateOf(t *testing.T) {
 }
 
 // A call that waits for its turn still has its full time for the
-// coordinator once it runs.
+// coordinator once it runs: the wait does not come out of it.
 func TestAccountDeletion_QueuedCallKeepsItsTime(t *testing.T) {
+	const callTimeout = 400 * time.Millisecond
 	net := newFakeDeletion(netAccountActive)
 	gate := make(chan struct{})
 	net.requestGate = gate
+	// The revert takes most of a call's time, after a wait that takes
+	// most of it too: together more than one call's time.
+	net.revertDelay = callTimeout * 3 / 4
 	acc := newDeletionAccount(t, net, newMemKV())
+	acc.deletion.callTimeout = callTimeout
 
-	requested := make(chan error, 1)
+	requested, reverted := make(chan error, 1), make(chan error, 1)
 	go func() {
 		_, err := acc.RequestDeletion(context.Background())
 		requested <- err
 	}()
 	require.Eventually(t, func() bool { return len(acc.deletion.call) == 1 }, time.Second, time.Millisecond)
-
-	// The caller's deadline bounds the wait for the turn, as an
-	// unavailable network.
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	_, err := acc.RevertDeletion(ctx)
-	require.ErrorIs(t, err, space.ErrNetworkUnavailable)
-	net.mu.Lock()
-	revertCalls := net.revertCalls
-	net.mu.Unlock()
-	assert.Zero(t, revertCalls, "a call that never got its turn does not reach the coordinator")
-
+	go func() {
+		_, err := acc.RevertDeletion(context.Background())
+		reverted <- err
+	}()
+	time.Sleep(callTimeout * 3 / 4)
 	close(gate)
 	require.NoError(t, <-requested)
+	require.NoError(t, <-reverted, "the wait for the turn came out of the call's time")
+	kept := deletionOf(t, acc)
+	require.NotNil(t, kept)
+	assert.Equal(t, space.AccountActive, kept.State)
+
+	// The wait for the turn has the same bound of its own, and a call
+	// that never got its turn does not reach the coordinator.
+	acc.deletion.call <- struct{}{}
+	net.mu.Lock()
+	before := net.revertCalls
+	net.mu.Unlock()
+	_, err := acc.RevertDeletion(context.Background())
+	require.ErrorIs(t, err, space.ErrNetworkUnavailable)
+	net.mu.Lock()
+	after := net.revertCalls
+	net.mu.Unlock()
+	assert.Equal(t, before, after)
+	<-acc.deletion.call
 }

@@ -135,6 +135,9 @@ type deletionState struct {
 	src         deletionSource
 	kv          limitsKV
 	poll, retry time.Duration
+	// callTimeout bounds one coordinator call, and the wait for a
+	// request's or a revert's turn.
+	callTimeout time.Duration
 
 	// call holds one RequestDeletion or RevertDeletion at a time, so
 	// their answers are kept in the order the coordinator gave them.
@@ -162,7 +165,7 @@ type deletionState struct {
 func (a *accountImpl) initDeletion(src deletionSource, kv limitsKV) {
 	d := &a.deletion
 	d.src, d.kv = src, kv
-	d.poll, d.retry = deletionPoll, deletionRetry
+	d.poll, d.retry, d.callTimeout = deletionPoll, deletionRetry, deletionCallTimeout
 	d.subs = map[uint64]func(space.AccountDeletion){}
 	d.call = make(chan struct{}, 1)
 	d.kick = make(chan struct{}, 1)
@@ -334,7 +337,7 @@ func (a *accountImpl) readDeletion() bool {
 	d.mu.Lock()
 	gen := d.gen
 	d.mu.Unlock()
-	ctx, cancel := context.WithTimeout(a.closeCtx, deletionCallTimeout)
+	ctx, cancel := context.WithTimeout(a.closeCtx, d.callTimeout)
 	defer cancel()
 	st, deleteAt, err := d.src.state(ctx)
 	if errors.Is(err, errUnknownAccountStatus) {
@@ -356,7 +359,7 @@ func (a *accountImpl) readDeletion() bool {
 // enterDeletionCall waits for the turn of a request or a revert, no
 // longer than one call may take. The call's own time starts after it.
 func (a *accountImpl) enterDeletionCall(ctx context.Context) error {
-	turn, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	turn, cancel := context.WithTimeout(ctx, a.deletion.callTimeout)
 	defer cancel()
 	select {
 	case a.deletion.call <- struct{}{}:
@@ -374,7 +377,7 @@ func (a *accountImpl) RequestDeletion(ctx context.Context) (space.AccountDeletio
 		return space.AccountDeletion{}, err
 	}
 	defer func() { <-d.call }()
-	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, d.callTimeout)
 	defer cancel()
 	deleteAt, refused, err := d.src.request(callCtx)
 	if err != nil {
@@ -398,7 +401,7 @@ func (a *accountImpl) RevertDeletion(ctx context.Context) (space.AccountDeletion
 		return space.AccountDeletion{}, err
 	}
 	defer func() { <-d.call }()
-	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, d.callTimeout)
 	defer cancel()
 	refused, err := d.src.revert(callCtx)
 	if err != nil {

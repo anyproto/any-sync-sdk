@@ -1108,10 +1108,12 @@ type AccountAPI interface {
 	// deleted. It is the network's last answer, kept on the device
 	// (FetchedAt says when), and the call never waits for the network:
 	// the SDK reads the state when it opens, every five minutes, and on
-	// RequestDeletion and RevertDeletion; a headless SDK reads it only
-	// on those two. An account the network has never registered reads
-	// active. Nil while the network has never answered on this device.
-	// The only error is a failed read of the answer kept on the device.
+	// RequestDeletion and RevertDeletion. A headless SDK does not read
+	// the state on its own: there Deletion is what the last request or
+	// revert answered. An account the network has never registered
+	// reads active. Nil while the network has never answered on this
+	// device. The only error is a failed read of the answer kept on
+	// the device.
 	Deletion(ctx context.Context) (*space.AccountDeletion, error)
 
 	// RequestDeletion asks the network to delete the account. Every
@@ -1128,8 +1130,9 @@ type AccountAPI interface {
 	// space.ErrAccountNotOnNetwork, and space.ErrNetworkUnavailable
 	// when the coordinator does not complete the call within thirty
 	// seconds. A call that fails that way may still have reached the
-	// coordinator: the SDK reads the state right after, and Deletion
-	// and SubscribeDeletion report what the network holds. Requests
+	// coordinator: the SDK, unless headless, reads the state right
+	// after, and Deletion and SubscribeDeletion report what the
+	// network holds. Requests
 	// and reverts run one at a time; one that waits for its turn
 	// longer than thirty seconds fails the same way.
 	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)

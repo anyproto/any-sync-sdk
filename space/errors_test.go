@@ -67,6 +67,9 @@ func TestAclSentinelAliases(t *testing.T) {
 	if ErrCoordinatorLimitReached != coordinatorproto.ErrSpaceLimitReached { //nolint:errorlint
 		t.Error("ErrCoordinatorLimitReached is not coordinatorproto.ErrSpaceLimitReached")
 	}
+	if ErrCoordinatorSpaceDeleted != coordinatorproto.ErrSpaceIsDeleted { //nolint:errorlint
+		t.Error("ErrCoordinatorSpaceDeleted is not coordinatorproto.ErrSpaceIsDeleted")
+	}
 }
 
 // An ACL record refused by the coordinator crosses the sync node as a

@@ -10,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/anyproto/any-sync/coordinator/coordinatorproto"
 	"github.com/stretchr/testify/require"
 
 	anysyncsdk "github.com/anyproto/any-sync-sdk"
@@ -216,7 +215,7 @@ func TestE2E_AccountDeletionRequestAndRevert(t *testing.T) {
 	// an ACL write on them.
 	demoteBob := []space.PermissionChange{{Identity: bob.Account().Id(), Permission: space.PermissionReader}}
 	err = shared.ACL().ChangePermissions(ctx, demoteBob)
-	require.ErrorIs(t, err, coordinatorproto.ErrSpaceIsDeleted, "ACL write on a space in pending deletion")
+	require.ErrorIs(t, err, space.ErrCoordinatorSpaceDeleted, "ACL write on a space in pending deletion")
 
 	// Several reconcile passes with live statuses on the three open
 	// devices: at least three each, were they evenly spread.

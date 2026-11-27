@@ -53,6 +53,13 @@ var (
 	// ACL record, removals and the joiner's Join and CancelJoin
 	// included.
 	ErrCoordinatorLimitReached = coordinatorproto.ErrSpaceLimitReached
+
+	// ErrCoordinatorSpaceDeleted is the coordinator refusing an ACL
+	// record for a space it holds as deleted or in pending deletion. An
+	// account deletion holds every space the account owns in pending
+	// deletion until it is reverted, so every ACL write on them returns
+	// it meanwhile.
+	ErrCoordinatorSpaceDeleted = coordinatorproto.ErrSpaceIsDeleted
 )
 
 // ACL is the owner/admin-side ACL surface: invite lifecycle, join

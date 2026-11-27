@@ -269,6 +269,31 @@ there is no coordinator `SpaceDelete`, and the space stays on the nodes.
 Other devices offload when the marker arrives. `OneToOne(peer)` or
 `JoinGuest` re-adds the space.
 
+**Account deletion.** `Account().RequestDeletion` asks the coordinator
+to delete the account. The coordinator moves every space the account
+owns — the tech space, the spaces it created, the 1-1 spaces it
+registered — to pending deletion for the network's deletion period, and
+returns the date it deletes them. Spaces the account only joined are not
+touched.
+
+- Nothing changes on the device. While the deletion is pending the
+  coordinator refuses the account's push credentials and the sync nodes
+  refuse the pending spaces, so those spaces do not sync with the
+  network. Local reads and writes keep working.
+- `Account().RevertDeletion` returns the spaces to active, and the nodes
+  serve them again.
+- Once the period has passed the coordinator deletes the spaces, and the
+  reconciler offloads them on every device that holds them, members'
+  devices included.
+- `Account().Deletion` is the state — active, pending with the date,
+  deleted — as the network last gave it, kept on the device. The SDK
+  reads it from the coordinator (the status of the tech space) when it
+  opens, every five minutes, and on a request or a revert.
+  `SubscribeDeletion` delivers the changes.
+- A device that holds nothing of the account cannot sync it while the
+  deletion is pending: the nodes refuse its tech space. It still reads
+  the state from the coordinator.
+
 **Offload is retryable; the startup sweep is the guarantee.**
 
 - Each offload step tolerates already-gone state.

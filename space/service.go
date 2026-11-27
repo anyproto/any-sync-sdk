@@ -559,6 +559,64 @@ type SharedSpacesLimits struct {
 	FetchedAt time.Time
 }
 
+// AccountDeletionState is where the account stands on the network.
+type AccountDeletionState uint8
+
+const (
+	// AccountActive: no deletion is requested.
+	AccountActive AccountDeletionState = iota + 1
+	// AccountDeletionPending: deletion is requested and can still be
+	// reverted. The network does not sync the spaces the account owns
+	// until it is.
+	AccountDeletionPending
+	// AccountDeleted: the network has deleted the account's data.
+	AccountDeleted
+)
+
+func (s AccountDeletionState) String() string {
+	switch s {
+	case AccountActive:
+		return "active"
+	case AccountDeletionPending:
+		return "pending"
+	case AccountDeleted:
+		return "deleted"
+	default:
+		return "unknown"
+	}
+}
+
+// AccountDeletion is the account's deletion state on the network.
+// Returned by Account().Deletion, RequestDeletion and RevertDeletion.
+type AccountDeletion struct {
+	State AccountDeletionState
+	// DeleteAt is when the network deletes the account's data. Set
+	// while State is AccountDeletionPending.
+	DeleteAt time.Time
+	// FetchedAt is when the network gave this answer.
+	FetchedAt time.Time
+}
+
+var (
+	// ErrAccountDeletionPending is returned by Account().RequestDeletion
+	// when the account's deletion is already pending.
+	ErrAccountDeletionPending = errors.New("space: account deletion is already pending")
+	// ErrAccountDeletionNotPending is returned by
+	// Account().RevertDeletion when no deletion is pending.
+	ErrAccountDeletionNotPending = errors.New("space: account deletion is not pending")
+	// ErrAccountDeleted is returned by Account().RequestDeletion and
+	// RevertDeletion once the network has deleted the account.
+	ErrAccountDeleted = errors.New("space: account is deleted")
+	// ErrAccountNotOnNetwork is returned by Account().RequestDeletion
+	// and RevertDeletion for an account the network has never
+	// registered: it holds nothing of the account.
+	ErrAccountNotOnNetwork = errors.New("space: account is not on the network")
+	// ErrNetworkUnavailable is returned by Account().RequestDeletion
+	// and RevertDeletion when the coordinator could not be reached or
+	// did not complete the call.
+	ErrNetworkUnavailable = errors.New("space: network unavailable")
+)
+
 // AccountMetadata is the owner/member metadata attached to ACL join
 // records (identityRepo-backed on the wire).
 type AccountMetadata struct {

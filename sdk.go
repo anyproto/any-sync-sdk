@@ -1118,10 +1118,12 @@ type AccountAPI interface {
 	// RequestDeletion asks the network to delete the account. Every
 	// space the account owns enters pending deletion until the returned
 	// DeleteAt; spaces it only joined are not touched. Nothing changes
-	// on the device: the spaces stay, and the network stops syncing the
-	// owned ones until RevertDeletion. Once the network has deleted
-	// them the SDK offloads their local copies; derived spaces and the
-	// tech space stay until the embedder removes the account's data.
+	// on the device: the spaces stay. Until RevertDeletion the network
+	// may stop syncing the owned ones: the coordinator refuses their
+	// ACL changes, and a sync node refuses a pending space it has to
+	// load. Once the network has deleted them the SDK offloads their
+	// local copies; derived spaces and the tech space stay until the
+	// embedder removes the account's data.
 	//
 	// Errors: space.ErrAccountDeletionPending, space.ErrAccountDeleted,
 	// space.ErrAccountNotOnNetwork, and space.ErrNetworkUnavailable
@@ -1132,7 +1134,7 @@ type AccountAPI interface {
 	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)
 
 	// RevertDeletion cancels a pending deletion: the account's spaces
-	// return to active and the network syncs them again.
+	// return to active on the network.
 	//
 	// Errors: space.ErrAccountDeletionNotPending,
 	// space.ErrAccountDeleted, space.ErrAccountNotOnNetwork, and

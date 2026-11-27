@@ -566,8 +566,8 @@ const (
 	// AccountActive: no deletion is requested.
 	AccountActive AccountDeletionState = iota + 1
 	// AccountDeletionPending: deletion is requested and can still be
-	// reverted. The network does not sync the spaces the account owns
-	// until it is.
+	// reverted. Until it is, the network may stop syncing the spaces
+	// the account owns.
 	AccountDeletionPending
 	// AccountDeleted: the network has deleted the account's data.
 	AccountDeleted

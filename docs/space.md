@@ -276,12 +276,13 @@ registered — to pending deletion for the network's deletion period, and
 returns the date it deletes them. Spaces the account only joined are not
 touched.
 
-- Nothing changes on the device. While the deletion is pending the
-  coordinator refuses the account's push credentials and the sync nodes
-  refuse the pending spaces, so those spaces do not sync with the
-  network. Local reads and writes keep working.
-- `Account().RevertDeletion` returns the spaces to active, and the nodes
-  serve them again.
+- Nothing changes on the device, and local reads and writes keep
+  working. While the deletion is pending, sync of those spaces with the
+  network is not guaranteed: the coordinator refuses their ACL changes
+  and the registration of new spaces, and a sync node refuses a pending
+  space it has to load. A space a node already holds in memory keeps
+  syncing.
+- `Account().RevertDeletion` returns the spaces to active.
 - Once the period has passed the coordinator deletes the spaces, and the
   reconciler offloads them on every device that holds them, members'
   devices included. Derived spaces and the tech space are not offloaded:
@@ -291,9 +292,9 @@ touched.
   reads it from the coordinator (the status of the tech space) when it
   opens, every five minutes, and on a request or a revert; a headless
   SDK does not read it. `SubscribeDeletion` delivers the changes.
-- A device that holds nothing of the account cannot sync it while the
-  deletion is pending: the nodes refuse its tech space. It still reads
-  the state from the coordinator.
+- A device that holds nothing of the account syncs it only if a node
+  still serves its tech space. It reads the state from the coordinator
+  either way.
 
 **Offload is retryable; the startup sweep is the guarantee.**
 

@@ -273,8 +273,8 @@ Other devices offload when the marker arrives. `OneToOne(peer)` or
 to delete the account. The coordinator moves every space the account
 owns, whatever its type — the tech space, derived and regular spaces,
 the 1-1 spaces it registered — to pending deletion for the network's
-deletion period, and returns the date it deletes them. Spaces the account only joined are not
-touched.
+deletion period, and returns the date it deletes them. Spaces the
+account only joined are not touched.
 
 - Nothing changes on the device, and local reads and writes keep
   working. While the deletion is pending, sync of those spaces with the

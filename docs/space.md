@@ -254,11 +254,14 @@ local half and a deferred network half.
 The reconciler also polls the coordinator (`StatusCheckMany`); a space it
 reports gone (deleted on another device, or the owner deleted a space you
 joined) is marked `deleted` and offloaded. The row is never physically
-removed: it stays in `List` with `StatusDeleted`. A coordinator
-`NotExists` is not "gone": the coordinator registers a space on its first
-push and never purges a registered record, so `NotExists` means the space
-was never registered (its first push has not landed, it was deleted
-before it could push, or the push was refused) and the row is left alone.
+removed: it stays in `List` with `StatusDeleted`. A space the
+coordinator holds in pending deletion is not "gone": that deletion can
+be reverted, so the local copy stays until the coordinator reports the
+space deleted. A coordinator `NotExists` is not "gone" either: the
+coordinator registers a space on its first push and never purges a
+registered record, so `NotExists` means the space was never registered
+(its first push has not landed, it was deleted before it could push, or
+the push was refused) and the row is left alone.
 
 **1-1 and guest spaces** delete locally only. `Delete` writes a synced,
 non-terminal marker (`oneToOneDeleted` / `guestDeleted`) and offloads;

@@ -255,9 +255,9 @@ const (
 // space, and the coordinator still has it active (Created) — so a
 // space already moving through deletion (Pending/Started/Deleted) is a
 // no-op and never re-sent. Inbound offload fires only when we have NOT
-// deleted locally but the coordinator reports the space gone. NotExists
-// is a no-op both ways: the space has not been pushed yet (see
-// remotelyGone), so there is nothing to drive and nothing to offload.
+// deleted locally but the coordinator reports the space gone. Pending
+// and NotExists are no-ops both ways (see remotelyGone): there is
+// nothing to drive and nothing to offload.
 func decideReconcile(locallyDeleted bool, st *coordinatorproto.SpaceStatusPayload) reconcileAction {
 	if st == nil {
 		return actionNone
@@ -275,7 +275,12 @@ func decideReconcile(locallyDeleted bool, st *coordinatorproto.SpaceStatusPayloa
 }
 
 // remotelyGone reports whether a coordinator status means the space no
-// longer exists for us: pending, started or finished deletion.
+// longer exists for us: started or finished deletion.
+//
+// PendingDeletion is NOT gone. A pending deletion can be reverted — an
+// account deletion holds every space the account owns in it for the
+// network's deletion period — so the local copy stays until the
+// coordinator reports the space deleted.
 //
 // NotExists is NOT gone. The coordinator registers a space on its first
 // push (SpaceSign in the credential provider) and never purges a
@@ -290,8 +295,7 @@ func decideReconcile(locallyDeleted bool, st *coordinatorproto.SpaceStatusPayloa
 // the explicit deletion states qualify.
 func remotelyGone(status coordinatorproto.SpaceStatus) bool {
 	switch status {
-	case coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
-		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
+	case coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
 		coordinatorproto.SpaceStatus_SpaceStatusDeleted:
 		return true
 	default:

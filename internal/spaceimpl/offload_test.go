@@ -284,7 +284,6 @@ func TestDropSpaceCollectionsChunkFailure(t *testing.T) {
 
 func TestRemotelyGone(t *testing.T) {
 	gone := []coordinatorproto.SpaceStatus{
-		coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion,
 		coordinatorproto.SpaceStatus_SpaceStatusDeletionStarted,
 		coordinatorproto.SpaceStatus_SpaceStatusDeleted,
 	}
@@ -292,6 +291,8 @@ func TestRemotelyGone(t *testing.T) {
 		assert.True(t, remotelyGone(st), "status %v should be gone", st)
 	}
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusCreated))
+	// A pending deletion can still be reverted.
+	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusPendingDeletion))
 	// Not registered on the coordinator yet (first push pending), not deleted.
 	assert.False(t, remotelyGone(coordinatorproto.SpaceStatus_SpaceStatusNotExists))
 	// Unknown future statuses must never offload.
@@ -325,7 +326,8 @@ func TestDecideReconcile(t *testing.T) {
 		{"owner deleted locally, already deleted -> none", true, st(D, owner), actionNone},
 		{"member deleted locally, active -> none (cannot delete)", true, st(C, reader), actionNone},
 		{"active not-deleted owner -> none", false, st(C, owner), actionNone},
-		{"inbound pending, not deleted -> offload", false, st(P, owner), actionOffload},
+		{"inbound pending, owner, not deleted -> none (revertible)", false, st(P, owner), actionNone},
+		{"inbound pending, member, not deleted -> none (revertible)", false, st(P, reader), actionNone},
 		{"inbound deletion started, not deleted -> offload", false, st(S, reader), actionOffload},
 		{"inbound deleted, not deleted -> offload", false, st(D, reader), actionOffload},
 		{"unknown status, not deleted -> none", false, st(coordinatorproto.SpaceStatus(99), owner), actionNone},

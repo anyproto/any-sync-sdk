@@ -1108,9 +1108,11 @@ type AccountAPI interface {
 	// deleted. It is the network's last answer, kept on the device
 	// (FetchedAt says when), and the call never waits for the network:
 	// the SDK reads the state when it opens, every five minutes, and on
-	// RequestDeletion and RevertDeletion. Nil while the network has
-	// never answered on this device. The only error is a failed read of
-	// the answer kept on the device.
+	// RequestDeletion and RevertDeletion. An account the network has
+	// never registered reads active. Nil while the network has never
+	// answered on this device, and in headless mode, which does not
+	// read the state. The only error is a failed read of the answer
+	// kept on the device.
 	Deletion(ctx context.Context) (*space.AccountDeletion, error)
 
 	// RequestDeletion asks the network to delete the account. Every
@@ -1118,12 +1120,15 @@ type AccountAPI interface {
 	// DeleteAt; spaces it only joined are not touched. Nothing changes
 	// on the device: the spaces stay, and the network stops syncing the
 	// owned ones until RevertDeletion. Once the network has deleted
-	// them the SDK offloads their local copies.
+	// them the SDK offloads their local copies; derived spaces and the
+	// tech space stay until the embedder removes the account's data.
 	//
 	// Errors: space.ErrAccountDeletionPending, space.ErrAccountDeleted,
 	// space.ErrAccountNotOnNetwork, and space.ErrNetworkUnavailable
 	// when the coordinator does not complete the call within thirty
-	// seconds.
+	// seconds. A call that fails that way may still have reached the
+	// coordinator: the SDK reads the state right after, and Deletion
+	// and SubscribeDeletion report what the network holds.
 	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)
 
 	// RevertDeletion cancels a pending deletion: the account's spaces
@@ -1136,8 +1141,11 @@ type AccountAPI interface {
 
 	// SubscribeDeletion calls cb with the new state each time the
 	// state or its date changes, whichever device of the account
-	// caused it. Delta-only: seed the current state with Deletion.
-	// Calls are ordered and come from one goroutine.
+	// caused it. Delta-only: subscribe first, then read the current
+	// state with Deletion. A change that lands in between is delivered
+	// too, so cb may repeat a state Deletion returned. Calls are
+	// ordered and come from one goroutine; cb may call the SDK, Close
+	// included, and a cb that blocks holds back later deliveries.
 	SubscribeDeletion(cb func(space.AccountDeletion)) (cancel func())
 }
 

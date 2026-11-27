@@ -284,12 +284,13 @@ touched.
   serve them again.
 - Once the period has passed the coordinator deletes the spaces, and the
   reconciler offloads them on every device that holds them, members'
-  devices included.
+  devices included. Derived spaces and the tech space are not offloaded:
+  they stay until the embedder removes the account's data.
 - `Account().Deletion` is the state — active, pending with the date,
   deleted — as the network last gave it, kept on the device. The SDK
   reads it from the coordinator (the status of the tech space) when it
-  opens, every five minutes, and on a request or a revert.
-  `SubscribeDeletion` delivers the changes.
+  opens, every five minutes, and on a request or a revert; a headless
+  SDK does not read it. `SubscribeDeletion` delivers the changes.
 - A device that holds nothing of the account cannot sync it while the
   deletion is pending: the nodes refuse its tech space. It still reads
   the state from the coordinator.

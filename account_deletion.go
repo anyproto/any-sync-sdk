@@ -42,6 +42,10 @@ const (
 	netAccountDeleted
 )
 
+// errUnknownAccountStatus: the coordinator answered a status this code
+// does not know. The kept state stands.
+var errUnknownAccountStatus = errors.New("anysyncsdk: unknown tech space status")
+
 // deletionSource is the network side of the account's deletion.
 type deletionSource interface {
 	// scope names the network and the account the state belongs to.
@@ -76,6 +80,12 @@ func (n networkDeletion) state(ctx context.Context) (netAccountState, time.Time,
 	if err != nil {
 		return 0, time.Time{}, err
 	}
+	return accountStateOf(st)
+}
+
+// accountStateOf maps the tech space's coordinator status to the
+// account's; deleteAt is set while pending.
+func accountStateOf(st *coordinatorproto.SpaceStatusPayload) (netAccountState, time.Time, error) {
 	switch st.GetStatus() {
 	case coordinatorproto.SpaceStatus_SpaceStatusCreated:
 		return netAccountActive, time.Time{}, nil
@@ -87,7 +97,7 @@ func (n networkDeletion) state(ctx context.Context) (netAccountState, time.Time,
 	case coordinatorproto.SpaceStatus_SpaceStatusNotExists:
 		return netAccountUnknown, time.Time{}, nil
 	default:
-		return 0, time.Time{}, fmt.Errorf("anysyncsdk: unknown tech space status %d", st.GetStatus())
+		return 0, time.Time{}, fmt.Errorf("%w %d", errUnknownAccountStatus, st.GetStatus())
 	}
 }
 
@@ -126,6 +136,9 @@ type deletionState struct {
 	kv          limitsKV
 	poll, retry time.Duration
 
+	// call holds one RequestDeletion or RevertDeletion at a time, so
+	// their answers are kept in the order the coordinator gave them.
+	call chan struct{}
 	// setMu orders the writers: an answer is kept and stored whole
 	// before the next one.
 	setMu sync.Mutex
@@ -151,16 +164,25 @@ func (a *accountImpl) initDeletion(src deletionSource, kv limitsKV) {
 	d.src, d.kv = src, kv
 	d.poll, d.retry = deletionPoll, deletionRetry
 	d.subs = map[uint64]func(space.AccountDeletion){}
+	d.call = make(chan struct{}, 1)
 	d.kick = make(chan struct{}, 1)
 	d.changed = make(chan struct{}, 1)
 }
 
 // stop keeps new goroutines from starting. Called by close before it
-// joins the running ones.
+// joins the watch.
 func (d *deletionState) stop() {
 	d.mu.Lock()
 	d.closed = true
 	d.mu.Unlock()
+}
+
+// readNow wakes the watch for a read now.
+func (d *deletionState) readNow() {
+	select {
+	case d.kick <- struct{}{}:
+	default:
+	}
 }
 
 // loadLocked reads the stored state once. Caller holds d.mu.
@@ -315,27 +337,46 @@ func (a *accountImpl) readDeletion() bool {
 	ctx, cancel := context.WithTimeout(a.closeCtx, deletionCallTimeout)
 	defer cancel()
 	st, deleteAt, err := d.src.state(ctx)
+	if errors.Is(err, errUnknownAccountStatus) {
+		// The network answered: asking sooner changes nothing.
+		log.Warn("account deletion: read", zap.Error(err))
+		return true
+	}
 	if err != nil {
 		log.Debug("account deletion: read failed", zap.Error(err))
 		return false
 	}
 	if !a.keepDeletion(publicDeletion(st, deleteAt), gen, false) {
 		// A request or a revert answered meanwhile: read again.
-		select {
-		case d.kick <- struct{}{}:
-		default:
-		}
+		d.readNow()
 	}
 	return true
+}
+
+// enterDeletionCall waits for the turn of a request or a revert.
+func (a *accountImpl) enterDeletionCall(ctx context.Context) error {
+	select {
+	case a.deletion.call <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return deletionCallError(ctx, ctx.Err())
+	}
 }
 
 // RequestDeletion asks the network to delete the account. See
 // AccountAPI.RequestDeletion.
 func (a *accountImpl) RequestDeletion(ctx context.Context) (space.AccountDeletion, error) {
+	d := &a.deletion
 	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
 	defer cancel()
-	deleteAt, refused, err := a.deletion.src.request(callCtx)
+	if err := a.enterDeletionCall(callCtx); err != nil {
+		return space.AccountDeletion{}, err
+	}
+	defer func() { <-d.call }()
+	deleteAt, refused, err := d.src.request(callCtx)
 	if err != nil {
+		// The coordinator may have taken the request: read the state.
+		d.readNow()
 		return space.AccountDeletion{}, deletionCallError(ctx, err)
 	}
 	if refused {
@@ -349,10 +390,17 @@ func (a *accountImpl) RequestDeletion(ctx context.Context) (space.AccountDeletio
 // RevertDeletion cancels a pending deletion. See
 // AccountAPI.RevertDeletion.
 func (a *accountImpl) RevertDeletion(ctx context.Context) (space.AccountDeletion, error) {
+	d := &a.deletion
 	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
 	defer cancel()
-	refused, err := a.deletion.src.revert(callCtx)
+	if err := a.enterDeletionCall(callCtx); err != nil {
+		return space.AccountDeletion{}, err
+	}
+	defer func() { <-d.call }()
+	refused, err := d.src.revert(callCtx)
 	if err != nil {
+		// The coordinator may have taken the revert: read the state.
+		d.readNow()
 		return space.AccountDeletion{}, deletionCallError(ctx, err)
 	}
 	if refused {
@@ -369,6 +417,7 @@ func (a *accountImpl) RevertDeletion(ctx context.Context) (space.AccountDeletion
 func (a *accountImpl) deletionRefused(ctx, callCtx context.Context, refusedIn netAccountState, refusedErr error) error {
 	st, deleteAt, err := a.deletion.src.state(callCtx)
 	if err != nil {
+		a.deletion.readNow()
 		return deletionCallError(ctx, err)
 	}
 	a.keepDeletion(publicDeletion(st, deleteAt), 0, true)
@@ -404,12 +453,6 @@ func (a *accountImpl) SubscribeDeletion(cb func(space.AccountDeletion)) (cancel 
 	d.subs[id] = cb
 	if !d.dispatching && !d.closed {
 		d.dispatching = true
-		// A change from before the first subscriber is not a delta.
-		select {
-		case <-d.changed:
-		default:
-		}
-		a.wg.Add(1)
 		go a.dispatchDeletion()
 	}
 	return func() {
@@ -421,9 +464,9 @@ func (a *accountImpl) SubscribeDeletion(cb func(space.AccountDeletion)) (cancel 
 
 // dispatchDeletion delivers the kept state to the subscribers after
 // each change, from one goroutine: deliveries are ordered and the last
-// one carries the latest state.
+// one carries the latest state. It ends with the account, and close
+// does not join it: a callback may be the one that closes the SDK.
 func (a *accountImpl) dispatchDeletion() {
-	defer a.wg.Done()
 	d := &a.deletion
 	for {
 		select {
@@ -437,13 +480,19 @@ func (a *accountImpl) dispatchDeletion() {
 			continue
 		}
 		cur := *d.cur
-		subs := make([]func(space.AccountDeletion), 0, len(d.subs))
-		for _, cb := range d.subs {
-			subs = append(subs, cb)
+		ids := make([]uint64, 0, len(d.subs))
+		for id := range d.subs {
+			ids = append(ids, id)
 		}
 		d.mu.Unlock()
-		for _, cb := range subs {
-			cb(cur)
+		for _, id := range ids {
+			// Read again: a subscriber cancelled meanwhile gets nothing.
+			d.mu.Lock()
+			cb := d.subs[id]
+			d.mu.Unlock()
+			if cb != nil && a.closeCtx.Err() == nil {
+				cb(cur)
+			}
 		}
 	}
 }

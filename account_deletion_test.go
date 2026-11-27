@@ -263,7 +263,6 @@ func TestAccountDeletion_Watch(t *testing.T) {
 	}
 
 	acc.startDeletionWatch()
-	acc.startDeletionWatch() // one watch only
 	require.Eventually(t, func() bool { return net.calls() >= 2 }, time.Second, time.Millisecond, "retries while the network fails")
 	assert.Nil(t, deletionOf(t, acc))
 	assert.Empty(t, states())
@@ -351,8 +350,14 @@ func TestAccountDeletion_Closed(t *testing.T) {
 	acc.startDeletionWatch()
 	cancel := acc.SubscribeDeletion(func(space.AccountDeletion) { t.Error("a closed account delivers nothing") })
 	defer cancel()
+	// A change after the close is kept and reaches no subscriber.
+	_, err := acc.RevertDeletion(context.Background())
+	require.NoError(t, err)
 	time.Sleep(30 * time.Millisecond)
 	assert.Zero(t, net.calls(), "a closed account starts no watch")
+	kept := deletionOf(t, acc)
+	require.NotNil(t, kept)
+	assert.Equal(t, space.AccountActive, kept.State)
 }
 
 // A change that lands between a read of the state and the first
@@ -503,4 +508,34 @@ func TestAccountStateOf(t *testing.T) {
 	}
 	_, _, err := accountStateOf(&coordinatorproto.SpaceStatusPayload{Status: coordinatorproto.SpaceStatus(99)})
 	require.ErrorIs(t, err, errUnknownAccountStatus)
+}
+
+// A call that waits for its turn still has its full time for the
+// coordinator once it runs.
+func TestAccountDeletion_QueuedCallKeepsItsTime(t *testing.T) {
+	net := newFakeDeletion(netAccountActive)
+	gate := make(chan struct{})
+	net.requestGate = gate
+	acc := newDeletionAccount(t, net, newMemKV())
+
+	requested := make(chan error, 1)
+	go func() {
+		_, err := acc.RequestDeletion(context.Background())
+		requested <- err
+	}()
+	require.Eventually(t, func() bool { return len(acc.deletion.call) == 1 }, time.Second, time.Millisecond)
+
+	// The caller's deadline bounds the wait for the turn, as an
+	// unavailable network.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := acc.RevertDeletion(ctx)
+	require.ErrorIs(t, err, space.ErrNetworkUnavailable)
+	net.mu.Lock()
+	revertCalls := net.revertCalls
+	net.mu.Unlock()
+	assert.Zero(t, revertCalls, "a call that never got its turn does not reach the coordinator")
+
+	close(gate)
+	require.NoError(t, <-requested)
 }

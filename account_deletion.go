@@ -353,13 +353,16 @@ func (a *accountImpl) readDeletion() bool {
 	return true
 }
 
-// enterDeletionCall waits for the turn of a request or a revert.
+// enterDeletionCall waits for the turn of a request or a revert, no
+// longer than one call may take. The call's own time starts after it.
 func (a *accountImpl) enterDeletionCall(ctx context.Context) error {
+	turn, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	defer cancel()
 	select {
 	case a.deletion.call <- struct{}{}:
 		return nil
-	case <-ctx.Done():
-		return deletionCallError(ctx, ctx.Err())
+	case <-turn.Done():
+		return deletionCallError(ctx, turn.Err())
 	}
 }
 
@@ -367,12 +370,12 @@ func (a *accountImpl) enterDeletionCall(ctx context.Context) error {
 // AccountAPI.RequestDeletion.
 func (a *accountImpl) RequestDeletion(ctx context.Context) (space.AccountDeletion, error) {
 	d := &a.deletion
-	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
-	defer cancel()
-	if err := a.enterDeletionCall(callCtx); err != nil {
+	if err := a.enterDeletionCall(ctx); err != nil {
 		return space.AccountDeletion{}, err
 	}
 	defer func() { <-d.call }()
+	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	defer cancel()
 	deleteAt, refused, err := d.src.request(callCtx)
 	if err != nil {
 		// The coordinator may have taken the request: read the state.
@@ -391,12 +394,12 @@ func (a *accountImpl) RequestDeletion(ctx context.Context) (space.AccountDeletio
 // AccountAPI.RevertDeletion.
 func (a *accountImpl) RevertDeletion(ctx context.Context) (space.AccountDeletion, error) {
 	d := &a.deletion
-	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
-	defer cancel()
-	if err := a.enterDeletionCall(callCtx); err != nil {
+	if err := a.enterDeletionCall(ctx); err != nil {
 		return space.AccountDeletion{}, err
 	}
 	defer func() { <-d.call }()
+	callCtx, cancel := context.WithTimeout(ctx, deletionCallTimeout)
+	defer cancel()
 	refused, err := d.src.revert(callCtx)
 	if err != nil {
 		// The coordinator may have taken the revert: read the state.

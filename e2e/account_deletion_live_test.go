@@ -39,7 +39,7 @@ import (
 // period longer than the test; set ANYSYNC_LOCAL_NETWORK to its
 // node-config YAML to run. Skipped otherwise.
 func TestE2E_AccountDeletionRequestAndRevert(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it counts the reconcile passes of its own devices.
 	netPath := os.Getenv("ANYSYNC_LOCAL_NETWORK")
 	if netPath == "" {
 		t.Skip("set ANYSYNC_LOCAL_NETWORK to the node-config YAML to run this live test")
@@ -173,11 +173,24 @@ func TestE2E_AccountDeletionRequestAndRevert(t *testing.T) {
 
 	// Request. The coordinator knows the account once its tech space
 	// has been pushed.
-	var st space.AccountDeletion
+	var (
+		st   space.AccountDeletion
+		lost bool // an attempt failed without an answer
+	)
 	require.True(t, waitFor(ctx, time.Minute, time.Second, func() bool {
 		st, err = aliceA.Account().RequestDeletion(ctx)
+		if errors.Is(err, space.ErrNetworkUnavailable) {
+			lost = true
+		}
 		return !errors.Is(err, space.ErrAccountNotOnNetwork) && !errors.Is(err, space.ErrNetworkUnavailable)
 	}), "the coordinator never took alice's request: %v", err)
+	if lost && errors.Is(err, space.ErrAccountDeletionPending) {
+		// The coordinator took the attempt whose answer was lost.
+		kept, kerr := aliceA.Account().Deletion(ctx)
+		require.NoError(t, kerr)
+		require.NotNil(t, kept)
+		st, err = *kept, nil
+	}
 	require.NoError(t, err, "RequestDeletion")
 	require.Equal(t, space.AccountDeletionPending, st.State)
 	require.True(t, st.DeleteAt.After(time.Now()), "DeleteAt %s is not in the future", st.DeleteAt)
@@ -205,14 +218,16 @@ func TestE2E_AccountDeletionRequestAndRevert(t *testing.T) {
 	err = shared.ACL().ChangePermissions(ctx, demoteBob)
 	require.ErrorIs(t, err, coordinatorproto.ErrSpaceIsDeleted, "ACL write on a space in pending deletion")
 
-	// Several reconcile passes on every device, with live statuses.
+	// Several reconcile passes with live statuses on the three open
+	// devices: at least three each, were they evenly spread.
 	passes := spaceimpl.DeletionReconcilePassesForTest()
 	select {
 	case <-time.After(6 * reconcileEvery):
 	case <-ctx.Done():
 		t.Fatal("test deadline during the reconcile wait")
 	}
-	require.Greater(t, spaceimpl.DeletionReconcilePassesForTest(), passes, "no reconcile pass received coordinator statuses")
+	require.GreaterOrEqual(t, spaceimpl.DeletionReconcilePassesForTest()-passes, int64(9),
+		"too few reconcile passes received coordinator statuses")
 	for _, dev := range []struct {
 		name string
 		sdk  *anysyncsdk.SDK

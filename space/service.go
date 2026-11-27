@@ -569,7 +569,8 @@ const (
 	// reverted. Until it is, the network may stop syncing the spaces
 	// the account owns.
 	AccountDeletionPending
-	// AccountDeleted: the network has deleted the account's data.
+	// AccountDeleted: the deletion can no longer be reverted — the
+	// network is deleting the account's data or has deleted it.
 	AccountDeleted
 )
 

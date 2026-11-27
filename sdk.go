@@ -1108,11 +1108,10 @@ type AccountAPI interface {
 	// deleted. It is the network's last answer, kept on the device
 	// (FetchedAt says when), and the call never waits for the network:
 	// the SDK reads the state when it opens, every five minutes, and on
-	// RequestDeletion and RevertDeletion. An account the network has
-	// never registered reads active. Nil while the network has never
-	// answered on this device, and in headless mode, which does not
-	// read the state. The only error is a failed read of the answer
-	// kept on the device.
+	// RequestDeletion and RevertDeletion; a headless SDK reads it only
+	// on those two. An account the network has never registered reads
+	// active. Nil while the network has never answered on this device.
+	// The only error is a failed read of the answer kept on the device.
 	Deletion(ctx context.Context) (*space.AccountDeletion, error)
 
 	// RequestDeletion asks the network to delete the account. Every
@@ -1130,7 +1129,9 @@ type AccountAPI interface {
 	// when the coordinator does not complete the call within thirty
 	// seconds. A call that fails that way may still have reached the
 	// coordinator: the SDK reads the state right after, and Deletion
-	// and SubscribeDeletion report what the network holds.
+	// and SubscribeDeletion report what the network holds. Requests
+	// and reverts run one at a time; one that waits for its turn
+	// longer than thirty seconds fails the same way.
 	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)
 
 	// RevertDeletion cancels a pending deletion: the account's spaces
@@ -1146,8 +1147,9 @@ type AccountAPI interface {
 	// caused it. Delta-only: subscribe first, then read the current
 	// state with Deletion. A change that lands in between is delivered
 	// too, so cb may repeat a state Deletion returned. Calls are
-	// ordered and come from one goroutine; cb may call the SDK, Close
-	// included, and a cb that blocks holds back later deliveries.
+	// ordered and come from one goroutine, and a cb that blocks holds
+	// back later deliveries. Close does not wait for a cb that is
+	// running, so a cb may itself close the SDK.
 	SubscribeDeletion(cb func(space.AccountDeletion)) (cancel func())
 }
 

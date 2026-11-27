@@ -11,7 +11,7 @@ import (
 // AccountDelete asks the coordinator to delete the account. It sends
 // the confirmation signed by the account key; the coordinator moves
 // every space the account owns to PendingDeletion for the network's
-// deletion period. Returns when the network deletes them.
+// deletion period. Returns the time at which the network deletes them.
 func (a *App) AccountDelete(ctx context.Context) (time.Time, error) {
 	conf, err := coordinatorproto.PrepareAccountDeleteConfirmation(
 		a.keys.SignKey, a.keys.PeerId, a.NetworkId())

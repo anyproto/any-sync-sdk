@@ -271,7 +271,7 @@ Other devices offload when the marker arrives. `OneToOne(peer)` or
 
 **Account deletion.** `Account().RequestDeletion` asks the coordinator
 to delete the account. The coordinator moves every space the account
-owns — the tech space, the spaces it created, the 1-1 spaces it
+owns — the tech space, the spaces it is the owner of, the 1-1 spaces it
 registered — to pending deletion for the network's deletion period, and
 returns the date it deletes them. Spaces the account only joined are not
 touched.

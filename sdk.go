@@ -497,6 +497,7 @@ func Open(ctx context.Context, cfg config.Config, provider auth.Provider) (*SDK,
 	// pass is done.
 	sdk.followerDone = make(chan struct{})
 	go sdk.followIndex(bootstrapCtx)
+	account.startDeletionWatch()
 	return sdk, nil
 }
 
@@ -1101,6 +1102,57 @@ type AccountAPI interface {
 	// errors are the caller's cancellation and a failed read of the
 	// answer kept on the device.
 	Limits(ctx context.Context) (space.AccountLimits, error)
+
+	// Deletion returns the account's deletion state on the network:
+	// active, pending with the date the network deletes the data, or
+	// deleted. It is the network's last answer, kept on the device
+	// (FetchedAt says when), and the call never waits for the network:
+	// the SDK reads the state when it opens, every five minutes, and on
+	// RequestDeletion and RevertDeletion. A headless SDK does not read
+	// the state on its own: there Deletion is what the last request or
+	// revert answered. An account the network has never registered
+	// reads active. Nil while the network has never answered on this
+	// device. The only error is a failed read of the answer kept on
+	// the device.
+	Deletion(ctx context.Context) (*space.AccountDeletion, error)
+
+	// RequestDeletion asks the network to delete the account. Every
+	// space the account owns enters pending deletion until the returned
+	// DeleteAt; spaces it only joined are not touched. Nothing changes
+	// on the device: the spaces stay. Until RevertDeletion the network
+	// may stop syncing the owned ones: the coordinator refuses their
+	// ACL changes, and a sync node refuses a pending space it has to
+	// load. Once the network has deleted them the SDK offloads their
+	// local copies; derived spaces and the tech space stay until the
+	// embedder removes the account's data.
+	//
+	// Errors: space.ErrAccountDeletionPending, space.ErrAccountDeleted,
+	// space.ErrAccountNotOnNetwork, and space.ErrNetworkUnavailable
+	// when the coordinator does not complete the call within thirty
+	// seconds. A call that fails that way may still have reached the
+	// coordinator: the SDK, unless headless, reads the state right
+	// after, and Deletion and SubscribeDeletion report what the
+	// network holds. Requests and reverts run one at a time; one that
+	// waits for its turn longer than thirty seconds fails the same way.
+	RequestDeletion(ctx context.Context) (space.AccountDeletion, error)
+
+	// RevertDeletion cancels a pending deletion: the account's spaces
+	// return to active on the network.
+	//
+	// Errors: space.ErrAccountDeletionNotPending,
+	// space.ErrAccountDeleted, space.ErrAccountNotOnNetwork, and
+	// space.ErrNetworkUnavailable.
+	RevertDeletion(ctx context.Context) (space.AccountDeletion, error)
+
+	// SubscribeDeletion calls cb with the new state each time the
+	// state or its date changes, whichever device of the account
+	// caused it. Delta-only: subscribe first, then read the current
+	// state with Deletion. A change that lands in between is delivered
+	// too, so cb may repeat a state Deletion returned. Calls are
+	// ordered and come from one goroutine, and a cb that blocks holds
+	// back later deliveries. Close does not wait for a cb that is
+	// running, so a cb may itself close the SDK.
+	SubscribeDeletion(cb func(space.AccountDeletion)) (cancel func())
 }
 
 // accountImpl exposes the account-level surface. Id() returns the
@@ -1118,6 +1170,8 @@ type accountImpl struct {
 	limitsKV           limitsKV
 	storageLimits      limitsPart[space.StorageLimits]
 	sharedSpacesLimits limitsPart[space.SharedSpacesLimits]
+	// deletion keeps the account's deletion state on the network.
+	deletion deletionState
 	// pushMu serializes each local-profile-read/write → IdentityRepoPut
 	// sequence. The boot republish runs on the bootstrap goroutine,
 	// concurrent with user calls; without the lock its in-flight put of
@@ -1162,6 +1216,7 @@ func newAccountImpl(app *anysyncx.App, tsp *techspace.Service, spaces *spaceimpl
 	a := &accountImpl{app: app, tsp: tsp, spaces: spaces, limitsKV: kv, closeCtx: ctx, closeCancel: cancel}
 	a.limits = networkLimits{app: app, files: files, spaceId: tsp.SpaceId, account: a.Id}
 	a.initLimits()
+	a.initDeletion(networkDeletion{app: app, spaceId: tsp.SpaceId, account: a.Id}, kv)
 	return a
 }
 
@@ -1174,6 +1229,7 @@ func (a *accountImpl) close() {
 	a.stopIconWatch()
 	a.storageLimits.stop()
 	a.sharedSpacesLimits.stop()
+	a.deletion.stop()
 	a.wg.Wait()
 }
 

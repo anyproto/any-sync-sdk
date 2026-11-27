@@ -254,17 +254,47 @@ local half and a deferred network half.
 The reconciler also polls the coordinator (`StatusCheckMany`); a space it
 reports gone (deleted on another device, or the owner deleted a space you
 joined) is marked `deleted` and offloaded. The row is never physically
-removed: it stays in `List` with `StatusDeleted`. A coordinator
-`NotExists` is not "gone": the coordinator registers a space on its first
-push and never purges a registered record, so `NotExists` means the space
-was never registered (its first push has not landed, it was deleted
-before it could push, or the push was refused) and the row is left alone.
+removed: it stays in `List` with `StatusDeleted`. A space the
+coordinator holds in pending deletion is not "gone": that deletion can
+be reverted, so the local copy stays until the coordinator reports the
+space deleted. A coordinator `NotExists` is not "gone" either: the
+coordinator registers a space on its first push and never purges a
+registered record, so `NotExists` means the space was never registered
+(its first push has not landed, it was deleted before it could push, or
+the push was refused) and the row is left alone.
 
 **1-1 and guest spaces** delete locally only. `Delete` writes a synced,
 non-terminal marker (`oneToOneDeleted` / `guestDeleted`) and offloads;
 there is no coordinator `SpaceDelete`, and the space stays on the nodes.
 Other devices offload when the marker arrives. `OneToOne(peer)` or
 `JoinGuest` re-adds the space.
+
+**Account deletion.** `Account().RequestDeletion` asks the coordinator
+to delete the account. The coordinator moves every space the account
+owns, whatever its type — the tech space, derived and regular spaces,
+the 1-1 spaces it registered — to pending deletion for the network's
+deletion period, and returns the date it deletes them. Spaces the
+account only joined are not touched.
+
+- Nothing changes on the device, and local reads and writes keep
+  working. While the deletion is pending, sync of those spaces with the
+  network is not guaranteed: the coordinator refuses their ACL changes
+  (`space.ErrCoordinatorSpaceDeleted`) and the registration of new
+  spaces, and a sync node refuses a pending space it has to load. A
+  space a node already holds in memory keeps syncing.
+- `Account().RevertDeletion` returns the spaces to active.
+- Once the period has passed the coordinator deletes the spaces, and the
+  reconciler offloads them on every device that holds them, members'
+  devices included. Derived spaces and the tech space are not offloaded:
+  they stay until the embedder removes the account's data.
+- `Account().Deletion` is the state — active, pending with the date,
+  deleted — as the network last gave it, kept on the device. The SDK
+  reads it from the coordinator (the status of the tech space) when it
+  opens, every five minutes, and on a request or a revert; a headless
+  SDK does not read it. `SubscribeDeletion` delivers the changes.
+- A device that holds nothing of the account syncs it only if a node
+  still serves its tech space. It reads the state from the coordinator
+  either way.
 
 **Offload is retryable; the startup sweep is the guarantee.**
 
